@@ -22,6 +22,8 @@ const activityRoutes = require('./routes/activity.routes');
 const notificationRoutes = require('./routes/notification.routes');
 const supportRoutes = require('./routes/support.routes');
 const searchRoutes = require('./routes/search.routes');
+const { sendError } = require('./utils/response.utils');
+const { HTTP_STATUS } = require('./utils/constants');
 
 const app = express();
 
@@ -59,8 +61,8 @@ app.get('/', (req, res) => {
 // Global error handler
 app.use((err, req, res, next) => {
   console.error(err);
-  res.status(err.status || 500).json({
-    success: false,
+  sendError(res, {
+    status: err.status || HTTP_STATUS.INTERNAL_SERVER_ERROR,
     message: err.message || 'Internal Server Error'
   });
 });

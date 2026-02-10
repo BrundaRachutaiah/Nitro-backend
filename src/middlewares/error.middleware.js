@@ -1,8 +1,11 @@
+const { sendError } = require('../utils/response.utils');
+const { HTTP_STATUS } = require('../utils/constants');
+
 const errorMiddleware = (err, req, res, next) => {
   console.error(err.stack);
 
-  res.status(err.status || 500).json({
-    success: false,
+  sendError(res, {
+    status: err.status || HTTP_STATUS.INTERNAL_SERVER_ERROR,
     message: err.message || 'Internal Server Error'
   });
 };

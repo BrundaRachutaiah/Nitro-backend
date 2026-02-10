@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const { PROOF_STATUS } = require('../utils/constants');
 
 /**
  * Get all pending purchase proofs (Admin)
@@ -15,7 +16,7 @@ const getPendingPurchaseProofs = async (req, res, next) => {
         allocation_id,
         participant_id
       `)
-      .eq('status', 'PENDING')
+      .eq('status', PROOF_STATUS.PENDING)
       .order('uploaded_at', { ascending: true });
 
     if (error) throw error;
@@ -35,9 +36,9 @@ const approvePurchaseProof = async (req, res, next) => {
 
     const { data } = await supabase
       .from('purchase_proofs')
-      .update({ status: 'APPROVED' })
+      .update({ status: PROOF_STATUS.APPROVED })
       .eq('id', id)
-      .eq('status', 'PENDING')
+      .eq('status', PROOF_STATUS.PENDING)
       .select()
       .maybeSingle();
 
@@ -66,9 +67,9 @@ const rejectPurchaseProof = async (req, res, next) => {
 
     const { data } = await supabase
       .from('purchase_proofs')
-      .update({ status: 'REJECTED' })
+      .update({ status: PROOF_STATUS.REJECTED })
       .eq('id', id)
-      .eq('status', 'PENDING')
+      .eq('status', PROOF_STATUS.PENDING)
       .select()
       .maybeSingle();
 

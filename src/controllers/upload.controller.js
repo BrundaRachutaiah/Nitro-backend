@@ -1,5 +1,6 @@
 const supabase = require('../config/supabaseClient');
 const path = require('path');
+const { ALLOCATION_STATUS } = require('../utils/constants');
 
 /**
  * Upload purchase proof
@@ -30,7 +31,7 @@ const uploadPurchaseProof = async (req, res, next) => {
       });
     }
 
-    if (allocation.status !== 'RESERVED') {
+    if (allocation.status !== ALLOCATION_STATUS.RESERVED) {
       return res.status(400).json({
         success: false,
         message: 'Allocation is not active'

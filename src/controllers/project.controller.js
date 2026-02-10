@@ -1,4 +1,9 @@
 const supabase = require('../config/supabaseClient');
+const {
+  PROJECT_MODE,
+  PROJECT_STATUS,
+  APPLICATION_STATUS
+} = require('../utils/constants');
 
 /**
  * Create project (Admin)
@@ -20,7 +25,7 @@ const createProject = async (req, res, next) => {
       });
     }
 
-    if (!['MARKETPLACE', 'D2C'].includes(mode)) {
+    if (![PROJECT_MODE.MARKETPLACE, PROJECT_MODE.D2C].includes(mode)) {
       return res.status(400).json({
         success: false,
         message: 'Invalid project mode'
@@ -196,7 +201,7 @@ const getAppliedProjects = async (req, res, next) => {
       `
       )
       .eq('participant_id', participantId)
-      .eq('status', 'PENDING');
+      .eq('status', APPLICATION_STATUS.PENDING);
 
     if (error) throw error;
 
@@ -294,7 +299,7 @@ const getAvailableProjects = async (req, res, next) => {
         'id, title, description, reward, category, created_at',
         { count: 'exact' }
       )
-      .eq('status', 'published');
+      .eq('status', PROJECT_STATUS.PUBLISHED);
 
     if (category) {
       query = query.eq('category', category);
@@ -443,7 +448,11 @@ const updateProjectStatus = async (req, res, next) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    const allowed = ['draft', 'published', 'archived'];
+    const allowed = [
+      PROJECT_STATUS.DRAFT,
+      PROJECT_STATUS.PUBLISHED,
+      PROJECT_STATUS.ARCHIVED
+    ];
     if (!allowed.includes(status)) {
       return res.status(400).json({
         success: false,

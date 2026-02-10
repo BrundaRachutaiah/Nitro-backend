@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const { ALLOCATION_STATUS, PROOF_STATUS } = require('../utils/constants');
 
 const RESERVATION_DAYS = 5;
 
@@ -53,7 +54,7 @@ const allocateUnit = async (req, res, next) => {
       .from('unit_allocations')
       .select('*', { count: 'exact', head: true })
       .eq('project_id', application.project_id)
-      .eq('status', 'RESERVED');
+      .eq('status', ALLOCATION_STATUS.RESERVED);
 
     if (count >= project.total_units) {
       return res.status(400).json({
@@ -71,7 +72,7 @@ const allocateUnit = async (req, res, next) => {
         project_id: application.project_id,
         participant_id: application.participant_id,
         reserved_until: reservedUntil.toISOString(),
-        status: 'RESERVED'
+        status: ALLOCATION_STATUS.RESERVED
       })
       .select()
       .single();
@@ -203,9 +204,9 @@ const getAllocationById = async (req, res, next) => {
 
     if (!proof) {
       nextAction = 'UPLOAD_PURCHASE_PROOF';
-    } else if (proof.status === 'REJECTED') {
+    } else if (proof.status === PROOF_STATUS.REJECTED) {
       nextAction = 'REUPLOAD_PURCHASE_PROOF';
-    } else if (proof.status === 'APPROVED') {
+    } else if (proof.status === PROOF_STATUS.APPROVED) {
       nextAction = 'WAIT_FOR_PAYOUT';
     }
 
@@ -231,7 +232,7 @@ const updateAllocationStatus = async (req, res, next) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    if (status !== 'COMPLETED') {
+    if (status !== ALLOCATION_STATUS.COMPLETED) {
       return res.status(400).json({
         success: false,
         message: 'Invalid status transition'
