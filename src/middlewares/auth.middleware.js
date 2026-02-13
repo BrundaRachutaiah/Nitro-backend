@@ -41,7 +41,15 @@ const authMiddleware = async (req, res, next) => {
       .eq('id', userId)
       .single();
 
-    if (profileError || !profile) {
+    if (profileError) {
+      console.error('Profile lookup error:', profileError);
+      return sendError(res, {
+        status: HTTP_STATUS.FORBIDDEN,
+        message: 'User profile not found'
+      });
+    }
+
+    if (!profile) {
       return sendError(res, {
         status: HTTP_STATUS.FORBIDDEN,
         message: 'User profile not found'
