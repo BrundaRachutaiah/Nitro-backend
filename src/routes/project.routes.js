@@ -20,21 +20,6 @@ router.get(
   projectController.getAllProjects
 );
 
-// Get project by ID
-router.get(
-  '/:id',
-  authMiddleware,
-  projectController.getProjectById
-);
-
-// Update project (Admin)
-router.patch(
-  '/:id',
-  authMiddleware,
-  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
-  projectController.updateProject
-);
-
 // Participant project lists
 router.get(
   '/applied',
@@ -72,6 +57,21 @@ router.get(
   authMiddleware,
   roleMiddleware('ADMIN', 'SUPER_ADMIN'),
   projectController.getAdminProjects
+);
+
+// Get project by ID
+router.get(
+  '/:id',
+  authMiddleware,
+  projectController.getProjectById
+);
+
+// Update project (Admin)
+router.patch(
+  '/:id',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  projectController.updateProject
 );
 
 router.patch(
