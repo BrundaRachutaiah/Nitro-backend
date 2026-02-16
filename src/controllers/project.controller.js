@@ -5,6 +5,12 @@ const {
   APPLICATION_STATUS
 } = require('../utils/constants');
 
+const isMissingCompletedAtColumn = (error) =>
+  /completed_at/i.test(String(error?.message || ''));
+
+const isMissingStatusColumn = (error) =>
+  /status/i.test(String(error?.message || ''));
+
 /**
  * Create project (Admin)
  */
@@ -86,10 +92,23 @@ const createProject = async (req, res, next) => {
  */
 const getAllProjects = async (req, res, next) => {
   try {
-    const { data, error } = await supabase
+    const baseQuery = supabase
       .from('projects')
       .select('*')
       .order('created_at', { ascending: false });
+
+    let query = baseQuery;
+    if (req.user?.role === 'BRAND') query = query.eq('created_by', req.user.id);
+    if (req.user?.role === 'PARTICIPANT') query = query.eq('status', PROJECT_STATUS.PUBLISHED);
+
+    let { data, error } = await query;
+
+    // Fallback for schemas where created_by or status does not exist yet.
+    if (error && req.user?.role === 'BRAND') {
+      ({ data, error } = await baseQuery);
+    } else if (error && req.user?.role === 'PARTICIPANT') {
+      ({ data, error } = await baseQuery);
+    }
 
     if (error) throw error;
 
@@ -109,11 +128,25 @@ const getProjectById = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const { data, error } = await supabase
+    const baseQuery = supabase
       .from('projects')
       .select('*')
-      .eq('id', id)
-      .maybeSingle();
+      .eq('id', id);
+
+    let query = baseQuery;
+    if (req.user?.role === 'BRAND') {
+      query = query.eq('created_by', req.user.id);
+    }
+
+    if (req.user?.role === 'PARTICIPANT') {
+      query = query.eq('status', PROJECT_STATUS.PUBLISHED);
+    }
+
+    let { data, error } = await query.maybeSingle();
+
+    if (error && req.user?.role === 'BRAND') {
+      ({ data, error } = await baseQuery.maybeSingle());
+    }
 
     if (!data) {
       return res.status(404).json({
@@ -218,22 +251,32 @@ const getActiveProjects = async (req, res, next) => {
   try {
     const participantId = req.user.id;
 
-    const { data, error } = await supabase
-      .from('unit_allocations')
-      .select(
-        `
-        id,
-        reserved_until,
-        projects (
+    const baseQuery = () =>
+      supabase
+        .from('unit_allocations')
+        .select(
+          `
           id,
-          title,
-          reward,
-          status
+          reserved_until,
+          projects (
+            id,
+            title,
+            reward,
+            status
+          )
+        `
         )
-      `
-      )
-      .eq('participant_id', participantId)
-      .is('completed_at', null);
+        .eq('participant_id', participantId);
+
+    let { data, error } = await baseQuery().is('completed_at', null);
+
+    if (error && isMissingCompletedAtColumn(error)) {
+      ({ data, error } = await baseQuery().neq('status', 'COMPLETED'));
+
+      if (error && isMissingStatusColumn(error)) {
+        ({ data, error } = await baseQuery());
+      }
+    }
 
     if (error) throw error;
 
@@ -250,21 +293,47 @@ const getCompletedProjects = async (req, res, next) => {
   try {
     const participantId = req.user.id;
 
-    const { data, error } = await supabase
-      .from('unit_allocations')
-      .select(
-        `
-        id,
-        completed_at,
-        projects (
+    const baseWithCompletedAt = () =>
+      supabase
+        .from('unit_allocations')
+        .select(
+          `
           id,
-          title,
-          reward
+          completed_at,
+          projects (
+            id,
+            title,
+            reward
+          )
+        `
         )
-      `
-      )
-      .eq('participant_id', participantId)
-      .not('completed_at', 'is', null);
+        .eq('participant_id', participantId);
+
+    let { data, error } = await baseWithCompletedAt().not('completed_at', 'is', null);
+
+    if (error && isMissingCompletedAtColumn(error)) {
+      const fallbackByStatus = await supabase
+        .from('unit_allocations')
+        .select(
+          `
+          id,
+          projects (
+            id,
+            title,
+            reward
+          )
+        `
+        )
+        .eq('participant_id', participantId)
+        .eq('status', 'COMPLETED');
+
+      ({ data, error } = fallbackByStatus);
+
+      if (error && isMissingStatusColumn(error)) {
+        data = [];
+        error = null;
+      }
+    }
 
     if (error) throw error;
 
@@ -284,6 +353,8 @@ const getAvailableProjects = async (req, res, next) => {
   try {
     const {
       category,
+      mode,
+      q,
       reward_min,
       sort = 'newest',
       page = 1,
@@ -296,13 +367,21 @@ const getAvailableProjects = async (req, res, next) => {
     let query = supabase
       .from('projects')
       .select(
-        'id, title, description, reward, category, created_at',
+        'id, title, description, reward, category, mode, status, created_at',
         { count: 'exact' }
       )
       .eq('status', PROJECT_STATUS.PUBLISHED);
 
+    if (mode && [PROJECT_MODE.MARKETPLACE, PROJECT_MODE.D2C].includes(mode.toUpperCase())) {
+      query = query.eq('mode', mode.toUpperCase());
+    }
+
     if (category) {
       query = query.eq('category', category);
+    }
+
+    if (q) {
+      query = query.ilike('title', `%${q}%`);
     }
 
     if (reward_min) {
@@ -363,12 +442,25 @@ const getProjectSummary = async (req, res, next) => {
       .eq('participant_id', participantId)
       .maybeSingle();
 
-    const { data: allocation } = await supabase
+    let { data: allocation } = await supabase
       .from('unit_allocations')
       .select('id, reserved_until, completed_at')
       .eq('project_id', projectId)
       .eq('participant_id', participantId)
       .maybeSingle();
+
+    if (!allocation) {
+      const fallback = await supabase
+        .from('unit_allocations')
+        .select('id, reserved_until')
+        .eq('project_id', projectId)
+        .eq('participant_id', participantId)
+        .maybeSingle();
+
+      allocation = fallback.data
+        ? { ...fallback.data, completed_at: null }
+        : null;
+    }
 
     const { data: proof } = allocation
       ? await supabase

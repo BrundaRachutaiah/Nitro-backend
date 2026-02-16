@@ -1,5 +1,10 @@
 const supabase = require('../config/supabaseClient');
 const { PROOF_STATUS } = require('../utils/constants');
+const { sendEmail } = require('../services/email.service');
+const {
+  purchaseApprovedEmail,
+  purchaseRejectedEmail
+} = require('../services/email.templates');
 
 /**
  * Get all pending purchase proofs (Admin)
@@ -39,7 +44,7 @@ const approvePurchaseProof = async (req, res, next) => {
       .update({ status: PROOF_STATUS.APPROVED })
       .eq('id', id)
       .eq('status', PROOF_STATUS.PENDING)
-      .select()
+      .select('id, participant_id')
       .maybeSingle();
 
     if (!data) {
@@ -53,6 +58,20 @@ const approvePurchaseProof = async (req, res, next) => {
       success: true,
       message: 'Purchase proof approved'
     });
+
+    const { data: participant } = await supabase
+      .from('profiles')
+      .select('email')
+      .eq('id', data.participant_id)
+      .maybeSingle();
+
+    if (participant?.email) {
+      sendEmail({
+        to: participant.email,
+        subject: 'Purchase proof approved',
+        html: purchaseApprovedEmail()
+      });
+    }
   } catch (err) {
     next(err);
   }
@@ -70,7 +89,7 @@ const rejectPurchaseProof = async (req, res, next) => {
       .update({ status: PROOF_STATUS.REJECTED })
       .eq('id', id)
       .eq('status', PROOF_STATUS.PENDING)
-      .select()
+      .select('id, participant_id')
       .maybeSingle();
 
     if (!data) {
@@ -84,6 +103,20 @@ const rejectPurchaseProof = async (req, res, next) => {
       success: true,
       message: 'Purchase proof rejected'
     });
+
+    const { data: participant } = await supabase
+      .from('profiles')
+      .select('email')
+      .eq('id', data.participant_id)
+      .maybeSingle();
+
+    if (participant?.email) {
+      sendEmail({
+        to: participant.email,
+        subject: 'Purchase proof rejected',
+        html: purchaseRejectedEmail()
+      });
+    }
   } catch (err) {
     next(err);
   }

@@ -1,0 +1,43 @@
+const express = require('express');
+const authMiddleware = require('../middlewares/auth.middleware');
+const roleMiddleware = require('../middlewares/role.middleware');
+const submissionController = require('../controllers/submission.controller');
+
+const router = express.Router();
+
+router.post(
+  '/feedback',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  submissionController.submitFeedback
+);
+
+router.post(
+  '/review',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  submissionController.submitReview
+);
+
+router.get(
+  '/admin/reviews/pending',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  submissionController.getPendingReviews
+);
+
+router.patch(
+  '/admin/reviews/:id/approve',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  submissionController.approveReview
+);
+
+router.patch(
+  '/admin/reviews/:id/reject',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  submissionController.rejectReview
+);
+
+module.exports = router;

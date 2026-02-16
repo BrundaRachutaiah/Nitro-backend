@@ -32,7 +32,8 @@ const getMyPayouts = async (req, res, next) => {
         created_at,
         projects (
           id,
-          title
+          title,
+          name
         )
       `
       )

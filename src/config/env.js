@@ -19,4 +19,26 @@ if (!env.supabase.url || !env.supabase.serviceRoleKey) {
   throw new Error('Supabase environment variables missing');
 }
 
+const getJwtRole = (jwt) => {
+  try {
+    const parts = jwt.split('.');
+    if (parts.length < 2) {
+      return null;
+    }
+
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    return payload?.role || null;
+  } catch {
+    return null;
+  }
+};
+
+const supabaseKeyRole = getJwtRole(env.supabase.serviceRoleKey);
+if (supabaseKeyRole && supabaseKeyRole !== 'service_role') {
+  throw new Error(
+    `SUPABASE_SERVICE_ROLE_KEY is invalid for backend use (detected role: ${supabaseKeyRole}). ` +
+      'Use the service_role key from Supabase Project Settings > API.'
+  );
+}
+
 module.exports = env;

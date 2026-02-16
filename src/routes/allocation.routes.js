@@ -21,6 +21,13 @@ router.get(
   allocationController.getMyAllocations
 );
 
+router.get(
+  '/allocations/my/tracking',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  allocationController.getMyAllocationTracking
+);
+
 // Get active allocations
 router.get(
   '/allocations/active',

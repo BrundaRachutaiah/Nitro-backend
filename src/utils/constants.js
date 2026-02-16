@@ -13,6 +13,7 @@ const HTTP_STATUS = Object.freeze({
 const ROLES = Object.freeze({
   ADMIN: 'ADMIN',
   SUPER_ADMIN: 'SUPER_ADMIN',
+  BRAND: 'BRAND',
   PARTICIPANT: 'PARTICIPANT'
 });
 

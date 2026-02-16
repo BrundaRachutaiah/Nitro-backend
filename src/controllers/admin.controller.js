@@ -4,6 +4,33 @@ const {
   applyDateFilter
 } = require('../utils/date.utils');
 const { Parser } = require('json2csv');
+const { sendEmail } = require('../services/email.service');
+const {
+  approvalEmail,
+  purchaseApprovedEmail
+} = require('../services/email.templates');
+
+const fillParticipantIdentity = async (rows = []) => {
+  return Promise.all(
+    rows.map(async (row) => {
+      if ((row?.full_name && row?.email) || !row?.id) {
+        return row;
+      }
+
+      const { data: authData, error } = await supabase.auth.admin.getUserById(row.id);
+      if (error || !authData?.user) {
+        return row;
+      }
+
+      const authUser = authData.user;
+      return {
+        ...row,
+        full_name: row.full_name || authUser.user_metadata?.full_name || authUser.user_metadata?.name || null,
+        email: row.email || authUser.email || null
+      };
+    })
+  );
+};
 
 /**
  * Get all pending participants
@@ -12,13 +39,14 @@ const getPendingParticipants = async (req, res, next) => {
   try {
     const { data, error } = await supabase
       .from('profiles')
-      .select('id, full_name, role, status, created_at')
+      .select('id, full_name, email, role, status, created_at')
       .eq('role', 'PARTICIPANT')
       .eq('status', 'PENDING');
 
     if (error) throw error;
 
-    res.json({ success: true, data });
+    const enriched = await fillParticipantIdentity(data || []);
+    res.json({ success: true, data: enriched });
   } catch (err) {
     next(err);
   }
@@ -37,7 +65,7 @@ const approveParticipant = async (req, res, next) => {
       .eq('id', id)
       .eq('role', 'PARTICIPANT')
       .eq('status', 'PENDING')
-      .select()
+      .select('id, full_name, email')
       .maybeSingle();
 
     if (!data) {
@@ -53,6 +81,14 @@ const approveParticipant = async (req, res, next) => {
       success: true,
       message: 'Participant approved successfully'
     });
+
+    if (data?.email) {
+      sendEmail({
+        to: data.email,
+        subject: 'Nitro account approved',
+        html: approvalEmail(data.full_name)
+      });
+    }
   } catch (err) {
     next(err);
   }
@@ -93,6 +129,47 @@ const rejectParticipant = async (req, res, next) => {
 };
 
 /**
+ * Promote participant to admin (Super Admin only)
+ */
+const promoteParticipantToAdmin = async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only Super Admin can promote users to Admin'
+      });
+    }
+
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ role: 'ADMIN', status: 'APPROVED' })
+      .eq('id', id)
+      .eq('role', 'PARTICIPANT')
+      .select('id, full_name, email, role, status')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Participant not found or already promoted'
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Participant promoted to Admin successfully',
+      data
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
  * Get all participants (Admin)
  */
 const getAllParticipants = async (req, res, next) => {
@@ -105,7 +182,28 @@ const getAllParticipants = async (req, res, next) => {
 
     if (error) throw error;
 
-    res.json({ success: true, data });
+    const enriched = await fillParticipantIdentity(data || []);
+    res.json({ success: true, data: enriched });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Get all admins (Super Admin)
+ */
+const getAllAdmins = async (req, res, next) => {
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, full_name, email, role, status, created_at')
+      .eq('role', 'ADMIN')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const enriched = await fillParticipantIdentity(data || []);
+    res.json({ success: true, data: enriched });
   } catch (err) {
     next(err);
   }
@@ -497,6 +595,20 @@ const approvePurchaseProof = async (req, res, next) => {
       }
     }
 
+    const { data: participant } = await supabase
+      .from('profiles')
+      .select('email')
+      .eq('id', proof.participant_id)
+      .maybeSingle();
+
+    if (participant?.email) {
+      sendEmail({
+        to: participant.email,
+        subject: 'Purchase proof approved',
+        html: purchaseApprovedEmail()
+      });
+    }
+
     res.json({
       success: true,
       message: 'Purchase proof approved and payout eligibility created'
@@ -560,6 +672,50 @@ const generatePayoutBatch = async (req, res, next) => {
         batch_id: batch.id,
         total_amount: totalAmount,
         payout_count: payoutIds.length
+      }
+    });
+
+    const { data: participants } = await supabase
+      .from('payouts')
+      .select('profiles ( email )')
+      .eq('payout_batch_id', batch.id);
+
+    (participants || []).forEach((row) => {
+      const email = row?.profiles?.email;
+      if (email) {
+        sendEmail({
+          to: email,
+          subject: 'Payout batch created',
+          html: `<p>Your payout has been added to batch <b>${batch.id}</b>.</p>`
+        });
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getPayoutBatches = async (req, res, next) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    const from = (Number(page) - 1) * Number(limit);
+    const to = from + Number(limit) - 1;
+
+    const { data, count, error } = await supabase
+      .from('payout_batches')
+      .select('id, total_amount, status, created_at, created_by', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(from, to);
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      data: data || [],
+      meta: {
+        page: Number(page),
+        limit: Number(limit),
+        total: count || 0
       }
     });
   } catch (err) {
@@ -865,7 +1021,9 @@ module.exports = {
   getPendingParticipants,
   approveParticipant,
   rejectParticipant,
+  promoteParticipantToAdmin,
   getAllParticipants,
+  getAllAdmins,
   getParticipantById,
   getAdminDashboardSummary,
   getDashboardSummary,
@@ -875,6 +1033,7 @@ module.exports = {
   adminSearch,
   approvePurchaseProof,
   generatePayoutBatch,
+  getPayoutBatches,
   exportPayoutBatchCSV,
   getAdminSupportTickets,
   getAdminSupportTicketById,

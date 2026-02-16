@@ -22,13 +22,34 @@ const activityRoutes = require('./routes/activity.routes');
 const notificationRoutes = require('./routes/notification.routes');
 const supportRoutes = require('./routes/support.routes');
 const searchRoutes = require('./routes/search.routes');
+const submissionRoutes = require('./routes/submission.routes');
+const brandRoutes = require('./routes/brand.routes');
 const { sendError } = require('./utils/response.utils');
 const { HTTP_STATUS } = require('./utils/constants');
 
 const app = express();
 
 // Global middlewares
-app.use(cors());
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://nitro.teamsuccesso.com',
+  'https://nitro-stg.teamsuccesso.com'
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 
 // Start background jobs
@@ -52,6 +73,8 @@ app.use('/activity', activityRoutes);
 app.use('/notifications', notificationRoutes);
 app.use('/support', supportRoutes);
 app.use('/search', searchRoutes);
+app.use('/', submissionRoutes);
+app.use('/brand', brandRoutes);
 
 // Root
 app.get('/', (req, res) => {

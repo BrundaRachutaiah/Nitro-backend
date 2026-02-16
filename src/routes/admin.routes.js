@@ -27,11 +27,25 @@ router.patch(
   adminController.rejectParticipant
 );
 
+router.patch(
+  '/participants/:id/promote-admin',
+  authMiddleware,
+  roleMiddleware('SUPER_ADMIN'),
+  adminController.promoteParticipantToAdmin
+);
+
 router.get(
   '/participants',
   authMiddleware,
   roleMiddleware('ADMIN', 'SUPER_ADMIN'),
   adminController.getAllParticipants
+);
+
+router.get(
+  '/admins',
+  authMiddleware,
+  roleMiddleware('SUPER_ADMIN'),
+  adminController.getAllAdmins
 );
 
 router.get(
@@ -91,6 +105,13 @@ router.post(
   authMiddleware,
   roleMiddleware('ADMIN', 'SUPER_ADMIN'),
   adminController.generatePayoutBatch
+);
+
+router.get(
+  '/payout-batches',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.getPayoutBatches
 );
 
 router.get(
