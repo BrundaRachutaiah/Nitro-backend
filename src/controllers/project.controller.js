@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const { logActivity } = require('../services/activityLog.service');
 const {
   PROJECT_MODE,
   PROJECT_STATUS,
@@ -11,6 +12,39 @@ const isMissingCompletedAtColumn = (error) =>
 const isMissingStatusColumn = (error) =>
   /status/i.test(String(error?.message || ''));
 
+const isMissingTableOrColumn = (error) => {
+  const message = String(error?.message || '').toLowerCase();
+  return (
+    message.includes('does not exist')
+    || message.includes('column')
+    || message.includes('schema cache')
+    || message.includes('relation')
+    || message.includes('table')
+  );
+};
+
+const attachCreatorNames = async (rows = []) => {
+  const creatorIds = [...new Set(rows.map((item) => item?.created_by).filter(Boolean))];
+  if (!creatorIds.length) return rows;
+
+  const { data: profiles, error } = await supabase
+    .from('profiles')
+    .select('id, full_name, email')
+    .in('id', creatorIds);
+
+  if (error && !isMissingTableOrColumn(error)) throw error;
+
+  const map = new Map((profiles || []).map((profile) => [
+    profile.id,
+    profile.full_name || profile.email || null
+  ]));
+
+  return rows.map((row) => ({
+    ...row,
+    created_by_name: map.get(row.created_by) || null
+  }));
+};
+
 /**
  * Create project (Admin)
  */
@@ -18,13 +52,29 @@ const createProject = async (req, res, next) => {
   try {
     const {
       name,
+      title,
+      description,
+      reward,
+      category,
       mode,
       total_units,
       start_date,
-      end_date
+      end_date,
+      product_url,
+      products = []
     } = req.body;
 
-    if (!name || !mode || !total_units || !start_date || !end_date) {
+    if (
+  !name ||
+  !title ||
+  !description ||
+  !reward ||
+  !category ||
+  !mode ||
+  !total_units ||
+  !start_date ||
+  !end_date
+) {
       return res.status(400).json({
         success: false,
         message: 'Missing required fields'
@@ -66,10 +116,15 @@ const createProject = async (req, res, next) => {
       .from('projects')
       .insert({
         name,
+        title,
+        description,
+        reward,
+        category,
         mode,
         total_units,
         start_date,
         end_date,
+        product_url: product_url || null,
         created_by: req.user.id
       })
       .select()
@@ -77,10 +132,48 @@ const createProject = async (req, res, next) => {
 
     if (error) throw error;
 
+    const { data: creatorProfile } = await supabase
+      .from('profiles')
+      .select('full_name, email')
+      .eq('id', req.user.id)
+      .maybeSingle();
+
+    const creatorLabel = creatorProfile?.full_name || creatorProfile?.email || req.user.id;
+
+    if (Array.isArray(products) && products.length > 0) {
+      const productRows = products
+        .map((item) => ({
+          project_id: data.id,
+          name: String(item?.name || '').trim(),
+          product_url: String(item?.product_url || '').trim(),
+          product_value: Number(item?.product_value || item?.price || 0)
+        }))
+        .filter((item) => item.name && item.product_url);
+
+      if (productRows.length > 0) {
+        const { error: productInsertError } = await supabase
+          .from('project_products')
+          .insert(productRows);
+
+        if (productInsertError && !isMissingTableOrColumn(productInsertError)) {
+          throw productInsertError;
+        }
+      }
+    }
+
     res.status(201).json({
       success: true,
       message: 'Project created successfully',
       data
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PROJECT_CREATED',
+      entityType: 'PROJECT',
+      entityId: data.id,
+      message: `${creatorLabel} created project ${data.title || data.name || data.id}`
     });
   } catch (err) {
     next(err);
@@ -112,9 +205,11 @@ const getAllProjects = async (req, res, next) => {
 
     if (error) throw error;
 
+    const enrichedData = await attachCreatorNames(data || []);
+
     res.json({
       success: true,
-      data
+      data: enrichedData
     });
   } catch (err) {
     next(err);
@@ -157,9 +252,11 @@ const getProjectById = async (req, res, next) => {
 
     if (error) throw error;
 
+    const [enriched] = await attachCreatorNames([data]);
+
     res.json({
       success: true,
-      data
+      data: enriched || data
     });
   } catch (err) {
     next(err);
@@ -172,13 +269,71 @@ const getProjectById = async (req, res, next) => {
 const updateProject = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { name, total_units, start_date, end_date } = req.body;
+    const {
+      name,
+      title,
+      description,
+      category,
+      reward,
+      mode,
+      total_units,
+      start_date,
+      end_date,
+      product_url,
+      products
+    } = req.body;
 
     const updates = {};
-    if (name) updates.name = name;
-    if (total_units) updates.total_units = total_units;
-    if (start_date) updates.start_date = start_date;
-    if (end_date) updates.end_date = end_date;
+    if (typeof name === 'string' && name.trim()) updates.name = name.trim();
+    if (typeof title === 'string' && title.trim()) updates.title = title.trim();
+    if (typeof description === 'string') updates.description = description.trim();
+    if (typeof category === 'string') updates.category = category.trim();
+    if (reward !== undefined && reward !== null && reward !== '') updates.reward = Number(reward);
+    if (typeof mode === 'string' && [PROJECT_MODE.MARKETPLACE, PROJECT_MODE.D2C].includes(mode)) {
+      updates.mode = mode;
+    }
+    if (total_units !== undefined && total_units !== null && total_units !== '') {
+      updates.total_units = Number(total_units);
+    }
+    if (typeof start_date === 'string' && start_date) updates.start_date = start_date;
+    if (typeof end_date === 'string' && end_date) updates.end_date = end_date;
+    if (typeof product_url === 'string') updates.product_url = product_url.trim() || null;
+
+    if (updates.total_units !== undefined && Number(updates.total_units) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Total units must be greater than 0'
+      });
+    }
+
+    if (updates.start_date || updates.end_date) {
+      const { data: existing, error: existingError } = await supabase
+        .from('projects')
+        .select('start_date, end_date')
+        .eq('id', id)
+        .maybeSingle();
+
+      if (existingError) throw existingError;
+      if (!existing) {
+        return res.status(404).json({
+          success: false,
+          message: 'Project not found'
+        });
+      }
+
+      const resolvedStartDate = updates.start_date || existing.start_date;
+      const resolvedEndDate = updates.end_date || existing.end_date;
+
+      const startDateObj = new Date(resolvedStartDate);
+      const endDateObj = new Date(resolvedEndDate);
+
+      if (isNaN(startDateObj.getTime()) || isNaN(endDateObj.getTime()) || startDateObj >= endDateObj) {
+        return res.status(400).json({
+          success: false,
+          message: 'Start date must be before end date'
+        });
+      }
+    }
 
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({
@@ -201,10 +356,49 @@ const updateProject = async (req, res, next) => {
       });
     }
 
+    if (Array.isArray(products)) {
+      const cleanedProducts = products
+        .map((item) => ({
+          project_id: id,
+          name: String(item?.name || '').trim(),
+          product_url: String(item?.product_url || '').trim(),
+          product_value: Number(item?.product_value || item?.price || 0)
+        }))
+        .filter((item) => item.name && item.product_url);
+
+      const { error: deleteProductsError } = await supabase
+        .from('project_products')
+        .delete()
+        .eq('project_id', id);
+
+      if (deleteProductsError && !isMissingTableOrColumn(deleteProductsError)) {
+        throw deleteProductsError;
+      }
+
+      if (cleanedProducts.length) {
+        const { error: insertProductsError } = await supabase
+          .from('project_products')
+          .insert(cleanedProducts);
+
+        if (insertProductsError && !isMissingTableOrColumn(insertProductsError)) {
+          throw insertProductsError;
+        }
+      }
+    }
+
     res.json({
       success: true,
       message: 'Project updated',
       data
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PROJECT_UPDATED',
+      entityType: 'PROJECT',
+      entityId: id,
+      message: `Project ${id} updated`
     });
   } catch (err) {
     next(err);
@@ -223,6 +417,8 @@ const getAppliedProjects = async (req, res, next) => {
       .select(
         `
         id,
+        product_id,
+        allocated_budget,
         status,
         created_at,
         projects (
@@ -230,6 +426,12 @@ const getAppliedProjects = async (req, res, next) => {
           title,
           reward,
           status
+        ),
+        project_products (
+          id,
+          name,
+          product_url,
+          product_value
         )
       `
       )
@@ -280,9 +482,57 @@ const getActiveProjects = async (req, res, next) => {
 
     if (error) throw error;
 
+    const projectIds = [...new Set((data || []).map((row) => row?.projects?.id).filter(Boolean))];
+    let approvedApplications = [];
+    if (projectIds.length > 0) {
+      const { data: applications, error: applicationsError } = await supabase
+        .from('project_applications')
+        .select(
+          `
+          id,
+          project_id,
+          allocated_budget,
+          status,
+          product_id,
+          project_products (
+            id,
+            name,
+            product_url,
+            product_value
+          )
+        `
+        )
+        .eq('participant_id', participantId)
+        .in('project_id', projectIds)
+        .eq('status', 'APPROVED')
+        .order('reviewed_at', { ascending: false });
+
+      if (applicationsError && !isMissingTableOrColumn(applicationsError)) {
+        throw applicationsError;
+      }
+      approvedApplications = applications || [];
+    }
+
+    const appByProject = new Map();
+    for (const row of approvedApplications) {
+      if (!appByProject.has(row.project_id)) {
+        appByProject.set(row.project_id, row);
+      }
+    }
+
+    const enriched = (data || []).map((row) => {
+      const projectId = row?.projects?.id;
+      const app = appByProject.get(projectId);
+      return {
+        ...row,
+        allocated_budget: app?.allocated_budget || 0,
+        selected_product: app?.project_products || null
+      };
+    });
+
     res.json({
       success: true,
-      data
+      data: enriched
     });
   } catch (err) {
     next(err);
@@ -351,6 +601,7 @@ const getCompletedProjects = async (req, res, next) => {
  */
 const getAvailableProjects = async (req, res, next) => {
   try {
+    const participantId = req.user.id;
     const {
       category,
       mode,
@@ -398,13 +649,239 @@ const getAvailableProjects = async (req, res, next) => {
 
     if (error) throw error;
 
+    let filtered = data || [];
+    if (participantId) {
+      const { data: applications, error: applicationsError } = await supabase
+        .from('project_applications')
+        .select('project_id')
+        .eq('participant_id', participantId);
+
+      if (applicationsError && !isMissingTableOrColumn(applicationsError)) {
+        throw applicationsError;
+      }
+
+      const appliedProjectIds = new Set((applications || []).map((row) => row.project_id));
+      filtered = filtered.filter((item) => !appliedProjectIds.has(item.id));
+    }
+
     res.json({
       success: true,
-      data,
+      data: filtered,
       meta: {
         page: Number(page),
         limit: Number(limit),
-        total: count
+        total: filtered.length
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getActiveCatalog = async (req, res, next) => {
+  try {
+    const participantId = req.user.id;
+    const { mode, q } = req.query;
+
+    let query = supabase
+      .from('projects')
+      .select('id, name, title, description, reward, total_units, category, mode, status, start_date, end_date, product_url, created_by, created_at')
+      .eq('status', PROJECT_STATUS.PUBLISHED)
+      .order('created_at', { ascending: false });
+
+    if (mode && [PROJECT_MODE.MARKETPLACE, PROJECT_MODE.D2C].includes(String(mode).toUpperCase())) {
+      query = query.eq('mode', String(mode).toUpperCase());
+    }
+
+    if (q) {
+      query = query.ilike('title', `%${q}%`);
+    }
+
+    const { data: projects, error } = await query;
+    if (error) throw error;
+
+    const applicationsRes = await supabase
+      .from('project_applications')
+      .select('project_id')
+      .eq('participant_id', participantId);
+
+    if (applicationsRes.error && !isMissingTableOrColumn(applicationsRes.error)) {
+      throw applicationsRes.error;
+    }
+
+    const appliedProjectIds = new Set((applicationsRes.data || []).map((row) => row.project_id));
+
+    let accessRows = [];
+    const accessRes = await supabase
+      .from('project_access_requests')
+      .select('project_id, status')
+      .eq('participant_id', participantId);
+
+    if (!accessRes.error) {
+      accessRows = accessRes.data || [];
+    } else if (!isMissingTableOrColumn(accessRes.error)) {
+      throw accessRes.error;
+    }
+
+    const accessMap = new Map(accessRows.map((row) => [row.project_id, row.status]));
+    const withCreatorName = await attachCreatorNames(projects || []);
+    const enriched = (withCreatorName || [])
+      .filter((project) => !appliedProjectIds.has(project.id))
+      .map((project) => ({
+        ...project,
+        access_status: accessMap.get(project.id) || null
+      }));
+
+    res.json({
+      success: true,
+      data: enriched
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const requestProjectAccess = async (req, res, next) => {
+  try {
+    const participantId = req.user.id;
+    const { id: projectId } = req.params;
+
+    const { data: project, error: projectError } = await supabase
+      .from('projects')
+      .select('id, title, status')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    if (projectError) throw projectError;
+    if (!project || project.status !== PROJECT_STATUS.PUBLISHED) {
+      return res.status(404).json({
+        success: false,
+        message: 'Active project not found'
+      });
+    }
+
+    const { data: existing, error: existingError } = await supabase
+      .from('project_access_requests')
+      .select('id, status')
+      .eq('project_id', projectId)
+      .eq('participant_id', participantId)
+      .maybeSingle();
+
+    if (existingError && !isMissingTableOrColumn(existingError)) throw existingError;
+
+    if (existing) {
+      return res.json({
+        success: true,
+        message: `Access request already ${String(existing.status || '').toLowerCase()}`,
+        data: existing
+      });
+    }
+
+    if (isMissingTableOrColumn(existingError)) {
+      return res.status(400).json({
+        success: false,
+        message: 'project_access_requests table not found. Run latest SQL migration.'
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('project_access_requests')
+      .insert({
+        project_id: projectId,
+        participant_id: participantId,
+        status: 'PENDING'
+      })
+      .select('id, status, project_id')
+      .single();
+
+    if (error) throw error;
+
+    const { data: participantProfile } = await supabase
+      .from('profiles')
+      .select('full_name, email')
+      .eq('id', participantId)
+      .maybeSingle();
+
+    const participantLabel = participantProfile?.full_name || participantProfile?.email || participantId;
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PROJECT_ACCESS_REQUESTED',
+      entityType: 'PROJECT_ACCESS_REQUEST',
+      entityId: data.id,
+      message: `${participantLabel} requested unlock for project ${project.title || projectId}`
+    });
+
+    const { data: admins } = await supabase
+      .from('profiles')
+      .select('id')
+      .in('role', ['ADMIN', 'SUPER_ADMIN'])
+      .eq('status', 'APPROVED');
+
+    if (admins?.length) {
+      const notifications = admins.map((admin) => ({
+        user_id: admin.id,
+        type: 'PROJECT_ACCESS_REQUEST',
+        title: 'Project access request',
+        message: `Participant requested access to project ${project.title || projectId}`
+      }));
+      await supabase.from('notifications').insert(notifications);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Access request sent to admin',
+      data
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getProjectProductsForParticipant = async (req, res, next) => {
+  try {
+    const participantId = req.user.id;
+    const { id: projectId } = req.params;
+
+    const accessRes = await supabase
+      .from('project_access_requests')
+      .select('id, status')
+      .eq('project_id', projectId)
+      .eq('participant_id', participantId)
+      .maybeSingle();
+
+    const access = accessRes.data;
+    if (!accessRes.error) {
+      if (!access || access.status !== 'APPROVED') {
+        return res.status(403).json({
+          success: false,
+          message: access?.status === 'PENDING'
+            ? 'Project access request is pending admin approval'
+            : 'Project is locked. Request access first.',
+          data: {
+            access_status: access?.status || null
+          }
+        });
+      }
+    } else if (!isMissingTableOrColumn(accessRes.error)) {
+      throw accessRes.error;
+    }
+
+    const { data: products, error: productError } = await supabase
+      .from('project_products')
+      .select('id, name, product_url, product_value, is_active, created_at')
+      .eq('project_id', projectId)
+      .eq('is_active', true)
+      .order('created_at', { ascending: false });
+
+    if (productError && !isMissingTableOrColumn(productError)) throw productError;
+
+    res.json({
+      success: true,
+      data: {
+        access_status: access?.status || 'APPROVED',
+        products: products || []
       }
     });
   } catch (err) {
@@ -518,9 +995,11 @@ const getAdminProjects = async (req, res, next) => {
     const { data, count, error } = await query.range(from, to);
     if (error) throw error;
 
+    const enrichedData = await attachCreatorNames(data || []);
+
     res.json({
       success: true,
-      data,
+      data: enrichedData,
       meta: {
         page: Number(page),
         limit: Number(limit),
@@ -571,6 +1050,15 @@ const updateProjectStatus = async (req, res, next) => {
     res.json({
       success: true,
       message: `Project status updated to ${status}`
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PROJECT_STATUS_UPDATED',
+      entityType: 'PROJECT',
+      entityId: id,
+      message: `Project ${id} status updated to ${status}`
     });
   } catch (err) {
     next(err);
@@ -648,6 +1136,9 @@ module.exports = {
   getAllProjects,
   getProjectById,
   updateProject,
+  getActiveCatalog,
+  requestProjectAccess,
+  getProjectProductsForParticipant,
   getAppliedProjects,
   getActiveProjects,
   getCompletedProjects,

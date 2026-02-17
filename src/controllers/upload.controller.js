@@ -70,10 +70,11 @@ const uploadPurchaseProof = async (req, res, next) => {
     const { data, error } = await supabase
       .from('purchase_proofs')
       .insert({
-        allocation_id: allocationId,
-        participant_id: participantId,
-        file_url: publicUrl.publicUrl
-      })
+  allocation_id: allocationId,
+  participant_id: participantId,
+  file_url: publicUrl.publicUrl,
+  status: 'PENDING'
+})
       .select()
       .single();
 

@@ -27,11 +27,25 @@ router.patch(
   adminController.rejectParticipant
 );
 
+router.delete(
+  '/participants/:id',
+  authMiddleware,
+  roleMiddleware('SUPER_ADMIN'),
+  adminController.deleteParticipant
+);
+
 router.patch(
   '/participants/:id/promote-admin',
   authMiddleware,
   roleMiddleware('SUPER_ADMIN'),
   adminController.promoteParticipantToAdmin
+);
+
+router.patch(
+  '/admins/:id/remove-access',
+  authMiddleware,
+  roleMiddleware('SUPER_ADMIN'),
+  adminController.removeAdminAccess
 );
 
 router.get(
@@ -83,6 +97,55 @@ router.get(
   authMiddleware,
   roleMiddleware('ADMIN', 'SUPER_ADMIN'),
   adminController.getApprovals
+);
+
+router.get(
+  '/applications/summary',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.getApplicationSummary
+);
+
+router.get(
+  '/project-access/pending',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.getPendingProjectAccessRequests
+);
+
+router.patch(
+  '/project-access/:id/approve',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.approveProjectAccessRequest
+);
+
+router.patch(
+  '/project-access/:id/reject',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.rejectProjectAccessRequest
+);
+
+router.get(
+  '/applications/pending',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.getPendingProductApplications
+);
+
+router.patch(
+  '/applications/:id/approve',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.approveProductApplication
+);
+
+router.patch(
+  '/applications/:id/reject',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.rejectProductApplication
 );
 
 router.get(

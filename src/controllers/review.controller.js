@@ -78,6 +78,42 @@ const approvePurchaseProof = async (req, res, next) => {
 };
 
 /**
+ * Get purchase proofs with optional status filter (Admin)
+ */
+const getPurchaseProofs = async (req, res, next) => {
+  try {
+    const status = String(req.query.status || "").toUpperCase();
+    const limit = Number(req.query.limit) > 0 ? Number(req.query.limit) : 100;
+
+    let query = supabase
+      .from('purchase_proofs')
+      .select(
+        `
+        id,
+        file_url,
+        status,
+        uploaded_at,
+        allocation_id,
+        participant_id
+      `
+      )
+      .order('uploaded_at', { ascending: false })
+      .limit(limit);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
  * Reject purchase proof
  */
 const rejectPurchaseProof = async (req, res, next) => {
@@ -123,6 +159,7 @@ const rejectPurchaseProof = async (req, res, next) => {
 };
 
 module.exports = {
+  getPurchaseProofs,
   getPendingPurchaseProofs,
   approvePurchaseProof,
   rejectPurchaseProof

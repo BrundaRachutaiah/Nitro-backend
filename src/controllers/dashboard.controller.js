@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const { buildDateRange } = require('../utils/date.utils');
 
 const getSummary = async (req, res, next) => {
   try {
@@ -55,21 +56,45 @@ const getActivity = async (req, res, next) => {
 
 const getProjectPerformance = async (req, res, next) => {
   try {
-    const since = new Date();
-    since.setDate(since.getDate() - 28);
+    const now = new Date();
+    const requestedRange = buildDateRange(req.query);
+    const range = requestedRange || {
+      from: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+      to: now
+    };
+
+    if (Number.isNaN(range.from.getTime()) || Number.isNaN(range.to.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid date range'
+      });
+    }
+
+    let from = range.from;
+    let to = range.to;
+    if (from > to) {
+      const temp = from;
+      from = to;
+      to = temp;
+    }
+
+    const fromIso = from.toISOString();
+    const toIso = to.toISOString();
 
     // Some environments store purchase proof time as uploaded_at, others as created_at.
     let reviewsRes = await supabase
       .from('purchase_proofs')
       .select('created_at')
-      .gte('created_at', since.toISOString());
+      .gte('created_at', fromIso)
+      .lte('created_at', toIso);
 
     let proofDateField = 'created_at';
     if (reviewsRes.error) {
       reviewsRes = await supabase
         .from('purchase_proofs')
         .select('uploaded_at')
-        .gte('uploaded_at', since.toISOString());
+        .gte('uploaded_at', fromIso)
+        .lte('uploaded_at', toIso);
       proofDateField = 'uploaded_at';
     }
 
@@ -78,21 +103,42 @@ const getProjectPerformance = async (req, res, next) => {
     let samplesRes = await supabase
       .from('project_applications')
       .select('created_at')
-      .gte('created_at', since.toISOString());
+      .gte('created_at', fromIso)
+      .lte('created_at', toIso);
 
     let appDateField = 'created_at';
     if (samplesRes.error) {
       samplesRes = await supabase
         .from('project_applications')
         .select('applied_at')
-        .gte('applied_at', since.toISOString());
+        .gte('applied_at', fromIso)
+        .lte('applied_at', toIso);
       appDateField = 'applied_at';
     }
 
     if (samplesRes.error) throw samplesRes.error;
 
+    const totalDays = Math.max(
+      1,
+      Math.ceil((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24))
+    );
+    const bucketCount = 4;
+    const bucketSizeDays = Math.max(1, Math.ceil(totalDays / bucketCount));
+
+    const formatBucketDate = (date) => {
+      const d = new Date(date);
+      return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+    };
+
     const weeks = [0, 1, 2, 3].map((index) => ({
-      label: `Week ${index + 1}`,
+      label: (() => {
+        const start = new Date(from);
+        start.setDate(start.getDate() + index * bucketSizeDays);
+        const end = new Date(start);
+        end.setDate(end.getDate() + bucketSizeDays - 1);
+        if (end > to) end.setTime(to.getTime());
+        return `${formatBucketDate(start)} - ${formatBucketDate(end)}`;
+      })(),
       reviews: 0,
       samples: 0
     }));
@@ -100,9 +146,9 @@ const getProjectPerformance = async (req, res, next) => {
     const addToBucket = (dateString, key) => {
       const diffDays = Math.max(
         0,
-        Math.floor((new Date(dateString).getTime() - since.getTime()) / (1000 * 60 * 60 * 24))
+        Math.floor((new Date(dateString).getTime() - from.getTime()) / (1000 * 60 * 60 * 24))
       );
-      const bucket = Math.min(3, Math.floor(diffDays / 7));
+      const bucket = Math.min(bucketCount - 1, Math.floor(diffDays / bucketSizeDays));
       weeks[bucket][key] += 1;
     };
 

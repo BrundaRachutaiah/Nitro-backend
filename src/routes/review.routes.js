@@ -6,6 +6,16 @@ const reviewController = require('../controllers/review.controller');
 const router = express.Router();
 
 /**
+ * Get purchase proofs with optional status filter (Admin)
+ */
+router.get(
+  '/purchase-proofs',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  reviewController.getPurchaseProofs
+);
+
+/**
  * Get pending purchase proofs (Admin)
  */
 router.get(

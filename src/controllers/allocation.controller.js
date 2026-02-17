@@ -93,6 +93,15 @@ const allocateUnit = async (req, res, next) => {
 
     if (error) throw error;
 
+    await supabase
+      .from('project_applications')
+      .update({
+        status: 'APPROVED',
+        reviewed_at: new Date().toISOString()
+      })
+      .eq('id', applicationId)
+      .eq('participant_id', application.participant_id);
+
     res.status(201).json({
       success: true,
       message: 'Unit allocated and reserved for 5 days',

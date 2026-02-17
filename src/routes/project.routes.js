@@ -46,6 +46,27 @@ router.get(
 );
 
 router.get(
+  '/catalog',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  projectController.getActiveCatalog
+);
+
+router.post(
+  '/:id/request-access',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  projectController.requestProjectAccess
+);
+
+router.get(
+  '/:id/products',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  projectController.getProjectProductsForParticipant
+);
+
+router.get(
   '/:id/summary',
   authMiddleware,
   projectController.getProjectSummary

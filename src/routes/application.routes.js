@@ -21,4 +21,18 @@ router.get(
   applicationController.getMyApplications
 );
 
+router.get(
+  '/applications/payment-details',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  applicationController.getPaymentDetails
+);
+
+router.put(
+  '/applications/payment-details',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  applicationController.savePaymentDetails
+);
+
 module.exports = router;

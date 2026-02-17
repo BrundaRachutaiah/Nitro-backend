@@ -3,8 +3,10 @@ const {
   buildDateRange,
   applyDateFilter
 } = require('../utils/date.utils');
+const { ALLOCATION_STATUS } = require('../utils/constants');
 const { Parser } = require('json2csv');
 const { sendEmail } = require('../services/email.service');
+const { logActivity } = require('../services/activityLog.service');
 const {
   approvalEmail,
   purchaseApprovedEmail
@@ -82,6 +84,15 @@ const approveParticipant = async (req, res, next) => {
       message: 'Participant approved successfully'
     });
 
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PARTICIPANT_APPROVED',
+      entityType: 'PROFILE',
+      entityId: id,
+      message: `Participant ${data.full_name || data.email || id} approved`
+    });
+
     if (data?.email) {
       sendEmail({
         to: data.email,
@@ -106,7 +117,7 @@ const rejectParticipant = async (req, res, next) => {
       .update({ status: 'REJECTED' })
       .eq('id', id)
       .eq('role', 'PARTICIPANT')
-      .eq('status', 'PENDING')
+      .in('status', ['PENDING', 'APPROVED'])
       .select()
       .maybeSingle();
 
@@ -122,6 +133,77 @@ const rejectParticipant = async (req, res, next) => {
     res.json({
       success: true,
       message: 'Participant rejected'
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PARTICIPANT_REJECTED',
+      entityType: 'PROFILE',
+      entityId: id,
+      message: `Participant ${id} rejected`
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Remove participant (Super Admin)
+ */
+const deleteParticipant = async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only Super Admin can delete participants'
+      });
+    }
+
+    const { id } = req.params;
+
+    const { data: participant, error: participantError } = await supabase
+      .from('profiles')
+      .select('id, role, status')
+      .eq('id', id)
+      .eq('role', 'PARTICIPANT')
+      .maybeSingle();
+
+    if (participantError) throw participantError;
+    if (!participant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Participant not found'
+      });
+    }
+
+    if (participant.status !== 'REJECTED') {
+      return res.status(400).json({
+        success: false,
+        message: 'Reject participant before deleting'
+      });
+    }
+
+    const { error: deleteError } = await supabase
+      .from('profiles')
+      .update({ status: 'DELETED' })
+      .eq('id', id)
+      .eq('role', 'PARTICIPANT');
+
+    if (deleteError) throw deleteError;
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PARTICIPANT_DELETED',
+      entityType: 'PROFILE',
+      entityId: id,
+      message: `Participant ${id} deleted`
+    });
+
+    return res.json({
+      success: true,
+      message: 'Participant deleted successfully'
     });
   } catch (err) {
     next(err);
@@ -159,9 +241,75 @@ const promoteParticipantToAdmin = async (req, res, next) => {
       });
     }
 
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PARTICIPANT_PROMOTED_TO_ADMIN',
+      entityType: 'PROFILE',
+      entityId: id,
+      message: `Participant ${data.full_name || data.email || id} promoted to Admin`
+    });
+
     return res.json({
       success: true,
       message: 'Participant promoted to Admin successfully',
+      data
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Remove admin access (Super Admin)
+ */
+const removeAdminAccess = async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only Super Admin can remove admin access'
+      });
+    }
+
+    const { id } = req.params;
+
+    if (id === req.user.id) {
+      return res.status(400).json({
+        success: false,
+        message: 'You cannot remove your own admin access'
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ role: 'PARTICIPANT', status: 'APPROVED' })
+      .eq('id', id)
+      .eq('role', 'ADMIN')
+      .select('id, role, status')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Admin not found or already removed'
+      });
+    }
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'ADMIN_ACCESS_REMOVED',
+      entityType: 'PROFILE',
+      entityId: id,
+      message: `Admin access removed for ${id}`
+    });
+
+    return res.json({
+      success: true,
+      message: 'Admin access removed successfully',
       data
     });
   } catch (err) {
@@ -178,6 +326,7 @@ const getAllParticipants = async (req, res, next) => {
       .from('profiles')
       .select('id, full_name, email, role, status, created_at')
       .eq('role', 'PARTICIPANT')
+      .neq('status', 'DELETED')
       .order('created_at', { ascending: false });
 
     if (error) throw error;
@@ -388,9 +537,150 @@ const getAdminActivity = async (req, res, next) => {
 
     if (error) throw error;
 
+    if (Array.isArray(data) && data.length > 0) {
+      return res.json({
+        success: true,
+        data
+      });
+    }
+
+    // Fallback: synthesize recent activity from existing domain tables
+    const fallbackActivities = [];
+
+    const { data: participants } = await supabase
+      .from('profiles')
+      .select('id, full_name, status, created_at')
+      .eq('role', 'PARTICIPANT')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    (participants || []).forEach((row) => {
+      fallbackActivities.push({
+        id: `profile-${row.id}`,
+        action: 'PARTICIPANT_REGISTERED',
+        entity_type: 'PROFILE',
+        message: `${row.full_name || row.id} registered (${row.status || 'UNKNOWN'})`,
+        created_at: row.created_at
+      });
+    });
+
+    const accessRes = await supabase
+      .from('project_access_requests')
+      .select('id, status, created_at, participant_id, project_id')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    const appRes = await supabase
+      .from('project_applications')
+      .select('id, status, created_at, participant_id, project_id, product_id')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    const projectRes = await supabase
+      .from('projects')
+      .select('id, title, created_at, created_by')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    const accessRows = !accessRes.error ? (accessRes.data || []) : [];
+    const appRows = !appRes.error ? (appRes.data || []) : [];
+    const projectRows = !projectRes.error ? (projectRes.data || []) : [];
+
+    const participantIds = new Set();
+    const projectIds = new Set();
+    const productIds = new Set();
+    const creatorIds = new Set();
+
+    accessRows.forEach((row) => {
+      if (row.participant_id) participantIds.add(row.participant_id);
+      if (row.project_id) projectIds.add(row.project_id);
+    });
+
+    appRows.forEach((row) => {
+      if (row.participant_id) participantIds.add(row.participant_id);
+      if (row.project_id) projectIds.add(row.project_id);
+      if (row.product_id) productIds.add(row.product_id);
+    });
+
+    projectRows.forEach((row) => {
+      if (row.created_by) creatorIds.add(row.created_by);
+      if (row.id) projectIds.add(row.id);
+    });
+
+    const allProfileIds = [...new Set([...participantIds, ...creatorIds])];
+    let profileMap = new Map();
+    if (allProfileIds.length) {
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', allProfileIds);
+      profileMap = new Map(
+        (profiles || []).map((row) => [row.id, row.full_name || row.email || row.id])
+      );
+    }
+
+    let projectMap = new Map();
+    if (projectIds.size) {
+      const { data: projects } = await supabase
+        .from('projects')
+        .select('id, title')
+        .in('id', [...projectIds]);
+      projectMap = new Map(
+        (projects || []).map((row) => [row.id, row.title || row.id])
+      );
+    }
+
+    let productMap = new Map();
+    if (productIds.size) {
+      const { data: products } = await supabase
+        .from('project_products')
+        .select('id, name')
+        .in('id', [...productIds]);
+      productMap = new Map(
+        (products || []).map((row) => [row.id, row.name || row.id])
+      );
+    }
+
+    accessRows.forEach((row) => {
+      const participantLabel = profileMap.get(row.participant_id) || row.participant_id || 'Participant';
+      const projectLabel = projectMap.get(row.project_id) || row.project_id || 'Project';
+      fallbackActivities.push({
+        id: `unlock-${row.id}`,
+        action: `PROJECT_ACCESS_${String(row.status || 'PENDING').toUpperCase()}`,
+        entity_type: 'PROJECT_ACCESS_REQUEST',
+        message: `${participantLabel} requested unlock for ${projectLabel} (${String(row.status || 'PENDING').toUpperCase()})`,
+        created_at: row.created_at
+      });
+    });
+
+    appRows.forEach((row) => {
+      const participantLabel = profileMap.get(row.participant_id) || row.participant_id || 'Participant';
+      const projectLabel = projectMap.get(row.project_id) || row.project_id || 'Project';
+      const productLabel = productMap.get(row.product_id) || row.product_id || 'Product';
+      fallbackActivities.push({
+        id: `app-${row.id}`,
+        action: `PRODUCT_APPLICATION_${String(row.status || 'PENDING').toUpperCase()}`,
+        entity_type: 'PROJECT_APPLICATION',
+        message: `${participantLabel} applied for ${productLabel} in ${projectLabel} (${String(row.status || 'PENDING').toUpperCase()})`,
+        created_at: row.created_at
+      });
+    });
+
+    projectRows.forEach((row) => {
+      const creatorLabel = profileMap.get(row.created_by) || row.created_by || 'Admin';
+      fallbackActivities.push({
+        id: `project-${row.id}`,
+        action: 'PROJECT_CREATED',
+        entity_type: 'PROJECT',
+        message: `${creatorLabel} created project ${row.title || row.id}`,
+        created_at: row.created_at
+      });
+    });
+
+    fallbackActivities.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+
     res.json({
       success: true,
-      data
+      data: fallbackActivities.slice(0, limit)
     });
   } catch (err) {
     next(err);
@@ -402,33 +692,52 @@ const getAdminActivity = async (req, res, next) => {
  */
 const getApprovalsCount = async (req, res, next) => {
   try {
-    const participants = await supabase
-      .from('profiles')
-      .select('id', { count: 'exact', head: true })
-      .eq('role', 'PARTICIPANT')
-      .eq('status', 'PENDING');
+    const [participants, purchaseProofs, payouts, projectAccessRequests, productApplications] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('role', 'PARTICIPANT')
+        .eq('status', 'PENDING'),
 
-    const purchaseProofs = await supabase
-      .from('purchase_proofs')
-      .select('id', { count: 'exact', head: true })
-      .eq('status', 'PENDING');
+      supabase
+        .from('purchase_proofs')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'PENDING'),
 
-    const payouts = await supabase
-      .from('payout_batches')
-      .select('id', { count: 'exact', head: true })
-      .eq('status', 'PENDING');
+      supabase
+        .from('payout_batches')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'PENDING'),
+
+      supabase
+        .from('project_access_requests')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'PENDING'),
+
+      supabase
+        .from('project_applications')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'PENDING')
+    ]);
 
     const data = {
       participants: participants.count || 0,
       purchase_proofs: purchaseProofs.count || 0,
-      payouts: payouts.count || 0
+      payouts: payouts.count || 0,
+      project_access_requests: projectAccessRequests.count || 0,
+      product_applications: productApplications.count || 0
     };
 
     res.json({
       success: true,
       data: {
         ...data,
-        total: data.participants + data.purchase_proofs + data.payouts
+        total:
+          data.participants
+          + data.project_access_requests
+          + data.product_applications
+          + data.purchase_proofs
+          + data.payouts
       }
     });
   } catch (err) {
@@ -542,8 +851,485 @@ const adminSearch = async (req, res, next) => {
   }
 };
 
+const getApplicationSummary = async (req, res, next) => {
+  try {
+    const toIsoOrNull = (value) => {
+      if (!value) return null;
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? null : date.toISOString();
+    };
+
+    const getLatest = (rows, field, predicate = () => true) => {
+      const values = rows
+        .filter(predicate)
+        .map((row) => toIsoOrNull(row?.[field]))
+        .filter(Boolean)
+        .sort((a, b) => new Date(b) - new Date(a));
+      return values[0] || null;
+    };
+
+    let participantRows = [];
+    const participantQuery = await supabase
+      .from('profiles')
+      .select('status, created_at, updated_at')
+      .eq('role', 'PARTICIPANT');
+
+    if (participantQuery.error) {
+      const fallback = await supabase
+        .from('profiles')
+        .select('status, created_at')
+        .eq('role', 'PARTICIPANT');
+      if (fallback.error) throw fallback.error;
+      participantRows = fallback.data || [];
+    } else {
+      participantRows = participantQuery.data || [];
+    }
+
+    const { data: accessRows, error: accessError } = await supabase
+      .from('project_access_requests')
+      .select('status, created_at, reviewed_at');
+    if (accessError) throw accessError;
+
+    const { data: applicationRows, error: applicationError } = await supabase
+      .from('project_applications')
+      .select('status, created_at, reviewed_at');
+    if (applicationError) throw applicationError;
+
+    const loginSummary = {
+      pending_count: participantRows.filter((row) => row.status === 'PENDING').length,
+      total_requested: participantRows.length,
+      approved_count: participantRows.filter((row) => row.status === 'APPROVED').length,
+      rejected_count: participantRows.filter((row) => row.status === 'REJECTED').length,
+      last_requested_at: getLatest(participantRows, 'created_at'),
+      last_approved_at: getLatest(
+        participantRows,
+        participantRows.some((row) => row.updated_at) ? 'updated_at' : 'created_at',
+        (row) => row.status === 'APPROVED'
+      ),
+      last_rejected_at: getLatest(
+        participantRows,
+        participantRows.some((row) => row.updated_at) ? 'updated_at' : 'created_at',
+        (row) => row.status === 'REJECTED'
+      )
+    };
+
+    const accessSummary = {
+      pending_count: (accessRows || []).filter((row) => row.status === 'PENDING').length,
+      total_requested: (accessRows || []).length,
+      approved_count: (accessRows || []).filter((row) => row.status === 'APPROVED').length,
+      rejected_count: (accessRows || []).filter((row) => row.status === 'REJECTED').length,
+      last_requested_at: getLatest(accessRows || [], 'created_at'),
+      last_approved_at: getLatest(accessRows || [], 'reviewed_at', (row) => row.status === 'APPROVED'),
+      last_rejected_at: getLatest(accessRows || [], 'reviewed_at', (row) => row.status === 'REJECTED')
+    };
+
+    const productSummary = {
+      pending_count: (applicationRows || []).filter((row) => row.status === 'PENDING').length,
+      total_requested: (applicationRows || []).length,
+      approved_count: (applicationRows || []).filter((row) => row.status === 'APPROVED').length,
+      rejected_count: (applicationRows || []).filter((row) => row.status === 'REJECTED').length,
+      last_requested_at: getLatest(applicationRows || [], 'created_at'),
+      last_approved_at: getLatest(applicationRows || [], 'reviewed_at', (row) => row.status === 'APPROVED'),
+      last_rejected_at: getLatest(applicationRows || [], 'reviewed_at', (row) => row.status === 'REJECTED')
+    };
+
+    const finalSummary = {
+      pending_total: loginSummary.pending_count + accessSummary.pending_count + productSummary.pending_count,
+      total_requested: loginSummary.total_requested + accessSummary.total_requested + productSummary.total_requested,
+      total_approved: loginSummary.approved_count + accessSummary.approved_count + productSummary.approved_count,
+      total_rejected: loginSummary.rejected_count + accessSummary.rejected_count + productSummary.rejected_count
+    };
+
+    return res.json({
+      success: true,
+      data: {
+        login_requests: loginSummary,
+        project_unlock_requests: accessSummary,
+        product_applications: productSummary,
+        final_summary: finalSummary
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getPendingProjectAccessRequests = async (req, res, next) => {
+  try {
+    const requestedStatus = String(req.query.status || 'PENDING').toUpperCase();
+    const { data: requests, error } = await supabase
+      .from('project_access_requests')
+      .select(
+        `
+        id,
+        project_id,
+        participant_id,
+        status,
+        created_at
+      `
+      )
+      .in('status', requestedStatus === 'ALL' ? ['PENDING', 'APPROVED', 'REJECTED'] : [requestedStatus])
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+
+    const projectIds = [...new Set((requests || []).map((row) => row.project_id).filter(Boolean))];
+    const participantIds = [...new Set((requests || []).map((row) => row.participant_id).filter(Boolean))];
+
+    let projects = [];
+    if (projectIds.length) {
+      const { data: projectRows, error: projectError } = await supabase
+        .from('projects')
+        .select('id, title, mode')
+        .in('id', projectIds);
+      if (projectError) throw projectError;
+      projects = projectRows || [];
+    }
+
+    let profiles = [];
+    if (participantIds.length) {
+      const { data: profileRows, error: profileError } = await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', participantIds);
+      if (profileError) throw profileError;
+      profiles = profileRows || [];
+    }
+
+    const projectMap = new Map(projects.map((item) => [item.id, item]));
+    const profileMap = new Map(profiles.map((item) => [item.id, item]));
+
+    const data = (requests || []).map((row) => ({
+      ...row,
+      projects: projectMap.get(row.project_id) || null,
+      profiles: profileMap.get(row.participant_id) || null
+    }));
+
+    res.json({
+      success: true,
+      data: data || []
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const approveProjectAccessRequest = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body;
+
+    const { data, error } = await supabase
+      .from('project_access_requests')
+      .update({
+        status: 'APPROVED',
+        reviewed_by: req.user.id,
+        reviewed_at: new Date().toISOString(),
+        notes: notes || null
+      })
+      .eq('id', id)
+      .eq('status', 'PENDING')
+      .select('id, participant_id, project_id')
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project access request not found or already processed'
+      });
+    }
+
+    await supabase
+      .from('notifications')
+      .insert({
+        user_id: data.participant_id,
+        type: 'PROJECT_ACCESS_APPROVED',
+        title: 'Project unlocked',
+        message: 'Your project access request has been approved. You can now view products.'
+      });
+
+    res.json({
+      success: true,
+      message: 'Project access approved'
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PROJECT_ACCESS_APPROVED',
+      entityType: 'PROJECT_ACCESS_REQUEST',
+      entityId: id,
+      message: `Project access request ${id} approved`
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const rejectProjectAccessRequest = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body;
+
+    const { data, error } = await supabase
+      .from('project_access_requests')
+      .update({
+        status: 'REJECTED',
+        reviewed_by: req.user.id,
+        reviewed_at: new Date().toISOString(),
+        notes: notes || null
+      })
+      .eq('id', id)
+      .eq('status', 'PENDING')
+      .select('id, participant_id')
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project access request not found or already processed'
+      });
+    }
+
+    await supabase
+      .from('notifications')
+      .insert({
+        user_id: data.participant_id,
+        type: 'PROJECT_ACCESS_REJECTED',
+        title: 'Project request rejected',
+        message: 'Your project access request was rejected by admin.'
+      });
+
+    res.json({
+      success: true,
+      message: 'Project access rejected'
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PROJECT_ACCESS_REJECTED',
+      entityType: 'PROJECT_ACCESS_REQUEST',
+      entityId: id,
+      message: `Project access request ${id} rejected`
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getPendingProductApplications = async (req, res, next) => {
+  try {
+    const requestedStatus = String(req.query.status || 'PENDING').toUpperCase();
+    const { data: applications, error } = await supabase
+      .from('project_applications')
+      .select(
+        `
+        id,
+        project_id,
+        participant_id,
+        product_id,
+        status,
+        created_at
+      `
+      )
+      .in('status', requestedStatus === 'ALL' ? ['PENDING', 'APPROVED', 'REJECTED'] : [requestedStatus])
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+
+    const projectIds = [...new Set((applications || []).map((row) => row.project_id).filter(Boolean))];
+    const participantIds = [...new Set((applications || []).map((row) => row.participant_id).filter(Boolean))];
+    const productIds = [...new Set((applications || []).map((row) => row.product_id).filter(Boolean))];
+
+    let projects = [];
+    if (projectIds.length) {
+      const { data: projectRows, error: projectError } = await supabase
+        .from('projects')
+        .select('id, title, mode')
+        .in('id', projectIds);
+      if (projectError) throw projectError;
+      projects = projectRows || [];
+    }
+
+    let profiles = [];
+    if (participantIds.length) {
+      const { data: profileRows, error: profileError } = await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', participantIds);
+      if (profileError) throw profileError;
+      profiles = profileRows || [];
+    }
+
+    let projectProducts = [];
+    if (productIds.length) {
+      const { data: productRows, error: productError } = await supabase
+        .from('project_products')
+        .select('id, name, product_url, product_value')
+        .in('id', productIds);
+      if (productError) throw productError;
+      projectProducts = productRows || [];
+    }
+
+    const projectMap = new Map(projects.map((item) => [item.id, item]));
+    const profileMap = new Map(profiles.map((item) => [item.id, item]));
+    const productMap = new Map(projectProducts.map((item) => [item.id, item]));
+
+    const data = (applications || []).map((row) => ({
+      ...row,
+      projects: projectMap.get(row.project_id) || null,
+      profiles: profileMap.get(row.participant_id) || null,
+      project_products: productMap.get(row.product_id) || null
+    }));
+
+    res.json({
+      success: true,
+      data: data || []
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const approveProductApplication = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { allocated_budget, eligibility_notes } = req.body;
+
+    const { data: application, error } = await supabase
+      .from('project_applications')
+      .update({
+        status: 'APPROVED',
+        reviewed_by: req.user.id,
+        reviewed_at: new Date().toISOString(),
+        eligibility_notes: eligibility_notes || null,
+        allocated_budget: Number(allocated_budget || 0)
+      })
+      .eq('id', id)
+      .eq('status', 'PENDING')
+      .select('id, project_id, participant_id')
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!application) {
+      return res.status(404).json({
+        success: false,
+        message: 'Application not found or already processed'
+      });
+    }
+
+    const { data: existingAllocation, error: allocationLookupError } = await supabase
+      .from('unit_allocations')
+      .select('id')
+      .eq('project_id', application.project_id)
+      .eq('participant_id', application.participant_id)
+      .maybeSingle();
+
+    if (allocationLookupError) throw allocationLookupError;
+
+    if (!existingAllocation) {
+      const reservedUntil = new Date();
+      reservedUntil.setDate(reservedUntil.getDate() + 5);
+
+      const { error: allocationError } = await supabase
+        .from('unit_allocations')
+        .insert({
+          project_id: application.project_id,
+          participant_id: application.participant_id,
+          reserved_until: reservedUntil.toISOString(),
+          status: ALLOCATION_STATUS.RESERVED
+        });
+
+      if (allocationError) throw allocationError;
+    }
+
+    await supabase
+      .from('notifications')
+      .insert({
+        user_id: application.participant_id,
+        type: 'PRODUCT_APPLICATION_APPROVED',
+        title: 'Application approved',
+        message: `Your product application was approved with allocated budget ₹${Number(allocated_budget || 0)}.`
+      });
+
+    res.json({
+      success: true,
+      message: 'Product application approved and allocation created'
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PRODUCT_APPLICATION_APPROVED',
+      entityType: 'PROJECT_APPLICATION',
+      entityId: id,
+      message: `Product application ${id} approved`
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const rejectProductApplication = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { eligibility_notes } = req.body;
+
+    const { data, error } = await supabase
+      .from('project_applications')
+      .update({
+        status: 'REJECTED',
+        reviewed_by: req.user.id,
+        reviewed_at: new Date().toISOString(),
+        eligibility_notes: eligibility_notes || null
+      })
+      .eq('id', id)
+      .eq('status', 'PENDING')
+      .select('id, participant_id')
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Application not found or already processed'
+      });
+    }
+
+    await supabase
+      .from('notifications')
+      .insert({
+        user_id: data.participant_id,
+        type: 'PRODUCT_APPLICATION_REJECTED',
+        title: 'Application rejected',
+        message: 'Your product application was rejected by admin.'
+      });
+
+    res.json({
+      success: true,
+      message: 'Product application rejected'
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PRODUCT_APPLICATION_REJECTED',
+      entityType: 'PROJECT_APPLICATION',
+      entityId: id,
+      message: `Product application ${id} rejected`
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 /**
- * Approve purchase proof + auto create payout
+ * Approve purchase proof.
+ * D2C: purchase proof approval can mark payout eligible.
+ * Marketplace: payout stays pending until review/feedback workflow completes.
  */
 const approvePurchaseProof = async (req, res, next) => {
   try {
@@ -566,32 +1352,48 @@ const approvePurchaseProof = async (req, res, next) => {
 
     if (error) throw error;
 
-    const { data: allocation } = await supabase
+    const { data: allocation, error: allocationError } = await supabase
       .from('unit_allocations')
-      .select('project_id, participant_id')
+      .select('project_id, participant_id, projects ( mode, reward )')
       .eq('id', proof.allocation_id)
       .maybeSingle();
 
+    if (allocationError) throw allocationError;
+
+    let payoutCreated = false;
     if (allocation) {
-      const { data: existingPayout } = await supabase
-        .from('payouts')
-        .select('id')
-        .eq('participant_id', allocation.participant_id)
-        .eq('project_id', allocation.project_id)
-        .maybeSingle();
-
-      if (!existingPayout) {
-        const { error: payoutError } = await supabase
+      const projectMode = String(allocation?.projects?.mode || '').toUpperCase();
+      if (projectMode === 'D2C') {
+        const { data: existingPayout, error: payoutLookupError } = await supabase
           .from('payouts')
-          .insert({
-            participant_id: allocation.participant_id,
-            project_id: allocation.project_id,
-            purchase_proof_id: proof.id,
-            amount: 0,
-            status: 'ELIGIBLE'
-          });
+          .select('id')
+          .eq('participant_id', allocation.participant_id)
+          .eq('project_id', allocation.project_id)
+          .maybeSingle();
 
-        if (payoutError) throw payoutError;
+        if (payoutLookupError) throw payoutLookupError;
+
+        if (!existingPayout) {
+          const { error: payoutError } = await supabase
+            .from('payouts')
+            .insert({
+              participant_id: allocation.participant_id,
+              project_id: allocation.project_id,
+              purchase_proof_id: proof.id,
+              amount: Number(allocation?.projects?.reward || 0),
+              status: 'ELIGIBLE'
+            });
+
+          if (payoutError) throw payoutError;
+          payoutCreated = true;
+        }
+
+        await supabase
+          .from('unit_allocations')
+          .update({ completed_at: new Date().toISOString() })
+          .eq('id', proof.allocation_id)
+          .eq('participant_id', allocation.participant_id)
+          .is('completed_at', null);
       }
     }
 
@@ -611,7 +1413,18 @@ const approvePurchaseProof = async (req, res, next) => {
 
     res.json({
       success: true,
-      message: 'Purchase proof approved and payout eligibility created'
+      message: payoutCreated
+        ? 'Purchase proof approved and payout eligibility created'
+        : 'Purchase proof approved'
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PURCHASE_PROOF_APPROVED',
+      entityType: 'PURCHASE_PROOF',
+      entityId: id,
+      message: `Purchase proof ${id} approved`
     });
   } catch (err) {
     next(err);
@@ -673,6 +1486,15 @@ const generatePayoutBatch = async (req, res, next) => {
         total_amount: totalAmount,
         payout_count: payoutIds.length
       }
+    });
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PAYOUT_BATCH_CREATED',
+      entityType: 'PAYOUT_BATCH',
+      entityId: batch.id,
+      message: `Payout batch ${batch.id} created with ${payoutIds.length} payouts`
     });
 
     const { data: participants } = await supabase
@@ -1021,7 +1843,9 @@ module.exports = {
   getPendingParticipants,
   approveParticipant,
   rejectParticipant,
+  deleteParticipant,
   promoteParticipantToAdmin,
+  removeAdminAccess,
   getAllParticipants,
   getAllAdmins,
   getParticipantById,
@@ -1030,7 +1854,14 @@ module.exports = {
   getAdminActivity,
   getApprovalsCount,
   getApprovals,
+  getApplicationSummary,
   adminSearch,
+  getPendingProjectAccessRequests,
+  approveProjectAccessRequest,
+  rejectProjectAccessRequest,
+  getPendingProductApplications,
+  approveProductApplication,
+  rejectProductApplication,
   approvePurchaseProof,
   generatePayoutBatch,
   getPayoutBatches,

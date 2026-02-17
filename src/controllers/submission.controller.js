@@ -97,6 +97,22 @@ const submitFeedback = async (req, res, next) => {
       });
     }
 
+    const { data: reviewProof, error: reviewProofError } = await supabase
+      .from('participant_reviews')
+      .select('id, status')
+      .eq('allocation_id', allocationId)
+      .eq('participant_id', participantId)
+      .neq('status', 'REJECTED')
+      .maybeSingle();
+
+    if (reviewProofError) throw reviewProofError;
+    if (!reviewProof) {
+      return res.status(400).json({
+        success: false,
+        message: 'Marketplace review screenshot is required before feedback submission'
+      });
+    }
+
     const normalizedRating = Number(rating);
     if (!Number.isFinite(normalizedRating) || normalizedRating < 1 || normalizedRating > 5) {
       return res.status(400).json({
@@ -162,10 +178,10 @@ const submitReview = async (req, res, next) => {
     const participantId = req.user.id;
     const { allocationId, reviewText, reviewUrl } = req.body;
 
-    if (!allocationId || !reviewText || !reviewUrl) {
+    if (!allocationId) {
       return res.status(400).json({
         success: false,
-        message: 'allocationId, reviewText, and reviewUrl are required'
+        message: 'allocationId is required'
       });
     }
 
@@ -178,10 +194,24 @@ const submitReview = async (req, res, next) => {
     }
 
     const projectMode = String(allocation?.projects?.mode || '').toUpperCase();
-    if (projectMode !== 'D2C') {
+    if (!['D2C', 'MARKETPLACE'].includes(projectMode)) {
       return res.status(400).json({
         success: false,
-        message: 'External review submission is only allowed for D2C mode'
+        message: 'Review submission is not enabled for this project mode'
+      });
+    }
+
+    if (projectMode === 'MARKETPLACE' && !reviewUrl) {
+      return res.status(400).json({
+        success: false,
+        message: 'Marketplace mode requires review screenshot URL'
+      });
+    }
+
+    if (projectMode === 'D2C' && !reviewText && !reviewUrl) {
+      return res.status(400).json({
+        success: false,
+        message: 'Review text or review URL is required when submitting a D2C review'
       });
     }
 
@@ -214,8 +244,8 @@ const submitReview = async (req, res, next) => {
         allocation_id: allocationId,
         participant_id: participantId,
         project_id: allocation.project_id,
-        review_text: String(reviewText).trim(),
-        review_url: String(reviewUrl).trim(),
+        review_text: String(reviewText || '').trim(),
+        review_url: String(reviewUrl || '').trim(),
         status: 'PENDING'
       })
       .select()
