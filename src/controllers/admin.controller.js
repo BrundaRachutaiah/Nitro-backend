@@ -2041,20 +2041,133 @@ const getEligiblePayouts = async (req, res, next) => {
 const getPayoutBatches = async (req, res, next) => {
   try {
     const { page = 1, limit = 20 } = req.query;
+    const requestedStatus = normalizeStatus(req.query.status || 'ALL');
     const from = (Number(page) - 1) * Number(limit);
     const to = from + Number(limit) - 1;
 
-    const { data, count, error } = await supabase
+    let query = supabase
       .from('payout_batches')
       .select('id, total_amount, status, created_at, created_by', { count: 'exact' })
-      .order('created_at', { ascending: false })
-      .range(from, to);
+      .order('created_at', { ascending: false });
+
+    if (requestedStatus === 'ACTIVE') {
+      query = query.neq('status', 'PAID');
+    } else if (requestedStatus === 'IN_BATCH') {
+      query = query.in('status', ['IN_BATCH', 'PENDING']);
+    } else if (requestedStatus !== 'ALL') {
+      query = query.eq('status', requestedStatus);
+    }
+
+    const { data, count, error } = await query.range(from, to);
 
     if (error) throw error;
 
+    const batchRows = data || [];
+    const batchIds = batchRows.map((row) => row.id).filter(Boolean);
+
+    let payoutsRes = { data: [], error: null };
+    if (batchIds.length) {
+      payoutsRes = await supabase
+        .from('payouts')
+        .select('id, payout_batch_id, participant_id')
+        .in('payout_batch_id', batchIds);
+      if (payoutsRes.error) throw payoutsRes.error;
+    }
+
+    const payoutRows = payoutsRes.data || [];
+    const participantIds = [...new Set(payoutRows.map((row) => row.participant_id).filter(Boolean))];
+
+    let profilesRes = { data: [], error: null };
+    let detailsRes = { data: [], error: null };
+    if (participantIds.length) {
+      profilesRes = await supabase
+        .from('profiles')
+        .select(
+          `
+          id,
+          full_name,
+          email
+          `
+        )
+        .in('id', participantIds);
+
+      if (profilesRes.error && isMissingSchemaObjectError(profilesRes.error)) {
+        profilesRes = await supabase
+          .from('profiles')
+          .select('id, full_name, email')
+          .in('id', participantIds);
+      }
+      if (profilesRes.error) throw profilesRes.error;
+
+      detailsRes = await supabase
+        .from('participant_details')
+        .select(
+          `
+          participant_id,
+          bank_account_name,
+          bank_account_number,
+          bank_ifsc,
+          bank_name,
+          address_line1,
+          address_line2,
+          city,
+          state,
+          pincode,
+          country
+          `
+        )
+        .in('participant_id', participantIds);
+      if (detailsRes.error && !isMissingSchemaObjectError(detailsRes.error)) throw detailsRes.error;
+    }
+
+    const profileMap = new Map((profilesRes.data || []).map((row) => [row.id, row]));
+    const detailMap = new Map((detailsRes.data || []).map((row) => [row.participant_id, row]));
+    const participantsByBatchId = new Map();
+
+    for (const payout of payoutRows) {
+      const batchId = payout?.payout_batch_id;
+      const participantId = payout?.participant_id;
+      if (!batchId || !participantId) continue;
+
+      if (!participantsByBatchId.has(batchId)) {
+        participantsByBatchId.set(batchId, new Map());
+      }
+
+      const bucket = participantsByBatchId.get(batchId);
+      if (bucket.has(participantId)) continue;
+
+      const profile = profileMap.get(participantId) || {};
+      const details = detailMap.get(participantId) || {};
+      bucket.set(participantId, {
+        id: participantId,
+        full_name: profile.full_name || null,
+        email: profile.email || null,
+        bank_account_name: details.bank_account_name || null,
+        bank_account_number: details.bank_account_number || null,
+        bank_ifsc: details.bank_ifsc || null,
+        bank_name: details.bank_name || null,
+        address_line1: details.address_line1 || null,
+        address_line2: details.address_line2 || null,
+        city: details.city || null,
+        state: details.state || null,
+        pincode: details.pincode || null,
+        country: details.country || null
+      });
+    }
+
+    const enrichedRows = batchRows.map((batch) => {
+      const participantMap = participantsByBatchId.get(batch.id) || new Map();
+      const participants = Array.from(participantMap.values());
+      return {
+        ...batch,
+        participant_count: participants.length,
+        participants
+      };
+    });
+
     res.json({
       success: true,
-      data: data || [],
+      data: enrichedRows,
       meta: {
         page: Number(page),
         limit: Number(limit),
@@ -2508,49 +2621,150 @@ const exportPayoutReportCSV = async (req, res, next) => {
 /**
  * Export payout batch CSV
  */
+const fetchPayoutExportRows = async ({ batchIds = [] } = {}) => {
+  if (!Array.isArray(batchIds) || !batchIds.length) return [];
+
+  let payoutsRes = await supabase
+    .from('payouts')
+    .select('id, amount, status, payout_batch_id, participant_id, project_id')
+    .in('payout_batch_id', batchIds);
+
+  if (payoutsRes.error && isMissingSchemaObjectError(payoutsRes.error)) {
+    payoutsRes = await supabase
+      .from('payouts')
+      .select('id, amount, status, payout_batch_id')
+      .in('payout_batch_id', batchIds);
+  }
+  if (payoutsRes.error) throw payoutsRes.error;
+  const payouts = payoutsRes.data || [];
+
+  const participantIds = [...new Set(payouts.map((row) => row.participant_id).filter(Boolean))];
+  const projectIds = [...new Set(payouts.map((row) => row.project_id).filter(Boolean))];
+
+  let profilesRes = { data: [], error: null };
+  let detailsRes = { data: [], error: null };
+  if (participantIds.length) {
+    profilesRes = await supabase
+      .from('profiles')
+      .select(
+        `
+        id,
+        full_name,
+        email
+      `
+      )
+      .in('id', participantIds);
+
+    if (profilesRes.error && isMissingSchemaObjectError(profilesRes.error)) {
+      profilesRes = await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', participantIds);
+    }
+    if (profilesRes.error) throw profilesRes.error;
+
+    detailsRes = await supabase
+      .from('participant_details')
+      .select(
+        `
+        participant_id,
+        bank_account_name,
+        bank_account_number,
+        bank_ifsc,
+        bank_name,
+        address_line1,
+        address_line2,
+        city,
+        state,
+        pincode,
+        country
+      `
+      )
+      .in('participant_id', participantIds);
+    if (detailsRes.error && !isMissingSchemaObjectError(detailsRes.error)) throw detailsRes.error;
+  }
+
+  let projectsRes = { data: [], error: null };
+  if (projectIds.length) {
+    projectsRes = await supabase
+      .from('projects')
+      .select('id, title, name')
+      .in('id', projectIds);
+    if (projectsRes.error) throw projectsRes.error;
+  }
+
+  const profileMap = new Map((profilesRes.data || []).map((row) => [row.id, row]));
+  const detailMap = new Map((detailsRes.data || []).map((row) => [row.participant_id, row]));
+  const projectMap = new Map((projectsRes.data || []).map((row) => [row.id, row]));
+
+  return payouts.map((row) => ({
+    ...row,
+    profiles: {
+      ...(profileMap.get(row.participant_id) || {}),
+      ...(detailMap.get(row.participant_id) || {})
+    },
+    projects: projectMap.get(row.project_id) || null
+  }));
+};
+
+const buildPayoutExportCsvRows = (payouts = []) => {
+  return payouts.map((row) => {
+    const profile = row?.profiles || {};
+    const addressParts = [
+      profile.address_line1,
+      profile.address_line2,
+      profile.city,
+      profile.state,
+      profile.pincode,
+      profile.country
+    ].filter(Boolean);
+
+    return {
+      payout_batch_id: row.payout_batch_id || null,
+      payout_id: row.id,
+      participant_name: profile.full_name || null,
+      participant_email: profile.email || null,
+      account_holder_name: profile.bank_account_name || null,
+      bank_account_number: profile.bank_account_number || null,
+      bank_ifsc: profile.bank_ifsc || null,
+      bank_name: profile.bank_name || null,
+      participant_address: addressParts.join(', ') || null,
+      project_title: row?.projects?.title || row?.projects?.name || null,
+      amount: row.amount,
+      status: row.status
+    };
+  });
+};
+
 const exportPayoutBatchCSV = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const { data: payouts, error } = await supabase
-      .from('payouts')
-      .select(
-        `
-        id,
-        amount,
-        status,
-        profiles (
-          id,
-          full_name,
-          email
-        ),
-        projects (
-          id,
-          title
-        )
-      `
-      )
-      .eq('payout_batch_id', id);
+    const payouts = await fetchPayoutExportRows({ batchIds: [id] });
 
-    if (error) throw error;
-
-    if (!payouts || payouts.length === 0) {
+    if (!payouts.length) {
       return res.status(404).json({
         success: false,
         message: 'No payouts found for this batch'
       });
     }
 
-    const csvData = payouts.map(p => ({
-      payout_id: p.id,
-      participant_name: p.profiles?.full_name,
-      participant_email: p.profiles?.email,
-      project_title: p.projects?.title,
-      amount: p.amount,
-      status: p.status
-    }));
-
-    const parser = new Parser();
+    const csvData = buildPayoutExportCsvRows(payouts);
+    const fields = [
+      'payout_batch_id',
+      'payout_id',
+      'participant_name',
+      'participant_email',
+      'account_holder_name',
+      'bank_account_number',
+      'bank_ifsc',
+      'bank_name',
+      'participant_address',
+      'project_title',
+      'amount',
+      'status'
+    ];
+    const parser = new Parser({ fields });
     const csv = parser.parse(csvData);
 
     await supabase
@@ -2566,6 +2780,80 @@ const exportPayoutBatchCSV = async (req, res, next) => {
     next(err);
   }
 };
+
+const exportPayoutBatchesCSV = async (req, res, next) => {
+  try {
+    const statusFilter = normalizeStatus(req.query.status || 'ALL');
+    const batchIdsQuery = String(req.query.batch_ids || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    let batchQuery = supabase
+      .from('payout_batches')
+      .select('id, status, created_at')
+      .order('created_at', { ascending: false });
+
+    if (batchIdsQuery.length) {
+      batchQuery = batchQuery.in('id', batchIdsQuery);
+    } else if (statusFilter === 'IN_BATCH') {
+      batchQuery = batchQuery.in('status', ['IN_BATCH', 'PENDING']);
+    } else if (statusFilter !== 'ALL') {
+      batchQuery = batchQuery.eq('status', statusFilter);
+    }
+
+    const { data: batches, error: batchError } = await batchQuery;
+    if (batchError) throw batchError;
+
+    const selectedBatchIds = (batches || []).map((row) => row.id).filter(Boolean);
+    if (!selectedBatchIds.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'No payout batches found for the selected filter'
+      });
+    }
+
+    const payouts = await fetchPayoutExportRows({ batchIds: selectedBatchIds });
+    if (!payouts.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'No payouts found for the selected batches'
+      });
+    }
+
+    const csvData = buildPayoutExportCsvRows(payouts);
+    const fields = [
+      'payout_batch_id',
+      'payout_id',
+      'participant_name',
+      'participant_email',
+      'account_holder_name',
+      'bank_account_number',
+      'bank_ifsc',
+      'bank_name',
+      'participant_address',
+      'project_title',
+      'amount',
+      'status'
+    ];
+    const parser = new Parser({ fields });
+    const csv = parser.parse(csvData);
+
+    await supabase
+      .from('payout_batches')
+      .update({ status: 'EXPORTED' })
+      .in('id', selectedBatchIds)
+      .neq('status', 'PAID');
+
+    const suffix = statusFilter === 'ALL' ? 'all' : statusFilter.toLowerCase();
+    res.header('Content-Type', 'text/csv');
+    res.attachment(`payout_batches_${suffix}_${new Date().toISOString().slice(0, 10)}.csv`);
+    res.send(csv);
+  } catch (err) {
+    next(err);
+  }
+};
+
 
 /**
  * Support tickets (Admin)
@@ -2830,6 +3118,7 @@ module.exports = {
   exportPayoutReportCSV,
   getPayoutBatches,
   markPayoutBatchPaid,
+  exportPayoutBatchesCSV,
   exportPayoutBatchCSV,
   getAdminSupportTickets,
   getAdminSupportTicketById,

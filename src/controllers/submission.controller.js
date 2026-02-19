@@ -183,45 +183,84 @@ const getProofStatus = async (allocationId, participantId) => {
   return String(data?.status || '').toUpperCase() || null;
 };
 
-const ensureEligiblePayout = async ({ participantId, projectId, fallbackReward = 0, purchaseProofId = null }) => {
-  const { data: existing, error: lookupError } = await supabase
+const ensureEligiblePayout = async ({ participantId, projectId }) => {
+
+  // 1️⃣ Check review approved for this project
+  const { data: review, error: reviewError } = await supabase
+    .from('participant_reviews')
+    .select('id, allocation_id')
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .eq('status', 'APPROVED')
+    .maybeSingle();
+
+  if (reviewError) throw reviewError;
+  if (!review) return; // stop if no approved review
+
+  // 2️⃣ Check purchase proof approved for this allocation
+  const { data: proof, error: proofError } = await supabase
+    .from('purchase_proofs')
+    .select('id')
+    .eq('allocation_id', review.allocation_id)
+    .eq('participant_id', participantId)
+    .eq('status', 'APPROVED')
+    .maybeSingle();
+
+  if (proofError) throw proofError;
+  if (!proof) return; // stop if purchase not approved
+
+  // 3️⃣ Prevent duplicate payout
+  const { data: existing } = await supabase
     .from('payouts')
     .select('id')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
     .maybeSingle();
 
-  if (lookupError) throw lookupError;
   if (existing) return;
 
-  const breakdown = await calculatePayoutBreakdown({
-    supabase,
-    participantId,
-    projectId,
-    fallbackReward
-  });
+  // 4️⃣ Get reward
+  const { data: project } = await supabase
+    .from('projects')
+    .select('reward')
+    .eq('id', projectId)
+    .maybeSingle();
 
-  let insertError = null;
-  ({ error: insertError } = await supabase
+  const rewardAmount = Number(project?.reward || 0);
+
+  // 5️⃣ Get product value
+  const { data: application } = await supabase
+    .from('project_applications')
+    .select('product_id, allocated_budget')
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .eq('status', 'APPROVED')
+    .maybeSingle();
+
+  let productAmount = Number(application?.allocated_budget || 0);
+
+  if (!productAmount && application?.product_id) {
+    const { data: product } = await supabase
+      .from('project_products')
+      .select('product_value')
+      .eq('id', application.product_id)
+      .maybeSingle();
+
+    productAmount = Number(product?.product_value || 0);
+  }
+
+  const totalAmount = rewardAmount + productAmount;
+
+  // 6️⃣ Insert payout
+  const { error: insertError } = await supabase
     .from('payouts')
     .insert({
       participant_id: participantId,
       project_id: projectId,
-      purchase_proof_id: purchaseProofId,
-      amount: Number(breakdown.totalAmount) || 0,
+      purchase_proof_id: proof.id,
+      amount: totalAmount,
       status: 'ELIGIBLE'
-    }));
-
-  if (insertError && isMissingSchemaObjectError(insertError)) {
-    ({ error: insertError } = await supabase
-      .from('payouts')
-      .insert({
-        participant_id: participantId,
-        project_id: projectId,
-        amount: Number(breakdown.totalAmount) || 0,
-        status: 'ELIGIBLE'
-      }));
-  }
+    });
 
   if (insertError) throw insertError;
 };

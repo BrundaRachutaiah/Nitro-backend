@@ -6,6 +6,8 @@ const {
   purchaseRejectedEmail
 } = require('../services/email.templates');
 
+const { ensureEligiblePayout } = require('./submission.controller');
+
 const buildAppMapKey = (participantId, projectId) => `${participantId}::${projectId}`;
 
 const getApprovedApplicationMap = async (participantIds, projectIds) => {
@@ -163,12 +165,13 @@ const approvePurchaseProof = async (req, res, next) => {
   try {
     const { id } = req.params;
 
+    // ✅ Single update only
     const { data } = await supabase
       .from('purchase_proofs')
       .update({ status: PROOF_STATUS.APPROVED })
       .eq('id', id)
       .eq('status', PROOF_STATUS.PENDING)
-      .select('id, participant_id')
+      .select('id, participant_id, allocation_id')
       .maybeSingle();
 
     if (!data) {
@@ -178,11 +181,27 @@ const approvePurchaseProof = async (req, res, next) => {
       });
     }
 
+    // 🔥 Auto payout check
+    const { data: allocation } = await supabase
+      .from('unit_allocations')
+      .select('project_id')
+      .eq('id', data.allocation_id)
+      .maybeSingle();
+
+    if (allocation?.project_id) {
+      await ensureEligiblePayout({
+        participantId: data.participant_id,
+        projectId: allocation.project_id
+      });
+    }
+
+    // ✅ Response
     res.json({
       success: true,
       message: 'Purchase proof approved'
     });
 
+    // ✅ Email logic remains unchanged
     const { data: participant } = await supabase
       .from('profiles')
       .select('email')
@@ -196,6 +215,7 @@ const approvePurchaseProof = async (req, res, next) => {
         html: purchaseApprovedEmail()
       });
     }
+
   } catch (err) {
     next(err);
   }

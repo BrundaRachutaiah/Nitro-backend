@@ -206,6 +206,13 @@ router.patch(
 );
 
 router.get(
+  '/payout-batches/export',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.exportPayoutBatchesCSV
+);
+
+router.get(
   '/payout-batches/:id/export',
   authMiddleware,
   roleMiddleware('ADMIN', 'SUPER_ADMIN'),
