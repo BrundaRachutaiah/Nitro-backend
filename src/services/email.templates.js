@@ -20,9 +20,22 @@ const purchaseRejectedEmail = () => `
   <p>Please re-upload a valid invoice.</p>
 `;
 
+const allocationReminderEmail = ({ projectName, hoursLeft, expiryDate }) => `
+  <p>Your reservation for <b>${projectName}</b> will expire in <b>${hoursLeft} hours</b>.</p>
+  <p>Please upload invoice/proof before <b>${expiryDate}</b>.</p>
+  <p>If required for your flow, submit your review after proof approval.</p>
+`;
+
+const allocationExpiredEmail = ({ projectName }) => `
+  <p>Your reservation for <b>${projectName}</b> has expired.</p>
+  <p>The reserved unit is now released. Please re-apply or request access again if you want to continue.</p>
+`;
+
 module.exports = {
   approvalEmail,
   allocationEmail,
   purchaseApprovedEmail,
-  purchaseRejectedEmail
+  purchaseRejectedEmail,
+  allocationReminderEmail,
+  allocationExpiredEmail
 };

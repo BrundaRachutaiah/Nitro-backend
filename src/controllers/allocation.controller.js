@@ -227,7 +227,7 @@ const getMyAllocationTracking = async (req, res, next) => {
     const allocationIds = allocations.map((item) => item.id);
     const projectIds = [...new Set(allocations.map((item) => item.project_id).filter(Boolean))];
 
-    const [proofsRes, reviewsRes, feedbacksRes, payoutsRes] = await Promise.all([
+    const [proofsRes, reviewsRes, feedbacksRes, payoutsRes, applicationsRes] = await Promise.all([
       supabase
         .from('purchase_proofs')
         .select('id, allocation_id, participant_id, status, file_url, created_at')
@@ -253,6 +253,29 @@ const getMyAllocationTracking = async (req, res, next) => {
             .eq('participant_id', participantId)
             .in('project_id', projectIds)
             .order('created_at', { ascending: false })
+        : Promise.resolve({ data: [], error: null }),
+      projectIds.length
+        ? supabase
+            .from('project_applications')
+            .select(
+              `
+              id,
+              project_id,
+              product_id,
+              allocated_budget,
+              status,
+              project_products (
+                id,
+                name,
+                product_value,
+                product_url
+              )
+            `
+            )
+            .eq('participant_id', participantId)
+            .in('project_id', projectIds)
+            .eq('status', 'APPROVED')
+            .order('created_at', { ascending: false })
         : Promise.resolve({ data: [], error: null })
     ]);
 
@@ -260,12 +283,22 @@ const getMyAllocationTracking = async (req, res, next) => {
     if (proofsRes.error) {
       if (!isMissingSchemaObjectError(proofsRes.error)) throw proofsRes.error;
 
-      const fallbackProofs = await supabase
+      // Some DBs use uploaded_at instead of created_at for purchase proofs.
+      let fallbackProofs = await supabase
         .from('purchase_proofs')
-        .select('id, allocation_id, participant_id, status, created_at')
+        .select('id, allocation_id, participant_id, status, file_url, uploaded_at')
         .eq('participant_id', participantId)
         .in('allocation_id', allocationIds)
-        .order('created_at', { ascending: false });
+        .order('uploaded_at', { ascending: false });
+
+      if (fallbackProofs.error && isMissingSchemaObjectError(fallbackProofs.error)) {
+        fallbackProofs = await supabase
+          .from('purchase_proofs')
+          .select('id, allocation_id, participant_id, status, uploaded_at')
+          .eq('participant_id', participantId)
+          .in('allocation_id', allocationIds)
+          .order('uploaded_at', { ascending: false });
+      }
 
       if (fallbackProofs.error && !isMissingSchemaObjectError(fallbackProofs.error)) {
         throw fallbackProofs.error;
@@ -273,7 +306,8 @@ const getMyAllocationTracking = async (req, res, next) => {
 
       proofRows = (fallbackProofs.data || []).map((item) => ({
         ...item,
-        file_url: null
+        created_at: item.created_at || item.uploaded_at || null,
+        file_url: item.file_url || null
       }));
     }
 
@@ -310,6 +344,58 @@ const getMyAllocationTracking = async (req, res, next) => {
       }
     }
 
+    let approvedApplications = applicationsRes.data || [];
+    if (applicationsRes.error) {
+      if (!isMissingSchemaObjectError(applicationsRes.error)) throw applicationsRes.error;
+
+      const fallbackApps = projectIds.length
+        ? await supabase
+            .from('project_applications')
+            .select('id, project_id, product_id, allocated_budget, status')
+            .eq('participant_id', participantId)
+            .in('project_id', projectIds)
+            .eq('status', 'APPROVED')
+            .order('created_at', { ascending: false })
+        : { data: [], error: null };
+
+      if (fallbackApps.error && !isMissingSchemaObjectError(fallbackApps.error)) {
+        throw fallbackApps.error;
+      }
+
+      approvedApplications = (fallbackApps.data || []).map((item) => ({
+        ...item,
+        project_products: null
+      }));
+    }
+
+    // Fallback: if relational select does not hydrate product details, fetch by product_id.
+    const missingProductDetails = approvedApplications
+      .some((item) => item?.product_id && !item?.project_products);
+    if (missingProductDetails) {
+      const productIds = [...new Set(
+        approvedApplications.map((item) => item?.product_id).filter(Boolean)
+      )];
+
+      let productMap = new Map();
+      if (productIds.length) {
+        const { data: productRows, error: productError } = await supabase
+          .from('project_products')
+          .select('id, name, product_value, product_url')
+          .in('id', productIds);
+
+        if (productError && !isMissingSchemaObjectError(productError)) {
+          throw productError;
+        }
+
+        productMap = new Map((productRows || []).map((row) => [row.id, row]));
+      }
+
+      approvedApplications = approvedApplications.map((item) => ({
+        ...item,
+        project_products: item?.project_products || productMap.get(item?.product_id) || null
+      }));
+    }
+
     const proofsByAllocation = new Map();
     for (const item of proofRows) {
       if (!proofsByAllocation.has(item.allocation_id)) {
@@ -343,6 +429,13 @@ const getMyAllocationTracking = async (req, res, next) => {
       }
     }
 
+    const applicationByProjectId = new Map();
+    for (const item of approvedApplications) {
+      if (item.project_id && !applicationByProjectId.has(item.project_id)) {
+        applicationByProjectId.set(item.project_id, item);
+      }
+    }
+
     const rows = allocations.map((allocation) => {
       const proof = proofsByAllocation.get(allocation.id) || null;
       const review = reviewsByAllocation.get(allocation.id) || null;
@@ -350,9 +443,12 @@ const getMyAllocationTracking = async (req, res, next) => {
       const payout = (proof?.id && payoutsByProofId.get(proof.id))
         || payoutsByProjectId.get(allocation.project_id)
         || null;
+      const application = applicationByProjectId.get(allocation.project_id) || null;
 
       return {
         ...allocation,
+        selected_product: application?.project_products || null,
+        allocated_budget: Number(application?.allocated_budget || 0),
         purchase_proof: proof,
         review_submission: review,
         feedback_submission: feedback,
@@ -481,34 +577,51 @@ const updateAllocationStatus = async (req, res, next) => {
     const { id } = req.params;
     const { status } = req.body;
 
-    if (status !== ALLOCATION_STATUS.COMPLETED) {
+    if (![ALLOCATION_STATUS.PURCHASED, ALLOCATION_STATUS.COMPLETED].includes(status)) {
       return res.status(400).json({
         success: false,
         message: 'Invalid status transition'
       });
     }
 
-    const { data, error } = await supabase
-      .from('unit_allocations')
-      .update({ completed_at: new Date().toISOString() })
-      .eq('id', id)
-      .eq('participant_id', participantId)
-      .is('completed_at', null)
-      .select()
-      .maybeSingle();
+    let data;
+    let error;
+
+    if (status === ALLOCATION_STATUS.PURCHASED) {
+      ({ data, error } = await supabase
+        .from('unit_allocations')
+        .update({ status: ALLOCATION_STATUS.PURCHASED })
+        .eq('id', id)
+        .eq('participant_id', participantId)
+        .is('completed_at', null)
+        .select()
+        .maybeSingle());
+    } else {
+      ({ data, error } = await supabase
+        .from('unit_allocations')
+        .update({ completed_at: new Date().toISOString(), status: ALLOCATION_STATUS.COMPLETED })
+        .eq('id', id)
+        .eq('participant_id', participantId)
+        .is('completed_at', null)
+        .select()
+        .maybeSingle());
+    }
 
     if (error) throw error;
 
     if (!data) {
       return res.status(404).json({
         success: false,
-        message: 'Allocation not found or already completed'
+        message: 'Allocation not found or already processed'
       });
     }
 
     res.json({
       success: true,
-      message: 'Allocation marked as completed'
+      message: status === ALLOCATION_STATUS.PURCHASED
+        ? 'Allocation marked as purchased'
+        : 'Allocation marked as completed',
+      data
     });
   } catch (err) {
     next(err);

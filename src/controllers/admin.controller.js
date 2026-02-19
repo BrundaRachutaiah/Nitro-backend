@@ -7,10 +7,90 @@ const { ALLOCATION_STATUS } = require('../utils/constants');
 const { Parser } = require('json2csv');
 const { sendEmail } = require('../services/email.service');
 const { logActivity } = require('../services/activityLog.service');
+const { calculatePayoutBreakdown } = require('../utils/payout.utils');
 const {
   approvalEmail,
   purchaseApprovedEmail
 } = require('../services/email.templates');
+
+const isMissingSchemaObjectError = (error) => {
+  const text = String(error?.message || '').toLowerCase();
+  return (
+    text.includes('does not exist')
+    || text.includes('could not find')
+    || text.includes('schema cache')
+    || text.includes('column')
+    || text.includes('relation')
+    || text.includes('table')
+  );
+};
+
+const normalizeStatus = (value) => String(value || '').trim().toUpperCase();
+
+const toAmount = (value) => {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
+};
+
+const getApprovedApplicationBreakdownMap = async ({ participantIds = [], projectIds = [] } = {}) => {
+  if (!participantIds.length || !projectIds.length) return new Map();
+
+  let appRes = await supabase
+    .from('project_applications')
+    .select('participant_id, project_id, product_id, allocated_budget, status, created_at')
+    .in('participant_id', participantIds)
+    .in('project_id', projectIds)
+    .eq('status', 'APPROVED')
+    .order('created_at', { ascending: false });
+
+  if (appRes.error && /created_at/i.test(String(appRes.error.message || ''))) {
+    appRes = await supabase
+      .from('project_applications')
+      .select('participant_id, project_id, product_id, allocated_budget, status')
+      .in('participant_id', participantIds)
+      .in('project_id', projectIds)
+      .eq('status', 'APPROVED');
+  }
+  if (appRes.error) throw appRes.error;
+
+  const latestAppByPair = new Map();
+  for (const row of (appRes.data || [])) {
+    const key = `${row.participant_id}::${row.project_id}`;
+    if (!latestAppByPair.has(key)) latestAppByPair.set(key, row);
+  }
+
+  const appProjectIds = [...new Set(Array.from(latestAppByPair.values()).map((row) => row.project_id).filter(Boolean))];
+  const productIds = [...new Set(Array.from(latestAppByPair.values()).map((row) => row.product_id).filter(Boolean))];
+
+  const [projectsRes, productsRes] = await Promise.all([
+    appProjectIds.length
+      ? supabase.from('projects').select('id, reward').in('id', appProjectIds)
+      : Promise.resolve({ data: [], error: null }),
+    productIds.length
+      ? supabase.from('project_products').select('id, product_value').in('id', productIds)
+      : Promise.resolve({ data: [], error: null })
+  ]);
+
+  if (projectsRes.error) throw projectsRes.error;
+  if (productsRes.error && !isMissingSchemaObjectError(productsRes.error)) throw productsRes.error;
+
+  const projectRewardMap = new Map((projectsRes.data || []).map((row) => [row.id, toAmount(row.reward)]));
+  const productValueMap = new Map((productsRes.data || []).map((row) => [row.id, toAmount(row.product_value)]));
+
+  const breakdownMap = new Map();
+  for (const [key, app] of latestAppByPair.entries()) {
+    const rewardAmount = toAmount(projectRewardMap.get(app.project_id));
+    const allocatedBudget = toAmount(app.allocated_budget);
+    const productAmount = allocatedBudget > 0 ? allocatedBudget : toAmount(productValueMap.get(app.product_id));
+    breakdownMap.set(key, {
+      rewardAmount,
+      productAmount,
+      totalAmount: rewardAmount + productAmount
+    });
+  }
+
+  return breakdownMap;
+};
 
 const fillParticipantIdentity = async (rows = []) => {
   return Promise.all(
@@ -365,21 +445,297 @@ const getParticipantById = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const { data } = await supabase
+    const { data: profile, error: profileError } = await supabase
       .from('profiles')
       .select('*')
       .eq('id', id)
       .eq('role', 'PARTICIPANT')
       .maybeSingle();
 
-    if (!data) {
+    if (profileError) throw profileError;
+
+    if (!profile) {
       return res.status(404).json({
         success: false,
         message: 'Participant not found'
       });
     }
 
-    res.json({ success: true, data });
+    const { data: participantDetails, error: participantDetailsError } = await supabase
+      .from('participant_details')
+      .select('*')
+      .eq('participant_id', id)
+      .maybeSingle();
+
+    if (participantDetailsError && !/does not exist|relation|schema cache|table|column/i.test(String(participantDetailsError.message || ''))) {
+      throw participantDetailsError;
+    }
+
+    let applicationRes = await supabase
+      .from('project_applications')
+      .select(
+        `
+        id,
+        project_id,
+        product_id,
+        status,
+        allocated_budget,
+        created_at,
+        reviewed_at,
+        projects (
+          id,
+          title,
+          name,
+          mode,
+          reward
+        ),
+        project_products (
+          id,
+          name,
+          product_value,
+          product_url
+        )
+      `
+      )
+      .eq('participant_id', id)
+      .order('created_at', { ascending: false });
+
+    if (applicationRes.error && /created_at/i.test(String(applicationRes.error.message || ''))) {
+      applicationRes = await supabase
+        .from('project_applications')
+        .select(
+          `
+          id,
+          project_id,
+          product_id,
+          status,
+          allocated_budget,
+          reviewed_at,
+          projects (
+            id,
+            title,
+            name,
+            mode,
+            reward
+          ),
+          project_products (
+            id,
+            name,
+            product_value,
+            product_url
+          )
+        `
+        )
+        .eq('participant_id', id);
+    }
+    if (applicationRes.error && /project_products|relationship|schema cache|does not exist/i.test(String(applicationRes.error.message || ''))) {
+      applicationRes = await supabase
+        .from('project_applications')
+        .select(
+          `
+          id,
+          project_id,
+          product_id,
+          status,
+          allocated_budget,
+          created_at,
+          reviewed_at,
+          projects (
+            id,
+            title,
+            name,
+            mode,
+            reward
+          )
+        `
+        )
+        .eq('participant_id', id)
+        .order('created_at', { ascending: false });
+    }
+    if (applicationRes.error) throw applicationRes.error;
+
+    let allocationRes = await supabase
+      .from('unit_allocations')
+      .select('id, project_id, status, reserved_until, completed_at, created_at')
+      .eq('participant_id', id)
+      .order('created_at', { ascending: false });
+
+    if (allocationRes.error && /completed_at/i.test(String(allocationRes.error.message || ''))) {
+      allocationRes = await supabase
+        .from('unit_allocations')
+        .select('id, project_id, status, reserved_until, created_at')
+        .eq('participant_id', id)
+        .order('created_at', { ascending: false });
+    }
+
+    if (allocationRes.error && /created_at/i.test(String(allocationRes.error.message || ''))) {
+      allocationRes = await supabase
+        .from('unit_allocations')
+        .select('id, project_id, status, reserved_until, completed_at')
+        .eq('participant_id', id)
+        .order('reserved_until', { ascending: false });
+    }
+
+    if (allocationRes.error && /completed_at/i.test(String(allocationRes.error.message || ''))) {
+      allocationRes = await supabase
+        .from('unit_allocations')
+        .select('id, project_id, status, reserved_until')
+        .eq('participant_id', id)
+        .order('reserved_until', { ascending: false });
+    }
+    if (allocationRes.error) throw allocationRes.error;
+
+    let proofsRes = await supabase
+      .from('purchase_proofs')
+      .select('id, allocation_id, participant_id, status, file_url, created_at, uploaded_at')
+      .eq('participant_id', id)
+      .order('uploaded_at', { ascending: false });
+
+    if (proofsRes.error && /created_at/i.test(String(proofsRes.error.message || ''))) {
+      proofsRes = await supabase
+        .from('purchase_proofs')
+        .select('id, allocation_id, participant_id, status, file_url, uploaded_at')
+        .eq('participant_id', id)
+        .order('uploaded_at', { ascending: false });
+    }
+    if (proofsRes.error) throw proofsRes.error;
+
+    const { data: reviews, error: reviewsError } = await supabase
+      .from('participant_reviews')
+      .select('id, allocation_id, participant_id, project_id, status, review_text, review_url, created_at')
+      .eq('participant_id', id)
+      .order('created_at', { ascending: false });
+    if (reviewsError) throw reviewsError;
+
+    const { data: payouts, error: payoutsError } = await supabase
+      .from('payouts')
+      .select('id, participant_id, project_id, payout_batch_id, amount, status, created_at')
+      .eq('participant_id', id)
+      .order('created_at', { ascending: false });
+    if (payoutsError) throw payoutsError;
+
+    let applications = applicationRes.data || [];
+    const allocations = allocationRes.data || [];
+    const proofs = proofsRes.data || [];
+    const reviewRows = reviews || [];
+    const payoutRows = payouts || [];
+
+    const missingProductRel = applications.some((row) => row.product_id && !row.project_products);
+    if (missingProductRel) {
+      const productIds = [...new Set(applications.map((row) => row.product_id).filter(Boolean))];
+      if (productIds.length) {
+        const { data: productRows, error: productError } = await supabase
+          .from('project_products')
+          .select('id, name, product_value, product_url')
+          .in('id', productIds);
+        if (!productError) {
+          const productMap = new Map((productRows || []).map((row) => [row.id, row]));
+          applications = applications.map((row) => ({
+            ...row,
+            project_products: row.project_products || productMap.get(row.product_id) || null
+          }));
+        }
+      }
+    }
+
+    const allocationsByProject = new Map();
+    for (const row of allocations) {
+      if (!allocationsByProject.has(row.project_id)) {
+        allocationsByProject.set(row.project_id, row);
+      }
+    }
+
+    const proofsByAllocation = new Map();
+    for (const row of proofs) {
+      if (!proofsByAllocation.has(row.allocation_id)) {
+        proofsByAllocation.set(row.allocation_id, row);
+      }
+    }
+
+    const reviewsByAllocation = new Map();
+    for (const row of reviewRows) {
+      if (!reviewsByAllocation.has(row.allocation_id)) {
+        reviewsByAllocation.set(row.allocation_id, row);
+      }
+    }
+
+    const reviewsByProject = new Map();
+    for (const row of reviewRows) {
+      if (row.project_id && !reviewsByProject.has(row.project_id)) {
+        reviewsByProject.set(row.project_id, row);
+      }
+    }
+
+    const payoutsByProject = new Map();
+    for (const row of payoutRows) {
+      if (row.project_id && !payoutsByProject.has(row.project_id)) {
+        payoutsByProject.set(row.project_id, row);
+      }
+    }
+
+    const completedProducts = applications
+      .filter((app) => String(app.status || '').toUpperCase() === 'APPROVED')
+      .map((app) => {
+        const allocation = allocationsByProject.get(app.project_id) || null;
+        const proof = allocation ? proofsByAllocation.get(allocation.id) || null : null;
+        const review = (allocation ? reviewsByAllocation.get(allocation.id) : null)
+          || reviewsByProject.get(app.project_id)
+          || null;
+        const payout = payoutsByProject.get(app.project_id) || null;
+
+        const projectName = app?.projects?.title || app?.projects?.name || '-';
+        const productName = app?.project_products?.name || '-';
+        const rewardAmount = Number(app?.projects?.reward || 0);
+        const allocatedBudget = Number(app?.allocated_budget || app?.project_products?.product_value || 0);
+        const totalPayout = rewardAmount + allocatedBudget;
+
+        return {
+          application_id: app.id,
+          project_id: app.project_id,
+          project_name: projectName,
+          project_mode: app?.projects?.mode || null,
+          product_id: app.product_id,
+          product_name: productName,
+          reward_amount: rewardAmount,
+          product_amount: allocatedBudget,
+          expected_payout_amount: totalPayout,
+          allocation_id: allocation?.id || null,
+          allocation_status: allocation?.status || null,
+          reserved_until: allocation?.reserved_until || null,
+          completed_at: allocation?.completed_at || null,
+          purchase_proof_status: proof?.status || null,
+          purchase_proof_url: proof?.file_url || null,
+          proof_uploaded_at: proof?.uploaded_at || proof?.created_at || null,
+          review_status: review?.status || null,
+          review_url: review?.review_url || null,
+          review_text: review?.review_text || null,
+          review_submitted_at: review?.created_at || null,
+          payout_status: payout?.status || null,
+          payout_amount: Number(payout?.amount || 0),
+          payout_batch_id: payout?.payout_batch_id || null,
+          payout_created_at: payout?.created_at || null
+        };
+      });
+
+    const summary = {
+      approved_applications: applications.filter((row) => String(row.status || '').toUpperCase() === 'APPROVED').length,
+      allocated_projects: allocations.length,
+      approved_purchase_proofs: proofs.filter((row) => String(row.status || '').toUpperCase() === 'APPROVED').length,
+      approved_reviews: reviewRows.filter((row) => String(row.status || '').toUpperCase() === 'APPROVED').length,
+      payouts_eligible: payoutRows.filter((row) => String(row.status || '').toUpperCase() === 'ELIGIBLE').length,
+      payouts_in_batch: payoutRows.filter((row) => ['IN_BATCH', 'EXPORTED'].includes(String(row.status || '').toUpperCase())).length,
+      payouts_paid: payoutRows.filter((row) => String(row.status || '').toUpperCase() === 'PAID').length
+    };
+
+    res.json({
+      success: true,
+      data: {
+        ...profile,
+        ...(participantDetails || {}),
+        summary,
+        completed_products: completedProducts
+      }
+    });
   } catch (err) {
     next(err);
   }
@@ -692,7 +1048,7 @@ const getAdminActivity = async (req, res, next) => {
  */
 const getApprovalsCount = async (req, res, next) => {
   try {
-    const [participants, purchaseProofs, payouts, projectAccessRequests, productApplications] = await Promise.all([
+    const [participants, purchaseProofs, pendingReviews, payouts, projectAccessRequests, productApplications] = await Promise.all([
       supabase
         .from('profiles')
         .select('id', { count: 'exact', head: true })
@@ -701,6 +1057,11 @@ const getApprovalsCount = async (req, res, next) => {
 
       supabase
         .from('purchase_proofs')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'PENDING'),
+
+      supabase
+        .from('participant_reviews')
         .select('id', { count: 'exact', head: true })
         .eq('status', 'PENDING'),
 
@@ -723,6 +1084,7 @@ const getApprovalsCount = async (req, res, next) => {
     const data = {
       participants: participants.count || 0,
       purchase_proofs: purchaseProofs.count || 0,
+      review_submissions: pendingReviews.count || 0,
       payouts: payouts.count || 0,
       project_access_requests: projectAccessRequests.count || 0,
       product_applications: productApplications.count || 0
@@ -737,6 +1099,7 @@ const getApprovalsCount = async (req, res, next) => {
           + data.project_access_requests
           + data.product_applications
           + data.purchase_proofs
+          + data.review_submissions
           + data.payouts
       }
     });
@@ -750,7 +1113,7 @@ const getApprovalsCount = async (req, res, next) => {
  */
 const getApprovals = async (req, res, next) => {
   try {
-    const [participants, proofs, payouts] = await Promise.all([
+    const [participants, proofs, pendingReviews, payouts] = await Promise.all([
       supabase
         .from('profiles')
         .select('id, full_name, created_at')
@@ -759,6 +1122,11 @@ const getApprovals = async (req, res, next) => {
 
       supabase
         .from('purchase_proofs')
+        .select('id, allocation_id, created_at')
+        .eq('status', 'PENDING'),
+
+      supabase
+        .from('participant_reviews')
         .select('id, allocation_id, created_at')
         .eq('status', 'PENDING'),
 
@@ -780,6 +1148,12 @@ const getApprovals = async (req, res, next) => {
         id: p.id,
         allocation_id: p.allocation_id,
         created_at: p.created_at
+      })),
+      ...(pendingReviews.data || []).map((review) => ({
+        type: 'review_submission',
+        id: review.id,
+        allocation_id: review.allocation_id,
+        created_at: review.created_at
       })),
       ...(payouts.data || []).map(p => ({
         type: 'payout',
@@ -895,6 +1269,25 @@ const getApplicationSummary = async (req, res, next) => {
       .select('status, created_at, reviewed_at');
     if (applicationError) throw applicationError;
 
+    let purchaseProofRows = [];
+    let purchaseProofRes = await supabase
+      .from('purchase_proofs')
+      .select('status, created_at, uploaded_at');
+
+    if (purchaseProofRes.error && /created_at/i.test(String(purchaseProofRes.error.message || ''))) {
+      purchaseProofRes = await supabase
+        .from('purchase_proofs')
+        .select('status, uploaded_at');
+    }
+
+    if (purchaseProofRes.error) throw purchaseProofRes.error;
+    purchaseProofRows = purchaseProofRes.data || [];
+
+    const { data: reviewRows, error: reviewError } = await supabase
+      .from('participant_reviews')
+      .select('status, created_at');
+    if (reviewError) throw reviewError;
+
     const loginSummary = {
       pending_count: participantRows.filter((row) => row.status === 'PENDING').length,
       total_requested: participantRows.length,
@@ -933,11 +1326,32 @@ const getApplicationSummary = async (req, res, next) => {
       last_rejected_at: getLatest(applicationRows || [], 'reviewed_at', (row) => row.status === 'REJECTED')
     };
 
+    const proofRowsNormalized = (purchaseProofRows || []).map((row) => ({
+      ...row,
+      created_at: row.created_at || row.uploaded_at || null
+    }));
+
+    const invoiceSummary = {
+      pending_count: proofRowsNormalized.filter((row) => row.status === 'PENDING').length,
+      total_requested: proofRowsNormalized.length,
+      approved_count: proofRowsNormalized.filter((row) => row.status === 'APPROVED').length,
+      rejected_count: proofRowsNormalized.filter((row) => row.status === 'REJECTED').length,
+      last_requested_at: getLatest(proofRowsNormalized, 'created_at')
+    };
+
+    const reviewSummary = {
+      pending_count: (reviewRows || []).filter((row) => row.status === 'PENDING').length,
+      total_requested: (reviewRows || []).length,
+      approved_count: (reviewRows || []).filter((row) => row.status === 'APPROVED').length,
+      rejected_count: (reviewRows || []).filter((row) => row.status === 'REJECTED').length,
+      last_requested_at: getLatest(reviewRows || [], 'created_at')
+    };
+
     const finalSummary = {
-      pending_total: loginSummary.pending_count + accessSummary.pending_count + productSummary.pending_count,
-      total_requested: loginSummary.total_requested + accessSummary.total_requested + productSummary.total_requested,
-      total_approved: loginSummary.approved_count + accessSummary.approved_count + productSummary.approved_count,
-      total_rejected: loginSummary.rejected_count + accessSummary.rejected_count + productSummary.rejected_count
+      pending_total: loginSummary.pending_count + accessSummary.pending_count + productSummary.pending_count + invoiceSummary.pending_count + reviewSummary.pending_count,
+      total_requested: loginSummary.total_requested + accessSummary.total_requested + productSummary.total_requested + invoiceSummary.total_requested + reviewSummary.total_requested,
+      total_approved: loginSummary.approved_count + accessSummary.approved_count + productSummary.approved_count + invoiceSummary.approved_count + reviewSummary.approved_count,
+      total_rejected: loginSummary.rejected_count + accessSummary.rejected_count + productSummary.rejected_count + invoiceSummary.rejected_count + reviewSummary.rejected_count
     };
 
     return res.json({
@@ -946,6 +1360,8 @@ const getApplicationSummary = async (req, res, next) => {
         login_requests: loginSummary,
         project_unlock_requests: accessSummary,
         product_applications: productSummary,
+        invoice_submissions: invoiceSummary,
+        review_submissions: reviewSummary,
         final_summary: finalSummary
       }
     });
@@ -1374,26 +1790,59 @@ const approvePurchaseProof = async (req, res, next) => {
         if (payoutLookupError) throw payoutLookupError;
 
         if (!existingPayout) {
-          const { error: payoutError } = await supabase
+          const breakdown = await calculatePayoutBreakdown({
+            supabase,
+            participantId: allocation.participant_id,
+            projectId: allocation.project_id,
+            fallbackReward: allocation?.projects?.reward
+          });
+
+          let payoutError = null;
+          ({ error: payoutError } = await supabase
             .from('payouts')
             .insert({
               participant_id: allocation.participant_id,
               project_id: allocation.project_id,
               purchase_proof_id: proof.id,
-              amount: Number(allocation?.projects?.reward || 0),
+              amount: Number(breakdown.totalAmount || 0),
               status: 'ELIGIBLE'
-            });
+            }));
+
+          if (payoutError && isMissingSchemaObjectError(payoutError)) {
+            ({ error: payoutError } = await supabase
+              .from('payouts')
+              .insert({
+                participant_id: allocation.participant_id,
+                project_id: allocation.project_id,
+                amount: Number(breakdown.totalAmount || 0),
+                status: 'ELIGIBLE'
+              }));
+          }
 
           if (payoutError) throw payoutError;
           payoutCreated = true;
         }
 
-        await supabase
+        const completionRes = await supabase
           .from('unit_allocations')
           .update({ completed_at: new Date().toISOString() })
           .eq('id', proof.allocation_id)
           .eq('participant_id', allocation.participant_id)
           .is('completed_at', null);
+
+        if (completionRes.error && isMissingSchemaObjectError(completionRes.error)) {
+          const statusOnlyRes = await supabase
+            .from('unit_allocations')
+            .update({ status: ALLOCATION_STATUS.COMPLETED })
+            .eq('id', proof.allocation_id)
+            .eq('participant_id', allocation.participant_id);
+
+          if (statusOnlyRes.error && !isMissingSchemaObjectError(statusOnlyRes.error)) {
+            throw statusOnlyRes.error;
+          }
+        } else if (completionRes.error) {
+          throw completionRes.error;
+        }
       }
     }
 
@@ -1436,6 +1885,8 @@ const approvePurchaseProof = async (req, res, next) => {
  */
 const generatePayoutBatch = async (req, res, next) => {
   try {
+    await backfillEligiblePayouts();
+
     const { data: payouts, error } = await supabase
       .from('payouts')
       .select('id, amount')
@@ -1517,6 +1968,76 @@ const generatePayoutBatch = async (req, res, next) => {
   }
 };
 
+const getEligiblePayouts = async (req, res, next) => {
+  try {
+    await backfillEligiblePayouts();
+
+    let payoutsRes = await supabase
+      .from('payouts')
+      .select('id, participant_id, project_id, amount, status, created_at, payout_batch_id')
+      .order('created_at', { ascending: true });
+
+    if (payoutsRes.error && /created_at/i.test(String(payoutsRes.error.message || ''))) {
+      payoutsRes = await supabase
+        .from('payouts')
+        .select('id, participant_id, project_id, amount, status, payout_batch_id')
+    }
+    if (payoutsRes.error) throw payoutsRes.error;
+
+    const data = (payoutsRes.data || []).filter(
+      (row) => normalizeStatus(row?.status) === 'ELIGIBLE'
+    );
+    const participantIds = [...new Set(data.map((row) => row.participant_id).filter(Boolean))];
+    const projectIds = [...new Set(data.map((row) => row.project_id).filter(Boolean))];
+
+    const [profilesRes, projectsRes, breakdownMap] = await Promise.all([
+      participantIds.length
+        ? supabase
+            .from('profiles')
+            .select('id, full_name, email')
+            .in('id', participantIds)
+        : Promise.resolve({ data: [], error: null }),
+      projectIds.length
+        ? supabase
+            .from('projects')
+            .select('id, title, name, reward')
+            .in('id', projectIds)
+        : Promise.resolve({ data: [], error: null }),
+      getApprovedApplicationBreakdownMap({ participantIds, projectIds })
+    ]);
+
+    if (profilesRes.error) throw profilesRes.error;
+    if (projectsRes.error) throw projectsRes.error;
+
+    const profileMap = new Map((profilesRes.data || []).map((row) => [row.id, row]));
+    const projectMap = new Map((projectsRes.data || []).map((row) => [row.id, row]));
+
+    const rows = (data || []).map((row) => {
+      const key = `${row.participant_id}::${row.project_id}`;
+      const breakdown = breakdownMap.get(key) || {};
+      const project = projectMap.get(row.project_id) || {};
+      const rewardAmount = toAmount(breakdown.rewardAmount ?? project.reward);
+      const productAmount = toAmount(breakdown.productAmount);
+      const fallbackTotal = rewardAmount + productAmount;
+      return {
+        ...row,
+        profiles: profileMap.get(row.participant_id) || null,
+        projects: project || null,
+        reward_amount: rewardAmount,
+        product_amount: productAmount,
+        total_amount: Number(row.amount || breakdown.totalAmount || fallbackTotal || 0)
+      };
+    });
+
+    res.json({
+      success: true,
+      data: rows
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 const getPayoutBatches = async (req, res, next) => {
   try {
     const { page = 1, limit = 20 } = req.query;
@@ -1540,6 +2061,445 @@ const getPayoutBatches = async (req, res, next) => {
         total: count || 0
       }
     });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const markPayoutBatchPaid = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const { data: batch, error: batchLookupError } = await supabase
+      .from('payout_batches')
+      .select('id, status')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (batchLookupError) throw batchLookupError;
+    if (!batch) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payout batch not found'
+      });
+    }
+
+    const { data: payouts, error: payoutsError } = await supabase
+      .from('payouts')
+      .select('id, participant_id')
+      .eq('payout_batch_id', id)
+      .in('status', ['IN_BATCH', 'EXPORTED']);
+
+    if (payoutsError) throw payoutsError;
+    if (!payouts || payouts.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No payouts in this batch are pending payment'
+      });
+    }
+
+    const payoutIds = payouts.map((row) => row.id);
+
+    const { error: payoutUpdateError } = await supabase
+      .from('payouts')
+      .update({ status: 'PAID' })
+      .in('id', payoutIds);
+
+    if (payoutUpdateError) throw payoutUpdateError;
+
+    const { error: batchUpdateError } = await supabase
+      .from('payout_batches')
+      .update({ status: 'PAID' })
+      .eq('id', id);
+
+    if (batchUpdateError) throw batchUpdateError;
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'PAYOUT_BATCH_MARKED_PAID',
+      entityType: 'PAYOUT_BATCH',
+      entityId: id,
+      message: `Payout batch ${id} marked as paid (${payoutIds.length} payouts)`
+    });
+
+    res.json({
+      success: true,
+      message: `Payout batch marked as paid (${payoutIds.length} payouts updated)`
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const backfillEligiblePayouts = async () => {
+  let appRes = await supabase
+    .from('project_applications')
+    .select('id, participant_id, project_id, status, created_at')
+    .eq('status', 'APPROVED')
+    .order('created_at', { ascending: false });
+
+  if (appRes.error && /created_at/i.test(String(appRes.error.message || ''))) {
+    appRes = await supabase
+      .from('project_applications')
+      .select('id, participant_id, project_id, status')
+      .eq('status', 'APPROVED');
+  }
+  if (appRes.error && !isMissingSchemaObjectError(appRes.error)) throw appRes.error;
+
+  const applications = (appRes.data || []).filter(
+    (row) => normalizeStatus(row?.status) === 'APPROVED'
+  );
+  if (!applications.length) return;
+
+  const appPairs = new Set(
+    applications
+      .filter((row) => row.participant_id && row.project_id)
+      .map((row) => `${row.participant_id}::${row.project_id}`)
+  );
+  if (!appPairs.size) return;
+
+  const participantIds = [...new Set(applications.map((row) => row.participant_id).filter(Boolean))];
+  const projectIds = [...new Set(applications.map((row) => row.project_id).filter(Boolean))];
+
+  const projectsRes = projectIds.length
+    ? await supabase
+        .from('projects')
+        .select('id, mode, reward')
+        .in('id', projectIds)
+    : { data: [], error: null };
+  if (projectsRes.error) throw projectsRes.error;
+  const projectMap = new Map((projectsRes.data || []).map((row) => [row.id, row]));
+  const breakdownMap = await getApprovedApplicationBreakdownMap({ participantIds, projectIds });
+
+  let approvedProofsRes = await supabase
+    .from('purchase_proofs')
+    .select('id, participant_id, project_id, allocation_id, status')
+    .eq('status', 'APPROVED')
+    .in('participant_id', participantIds);
+  if (approvedProofsRes.error && /project_id/i.test(String(approvedProofsRes.error.message || ''))) {
+    approvedProofsRes = await supabase
+      .from('purchase_proofs')
+      .select('id, participant_id, allocation_id, status')
+      .eq('status', 'APPROVED')
+      .in('participant_id', participantIds);
+  }
+  if (approvedProofsRes.error && !isMissingSchemaObjectError(approvedProofsRes.error)) {
+    throw approvedProofsRes.error;
+  }
+  const approvedProofs = (approvedProofsRes.data || []).filter(
+    (row) => normalizeStatus(row?.status) === 'APPROVED'
+  );
+
+  let approvedReviewsRes = await supabase
+    .from('participant_reviews')
+    .select('id, participant_id, project_id, allocation_id, status')
+    .eq('status', 'APPROVED')
+    .in('participant_id', participantIds);
+  if (approvedReviewsRes.error && !isMissingSchemaObjectError(approvedReviewsRes.error)) {
+    throw approvedReviewsRes.error;
+  }
+  const approvedReviews = (approvedReviewsRes.data || []).filter(
+    (row) => normalizeStatus(row?.status) === 'APPROVED'
+  );
+
+  let feedbacksRes = participantIds.length
+    ? await supabase
+        .from('internal_feedbacks')
+        .select('id, participant_id, project_id, allocation_id')
+        .in('participant_id', participantIds)
+    : { data: [], error: null };
+  if (feedbacksRes.error && /project_id/i.test(String(feedbacksRes.error.message || ''))) {
+    feedbacksRes = participantIds.length
+      ? await supabase
+          .from('internal_feedbacks')
+          .select('id, participant_id, allocation_id')
+          .in('participant_id', participantIds)
+      : { data: [], error: null };
+  }
+  if (feedbacksRes.error && !isMissingSchemaObjectError(feedbacksRes.error)) throw feedbacksRes.error;
+  const feedbacks = feedbacksRes.data || [];
+
+  const allAllocationIds = [...new Set([
+    ...approvedProofs.map((row) => row.allocation_id),
+    ...approvedReviews.map((row) => row.allocation_id),
+    ...feedbacks.map((row) => row.allocation_id)
+  ].filter(Boolean))];
+
+  const allocationsRes = allAllocationIds.length
+    ? await supabase
+        .from('unit_allocations')
+        .select('id, participant_id, project_id')
+        .in('id', allAllocationIds)
+    : { data: [], error: null };
+  if (allocationsRes.error && !isMissingSchemaObjectError(allocationsRes.error)) throw allocationsRes.error;
+  const allocations = allocationsRes.data || [];
+
+  const allocationToProject = new Map(allocations.map((row) => [row.id, row.project_id]));
+  const allocationToParticipant = new Map(allocations.map((row) => [row.id, row.participant_id]));
+
+  const { data: payoutRows, error: payoutsError } =
+    participantIds.length && projectIds.length
+      ? await supabase
+          .from('payouts')
+          .select('id, participant_id, project_id, status')
+          .in('participant_id', participantIds)
+          .in('project_id', projectIds)
+      : { data: [], error: null };
+  if (payoutsError && !isMissingSchemaObjectError(payoutsError)) throw payoutsError;
+  const payoutMap = new Map(
+    (payoutRows || []).map((row) => [`${row.participant_id}::${row.project_id}`, row])
+  );
+
+  const approvedProofByPair = new Map();
+  for (const proof of approvedProofs) {
+    const participantId = proof.participant_id || allocationToParticipant.get(proof.allocation_id);
+    const projectId = proof.project_id || allocationToProject.get(proof.allocation_id);
+    if (!participantId || !projectId) continue;
+    const key = `${participantId}::${projectId}`;
+    if (!approvedProofByPair.has(key)) approvedProofByPair.set(key, proof);
+  }
+
+  const approvedReviewByPair = new Map();
+  for (const review of approvedReviews) {
+    const participantId = review.participant_id || allocationToParticipant.get(review.allocation_id);
+    const projectId = review.project_id || allocationToProject.get(review.allocation_id);
+    if (!participantId || !projectId) continue;
+    const key = `${participantId}::${projectId}`;
+    if (!approvedReviewByPair.has(key)) approvedReviewByPair.set(key, review);
+  }
+
+  const feedbackByPair = new Set();
+  for (const feedback of feedbacks) {
+    const participantId = feedback.participant_id || allocationToParticipant.get(feedback.allocation_id);
+    const projectId = feedback.project_id || allocationToProject.get(feedback.allocation_id);
+    if (participantId && projectId) {
+      feedbackByPair.add(`${participantId}::${projectId}`);
+    }
+  }
+
+  for (const key of appPairs) {
+    const [participantId, projectId] = key.split('::');
+    const existingPayout = payoutMap.get(key) || null;
+    const currentStatus = normalizeStatus(existingPayout?.status);
+    if (existingPayout && ['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID'].includes(currentStatus)) {
+      continue;
+    }
+
+    const project = projectMap.get(projectId);
+    const mode = String(project?.mode || '').toUpperCase();
+    const hasApprovedProof = approvedProofByPair.has(key);
+    const hasApprovedReview = approvedReviewByPair.has(key);
+    const hasFeedback = feedbackByPair.has(key);
+
+    let eligible = false;
+    if (mode === 'MARKETPLACE') {
+      eligible = hasApprovedReview || hasFeedback;
+    } else {
+      eligible = hasApprovedProof || hasApprovedReview;
+    }
+    if (!eligible) continue;
+
+    const breakdown = breakdownMap.get(key) || {
+      rewardAmount: toAmount(project?.reward),
+      productAmount: 0,
+      totalAmount: toAmount(project?.reward)
+    };
+
+    const proof = approvedProofByPair.get(key);
+    if (existingPayout) {
+      const { error: updateError } = await supabase
+        .from('payouts')
+        .update({
+          amount: Number(breakdown.totalAmount || 0),
+          status: 'ELIGIBLE'
+        })
+        .eq('id', existingPayout.id);
+      if (updateError && !isMissingSchemaObjectError(updateError)) {
+        throw updateError;
+      }
+      continue;
+    }
+
+    let insertError = null;
+    ({ error: insertError } = await supabase
+      .from('payouts')
+      .insert({
+        participant_id: participantId,
+        project_id: projectId,
+        purchase_proof_id: proof?.id || null,
+        amount: Number(breakdown.totalAmount || 0),
+        status: 'ELIGIBLE'
+      }));
+
+    if (insertError && isMissingSchemaObjectError(insertError)) {
+      ({ error: insertError } = await supabase
+        .from('payouts')
+        .insert({
+          participant_id: participantId,
+          project_id: projectId,
+          amount: Number(breakdown.totalAmount || 0),
+          status: 'ELIGIBLE'
+        }));
+    }
+
+    if (insertError && !isMissingSchemaObjectError(insertError)) throw insertError;
+  }
+};
+
+const getPayoutReportRows = async ({ projectId = null, paidFilter = 'ALL' } = {}) => {
+  let appRes = await supabase
+    .from('project_applications')
+    .select('id, participant_id, project_id, product_id, allocated_budget, status, created_at')
+    .eq('status', 'APPROVED')
+    .order('created_at', { ascending: false });
+
+  if (appRes.error && /created_at/i.test(String(appRes.error.message || ''))) {
+    appRes = await supabase
+      .from('project_applications')
+      .select('id, participant_id, project_id, product_id, allocated_budget, status')
+      .eq('status', 'APPROVED');
+  }
+  if (appRes.error) throw appRes.error;
+
+  let applications = appRes.data || [];
+  if (projectId) {
+    applications = applications.filter((row) => String(row.project_id) === String(projectId));
+  }
+  if (!applications.length) return [];
+
+  const participantIds = [...new Set(applications.map((row) => row.participant_id).filter(Boolean))];
+  const projectIds = [...new Set(applications.map((row) => row.project_id).filter(Boolean))];
+  const productIds = [...new Set(applications.map((row) => row.product_id).filter(Boolean))];
+
+  const [profilesRes, detailsRes, projectsRes, productsRes, payoutsRes] = await Promise.all([
+    participantIds.length
+      ? supabase.from('profiles').select('id, full_name, email').in('id', participantIds)
+      : Promise.resolve({ data: [], error: null }),
+    participantIds.length
+      ? supabase.from('participant_details').select('participant_id, bank_account_name, bank_account_number, bank_ifsc, bank_name').in('participant_id', participantIds)
+      : Promise.resolve({ data: [], error: null }),
+    projectIds.length
+      ? supabase.from('projects').select('id, title, name, reward').in('id', projectIds)
+      : Promise.resolve({ data: [], error: null }),
+    productIds.length
+      ? supabase.from('project_products').select('id, name, product_value').in('id', productIds)
+      : Promise.resolve({ data: [], error: null }),
+    participantIds.length && projectIds.length
+      ? supabase.from('payouts').select('id, participant_id, project_id, amount, status, payout_batch_id, created_at').in('participant_id', participantIds).in('project_id', projectIds)
+      : Promise.resolve({ data: [], error: null })
+  ]);
+
+  if (profilesRes.error) throw profilesRes.error;
+  if (detailsRes.error && !isMissingSchemaObjectError(detailsRes.error)) throw detailsRes.error;
+  if (projectsRes.error) throw projectsRes.error;
+  if (productsRes.error && !isMissingSchemaObjectError(productsRes.error)) throw productsRes.error;
+  if (payoutsRes.error && !isMissingSchemaObjectError(payoutsRes.error)) throw payoutsRes.error;
+
+  const profileMap = new Map((profilesRes.data || []).map((row) => [row.id, row]));
+  const detailMap = new Map((detailsRes.data || []).map((row) => [row.participant_id, row]));
+  const projectMap = new Map((projectsRes.data || []).map((row) => [row.id, row]));
+  const productMap = new Map((productsRes.data || []).map((row) => [row.id, row]));
+
+  const payoutMap = new Map();
+  for (const payout of (payoutsRes.data || [])) {
+    const key = `${payout.participant_id}::${payout.project_id}`;
+    if (!payoutMap.has(key)) payoutMap.set(key, payout);
+  }
+
+  let rows = applications.map((app) => {
+    const profile = profileMap.get(app.participant_id) || {};
+    const details = detailMap.get(app.participant_id) || {};
+    const project = projectMap.get(app.project_id) || {};
+    const product = productMap.get(app.product_id) || {};
+    const payout = payoutMap.get(`${app.participant_id}::${app.project_id}`) || null;
+    const rewardAmount = Number(project.reward || 0);
+    const productAmount = Number(app.allocated_budget || product.product_value || 0);
+    const payoutStatus = String(payout?.status || 'NOT_ELIGIBLE').toUpperCase();
+
+    return {
+      payout_id: payout?.id || null,
+      project_id: app.project_id,
+      project_name: project.title || project.name || '-',
+      participant_id: app.participant_id,
+      participant_name: profile.full_name || '-',
+      participant_email: profile.email || '-',
+      product_id: app.product_id || null,
+      product_name: product.name || '-',
+      reward_amount: rewardAmount,
+      product_amount: productAmount,
+      payout_amount: Number(payout?.amount || rewardAmount + productAmount || 0),
+      payout_status: payoutStatus,
+      paid_status: payoutStatus === 'PAID' ? 'PAID' : 'NOT_PAID',
+      payout_batch_id: payout?.payout_batch_id || null,
+      bank_account_name: details.bank_account_name || '-',
+      bank_account_number: details.bank_account_number || '-',
+      bank_ifsc: details.bank_ifsc || '-',
+      bank_name: details.bank_name || '-',
+      created_at: payout?.created_at || app.created_at || null
+    };
+  });
+
+  if (String(paidFilter || 'ALL').toUpperCase() === 'PAID') {
+    rows = rows.filter((row) => row.paid_status === 'PAID');
+  } else if (String(paidFilter || 'ALL').toUpperCase() === 'NOT_PAID') {
+    rows = rows.filter((row) => row.paid_status === 'NOT_PAID');
+  }
+
+  return rows;
+};
+
+const getPayoutReport = async (req, res, next) => {
+  try {
+    await backfillEligiblePayouts();
+    const projectId = req.query.projectId || null;
+    const paidFilter = String(req.query.paid || 'ALL').toUpperCase();
+
+    const rows = await getPayoutReportRows({ projectId, paidFilter });
+    const summary = {
+      total_rows: rows.length,
+      total_amount: rows.reduce((sum, row) => sum + Number(row.payout_amount || 0), 0),
+      paid_count: rows.filter((row) => row.paid_status === 'PAID').length,
+      unpaid_count: rows.filter((row) => row.paid_status === 'NOT_PAID').length
+    };
+
+    res.json({
+      success: true,
+      data: rows,
+      summary
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const exportPayoutReportCSV = async (req, res, next) => {
+  try {
+    await backfillEligiblePayouts();
+    const projectId = req.query.projectId || null;
+    const paidFilter = String(req.query.paid || 'ALL').toUpperCase();
+    const rows = await getPayoutReportRows({ projectId, paidFilter });
+    const fields = [
+      'project_name',
+      'product_name',
+      'participant_name',
+      'participant_email',
+      'product_amount',
+      'bank_account_name',
+      'bank_account_number',
+      'bank_ifsc',
+      'bank_name',
+      'payout_amount',
+      'payout_status',
+      'paid_status',
+      'payout_batch_id',
+      'created_at'
+    ];
+    const parser = new Parser({ fields });
+    const csv = rows.length ? parser.parse(rows) : fields.join(',');
+    res.header('Content-Type', 'text/csv');
+    res.attachment(`payout_report_${new Date().toISOString().slice(0, 10)}.csv`);
+    res.send(csv);
   } catch (err) {
     next(err);
   }
@@ -1596,7 +2556,8 @@ const exportPayoutBatchCSV = async (req, res, next) => {
     await supabase
       .from('payout_batches')
       .update({ status: 'EXPORTED' })
-      .eq('id', id);
+      .eq('id', id)
+      .neq('status', 'PAID');
 
     res.header('Content-Type', 'text/csv');
     res.attachment(`payout_batch_${id}.csv`);
@@ -1864,7 +2825,11 @@ module.exports = {
   rejectProductApplication,
   approvePurchaseProof,
   generatePayoutBatch,
+  getEligiblePayouts,
+  getPayoutReport,
+  exportPayoutReportCSV,
   getPayoutBatches,
+  markPayoutBatchPaid,
   exportPayoutBatchCSV,
   getAdminSupportTickets,
   getAdminSupportTicketById,

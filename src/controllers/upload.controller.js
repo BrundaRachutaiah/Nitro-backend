@@ -90,6 +90,129 @@ const uploadPurchaseProof = async (req, res, next) => {
   }
 };
 
+/**
+ * Upload review proof screenshot
+ */
+const uploadReviewProof = async (req, res, next) => {
+  try {
+    const participantId = req.user.id;
+    const { allocationId } = req.body;
+
+    if (!req.file || !allocationId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Allocation ID and file are required'
+      });
+    }
+
+    const { data: allocation, error: allocError } = await supabase
+      .from('unit_allocations')
+      .select('id')
+      .eq('id', allocationId)
+      .eq('participant_id', participantId)
+      .maybeSingle();
+
+    if (allocError || !allocation) {
+      return res.status(404).json({
+        success: false,
+        message: 'Allocation not found'
+      });
+    }
+
+    const fileExt = path.extname(req.file.originalname);
+    const fileName = `review_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${fileExt}`;
+    const filePath = `reviews/${participantId}/${allocationId}/${fileName}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('purchase-proofs')
+      .upload(filePath, req.file.buffer, {
+        contentType: req.file.mimetype
+      });
+
+    if (uploadError) throw uploadError;
+
+    const { data: publicUrl } = supabase.storage
+      .from('purchase-proofs')
+      .getPublicUrl(filePath);
+
+    res.status(201).json({
+      success: true,
+      message: 'Review screenshot uploaded successfully',
+      data: {
+        allocation_id: allocationId,
+        review_url: publicUrl.publicUrl
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Upload multiple review screenshots
+ */
+const uploadReviewProofs = async (req, res, next) => {
+  try {
+    const participantId = req.user.id;
+    const { allocationId } = req.body;
+
+    if (!Array.isArray(req.files) || req.files.length === 0 || !allocationId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Allocation ID and at least one file are required'
+      });
+    }
+
+    const { data: allocation, error: allocError } = await supabase
+      .from('unit_allocations')
+      .select('id')
+      .eq('id', allocationId)
+      .eq('participant_id', participantId)
+      .maybeSingle();
+
+    if (allocError || !allocation) {
+      return res.status(404).json({
+        success: false,
+        message: 'Allocation not found'
+      });
+    }
+
+    const uploaded = [];
+    for (const file of req.files) {
+      const fileExt = path.extname(file.originalname);
+      const fileName = `review_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${fileExt}`;
+      const filePath = `reviews/${participantId}/${allocationId}/${fileName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from('purchase-proofs')
+        .upload(filePath, file.buffer, {
+          contentType: file.mimetype
+        });
+
+      if (uploadError) throw uploadError;
+
+      const { data: publicUrl } = supabase.storage
+        .from('purchase-proofs')
+        .getPublicUrl(filePath);
+
+      uploaded.push(publicUrl.publicUrl);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Review screenshots uploaded successfully',
+      data: {
+        allocation_id: allocationId,
+        review_urls: uploaded
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
-  uploadPurchaseProof
+  uploadPurchaseProof,
+  uploadReviewProof,
+  uploadReviewProofs
 };

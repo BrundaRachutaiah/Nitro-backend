@@ -17,6 +17,7 @@ const getPayoutBatches = (req, res) => {
 };
 
 const supabase = require('../config/supabaseClient');
+const { calculatePayoutBreakdown } = require('../utils/payout.utils');
 
 const getMyPayouts = async (req, res, next) => {
   try {
@@ -30,6 +31,9 @@ const getMyPayouts = async (req, res, next) => {
         amount,
         status,
         created_at,
+        payout_batch_id,
+        participant_id,
+        project_id,
         projects (
           id,
           title,
@@ -42,9 +46,38 @@ const getMyPayouts = async (req, res, next) => {
 
     if (error) throw error;
 
+    const breakdownCache = new Map();
+    const enriched = await Promise.all((data || []).map(async (row) => {
+      const cacheKey = `${row.participant_id}::${row.project_id}`;
+      let breakdown = breakdownCache.get(cacheKey);
+      if (!breakdown) {
+        breakdown = await calculatePayoutBreakdown({
+          supabase,
+          participantId: row.participant_id,
+          projectId: row.project_id
+        });
+        breakdownCache.set(cacheKey, breakdown);
+      }
+
+      const totalAmount = Number(row.amount || breakdown.totalAmount || 0);
+      return {
+        ...row,
+        reward_amount: breakdown.rewardAmount,
+        product_amount: breakdown.productAmount,
+        total_amount: totalAmount,
+        eligibility_reason: String(row.status || '').toUpperCase() === 'PAID'
+          ? 'Payout paid successfully'
+          : String(row.status || '').toUpperCase() === 'IN_BATCH'
+            ? 'Included in payout batch'
+            : String(row.status || '').toUpperCase() === 'EXPORTED'
+              ? 'Batch exported and waiting for transfer'
+              : 'Payout eligible and waiting for batch processing'
+      };
+    }));
+
     res.json({
       success: true,
-      data
+      data: enriched
     });
   } catch (err) {
     next(err);

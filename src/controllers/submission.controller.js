@@ -1,5 +1,152 @@
 const supabase = require('../config/supabaseClient');
 const { sendEmail } = require('../services/email.service');
+const { calculatePayoutBreakdown } = require('../utils/payout.utils');
+const { ALLOCATION_STATUS } = require('../utils/constants');
+
+const isMissingSchemaObjectError = (error) => {
+  const text = String(error?.message || '').toLowerCase();
+  return (
+    text.includes('does not exist')
+    || text.includes('could not find')
+    || text.includes('schema cache')
+    || text.includes('column')
+    || text.includes('relation')
+    || text.includes('table')
+  );
+};
+
+const markAllocationCompleted = async ({ allocationId, participantId }) => {
+  const completionRes = await supabase
+    .from('unit_allocations')
+    .update({ completed_at: new Date().toISOString() })
+    .eq('id', allocationId)
+    .eq('participant_id', participantId)
+    .is('completed_at', null);
+
+  if (completionRes.error && isMissingSchemaObjectError(completionRes.error)) {
+    const statusOnlyRes = await supabase
+      .from('unit_allocations')
+      .update({ status: ALLOCATION_STATUS.COMPLETED })
+      .eq('id', allocationId)
+      .eq('participant_id', participantId);
+
+    if (statusOnlyRes.error && !isMissingSchemaObjectError(statusOnlyRes.error)) {
+      throw statusOnlyRes.error;
+    }
+    return;
+  }
+
+  if (completionRes.error) throw completionRes.error;
+};
+
+const buildAppMapKey = (participantId, projectId) => `${participantId}::${projectId}`;
+
+const getApprovedApplicationMap = async (participantIds, projectIds) => {
+  if (!participantIds.length || !projectIds.length) {
+    return new Map();
+  }
+
+  let appRows = [];
+  let appRes = await supabase
+    .from('project_applications')
+    .select(
+      `
+      id,
+      participant_id,
+      project_id,
+      product_id,
+      status,
+      project_products (
+        id,
+        name
+      )
+    `
+    )
+    .in('participant_id', participantIds)
+    .in('project_id', projectIds)
+    .eq('status', 'APPROVED')
+    .order('created_at', { ascending: false });
+
+  if (appRes.error && /created_at/i.test(String(appRes.error.message || ''))) {
+    appRes = await supabase
+      .from('project_applications')
+      .select(
+        `
+        id,
+        participant_id,
+        project_id,
+        product_id,
+        status,
+        project_products (
+          id,
+          name
+        )
+      `
+      )
+      .in('participant_id', participantIds)
+      .in('project_id', projectIds)
+      .eq('status', 'APPROVED');
+  }
+
+  if (appRes.error) throw appRes.error;
+  appRows = appRes.data || [];
+
+  const productIds = [...new Set(appRows.map((row) => row.product_id).filter(Boolean))];
+  const missingProductLink = appRows.some((row) => row.product_id && !row.project_products);
+
+  let productMap = new Map();
+  if (missingProductLink && productIds.length) {
+    const { data: products, error: productError } = await supabase
+      .from('project_products')
+      .select('id, name')
+      .in('id', productIds);
+    if (productError) throw productError;
+    productMap = new Map((products || []).map((item) => [item.id, item]));
+  }
+
+  const approvedApplicationMap = new Map();
+  for (const row of appRows) {
+    const key = buildAppMapKey(row.participant_id, row.project_id);
+    if (!approvedApplicationMap.has(key)) {
+      approvedApplicationMap.set(key, {
+        product_id: row.product_id || null,
+        product_name: row?.project_products?.name || productMap.get(row.product_id)?.name || null
+      });
+    }
+  }
+
+  return approvedApplicationMap;
+};
+
+const enrichReviewRows = async (rows) => {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+
+  const participantIds = [...new Set(rows.map((row) => row.participant_id).filter(Boolean))];
+  const projectIds = [...new Set(rows.map((row) => row.project_id).filter(Boolean))];
+
+  const { data: projects, error: projectError } = projectIds.length
+    ? await supabase
+        .from('projects')
+        .select('id, title, name')
+        .in('id', projectIds)
+    : { data: [], error: null };
+  if (projectError) throw projectError;
+
+  const projectMap = new Map(
+    (projects || []).map((item) => [item.id, item.title || item.name || null])
+  );
+  const appMap = await getApprovedApplicationMap(participantIds, projectIds);
+
+  return rows.map((row) => {
+    const app = appMap.get(buildAppMapKey(row.participant_id, row.project_id)) || {};
+    return {
+      ...row,
+      project_name: projectMap.get(row.project_id) || null,
+      product_id: app.product_id || null,
+      product_name: app.product_name || null
+    };
+  });
+};
 
 const getAllocationContext = async (allocationId, participantId) => {
   const { data: allocation, error } = await supabase
@@ -24,20 +171,19 @@ const getAllocationContext = async (allocationId, participantId) => {
   return allocation;
 };
 
-const hasApprovedProof = async (allocationId, participantId) => {
+const getProofStatus = async (allocationId, participantId) => {
   const { data, error } = await supabase
     .from('purchase_proofs')
     .select('id, status')
     .eq('allocation_id', allocationId)
     .eq('participant_id', participantId)
-    .eq('status', 'APPROVED')
     .maybeSingle();
 
   if (error) throw error;
-  return Boolean(data);
+  return String(data?.status || '').toUpperCase() || null;
 };
 
-const ensureEligiblePayout = async ({ participantId, projectId, amount, purchaseProofId = null }) => {
+const ensureEligiblePayout = async ({ participantId, projectId, fallbackReward = 0, purchaseProofId = null }) => {
   const { data: existing, error: lookupError } = await supabase
     .from('payouts')
     .select('id')
@@ -48,15 +194,34 @@ const ensureEligiblePayout = async ({ participantId, projectId, amount, purchase
   if (lookupError) throw lookupError;
   if (existing) return;
 
-  const { error: insertError } = await supabase
+  const breakdown = await calculatePayoutBreakdown({
+    supabase,
+    participantId,
+    projectId,
+    fallbackReward
+  });
+
+  let insertError = null;
+  ({ error: insertError } = await supabase
     .from('payouts')
     .insert({
       participant_id: participantId,
       project_id: projectId,
       purchase_proof_id: purchaseProofId,
-      amount: Number(amount) || 0,
+      amount: Number(breakdown.totalAmount) || 0,
       status: 'ELIGIBLE'
-    });
+    }));
+
+  if (insertError && isMissingSchemaObjectError(insertError)) {
+    ({ error: insertError } = await supabase
+      .from('payouts')
+      .insert({
+        participant_id: participantId,
+        project_id: projectId,
+        amount: Number(breakdown.totalAmount) || 0,
+        status: 'ELIGIBLE'
+      }));
+  }
 
   if (insertError) throw insertError;
 };
@@ -89,8 +254,8 @@ const submitFeedback = async (req, res, next) => {
       });
     }
 
-    const approvedProof = await hasApprovedProof(allocationId, participantId);
-    if (!approvedProof) {
+    const proofStatus = await getProofStatus(allocationId, participantId);
+    if (proofStatus !== 'APPROVED') {
       return res.status(400).json({
         success: false,
         message: 'Approved purchase proof is required before feedback submission'
@@ -153,15 +318,10 @@ const submitFeedback = async (req, res, next) => {
     await ensureEligiblePayout({
       participantId,
       projectId: allocation.project_id,
-      amount: allocation?.projects?.reward
+      fallbackReward: allocation?.projects?.reward
     });
 
-    await supabase
-      .from('unit_allocations')
-      .update({ completed_at: new Date().toISOString() })
-      .eq('id', allocationId)
-      .eq('participant_id', participantId)
-      .is('completed_at', null);
+    await markAllocationCompleted({ allocationId, participantId });
 
     res.status(201).json({
       success: true,
@@ -215,11 +375,11 @@ const submitReview = async (req, res, next) => {
       });
     }
 
-    const approvedProof = await hasApprovedProof(allocationId, participantId);
-    if (!approvedProof) {
+    const proofStatus = await getProofStatus(allocationId, participantId);
+    if (!proofStatus || proofStatus === 'REJECTED') {
       return res.status(400).json({
         success: false,
-        message: 'Approved purchase proof is required before review submission'
+        message: 'Upload purchase proof before review submission'
       });
     }
 
@@ -273,9 +433,38 @@ const getPendingReviews = async (req, res, next) => {
 
     if (error) throw error;
 
+    const enriched = await enrichReviewRows(data || []);
     res.json({
       success: true,
-      data: data || []
+      data: enriched
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getReviews = async (req, res, next) => {
+  try {
+    const status = String(req.query.status || '').toUpperCase();
+    const limit = Number(req.query.limit) > 0 ? Number(req.query.limit) : 100;
+
+    let query = supabase
+      .from('participant_reviews')
+      .select('id, allocation_id, participant_id, project_id, review_text, review_url, status, created_at')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const enriched = await enrichReviewRows(data || []);
+    res.json({
+      success: true,
+      data: enriched
     });
   } catch (err) {
     next(err);
@@ -313,15 +502,13 @@ const approveReview = async (req, res, next) => {
     await ensureEligiblePayout({
       participantId: review.participant_id,
       projectId: review.project_id,
-      amount: project?.reward
+      fallbackReward: project?.reward
     });
 
-    await supabase
-      .from('unit_allocations')
-      .update({ completed_at: new Date().toISOString() })
-      .eq('id', review.allocation_id)
-      .eq('participant_id', review.participant_id)
-      .is('completed_at', null);
+    await markAllocationCompleted({
+      allocationId: review.allocation_id,
+      participantId: review.participant_id
+    });
 
     res.json({
       success: true,
@@ -392,6 +579,7 @@ const rejectReview = async (req, res, next) => {
 module.exports = {
   submitFeedback,
   submitReview,
+  getReviews,
   getPendingReviews,
   approveReview,
   rejectReview

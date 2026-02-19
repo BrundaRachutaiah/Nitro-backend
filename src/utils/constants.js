@@ -42,6 +42,7 @@ const APPLICATION_STATUS = Object.freeze({
 
 const ALLOCATION_STATUS = Object.freeze({
   RESERVED: 'RESERVED',
+  PURCHASED: 'PURCHASED',
   COMPLETED: 'COMPLETED',
   EXPIRED: 'EXPIRED'
 });
@@ -55,7 +56,9 @@ const PROOF_STATUS = Object.freeze({
 const PAYOUT_STATUS = Object.freeze({
   ELIGIBLE: 'ELIGIBLE',
   IN_BATCH: 'IN_BATCH',
-  EXPORTED: 'EXPORTED'
+  EXPORTED: 'EXPORTED',
+  PAID: 'PAID',
+  FAILED: 'FAILED'
 });
 
 const SUPPORT_TICKET_STATUS = Object.freeze({

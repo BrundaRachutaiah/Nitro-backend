@@ -20,4 +20,20 @@ router.post(
   uploadController.uploadPurchaseProof
 );
 
+router.post(
+  '/uploads/review-proof',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  upload.single('file'),
+  uploadController.uploadReviewProof
+);
+
+router.post(
+  '/uploads/review-proofs',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  upload.array('files', 6),
+  uploadController.uploadReviewProofs
+);
+
 module.exports = router;

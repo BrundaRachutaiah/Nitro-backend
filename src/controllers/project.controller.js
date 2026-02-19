@@ -417,10 +417,12 @@ const getAppliedProjects = async (req, res, next) => {
       .select(
         `
         id,
+        project_id,
         product_id,
         allocated_budget,
         status,
         created_at,
+        reviewed_at,
         projects (
           id,
           title,
@@ -436,13 +438,69 @@ const getAppliedProjects = async (req, res, next) => {
       `
       )
       .eq('participant_id', participantId)
-      .eq('status', APPLICATION_STATUS.PENDING);
+      .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED])
+      .order('created_at', { ascending: false });
 
     if (error) throw error;
 
+    const rows = data || [];
+    const projectIds = [...new Set(rows.map((row) => row?.project_id).filter(Boolean))];
+
+    let allocationRows = [];
+    if (projectIds.length > 0) {
+      let { data: allocations, error: allocationsError } = await supabase
+        .from('unit_allocations')
+        .select('id, project_id, status, reserved_until, created_at')
+        .eq('participant_id', participantId)
+        .in('project_id', projectIds)
+        .order('created_at', { ascending: false });
+
+      if (allocationsError && isMissingTableOrColumn(allocationsError)) {
+        const fallback = await supabase
+          .from('unit_allocations')
+          .select('id, project_id, status, reserved_until')
+          .eq('participant_id', participantId)
+          .in('project_id', projectIds)
+          .order('reserved_until', { ascending: false });
+
+        allocations = fallback.data || [];
+        allocationsError = fallback.error || null;
+      }
+
+      if (allocationsError && !isMissingTableOrColumn(allocationsError)) {
+        throw allocationsError;
+      }
+
+      allocationRows = (allocations || []).map((row) => ({
+        ...row,
+        created_at: row.created_at || null
+      }));
+    }
+
+    const latestAllocationByProject = new Map();
+    for (const allocation of allocationRows) {
+      if (!latestAllocationByProject.has(allocation.project_id)) {
+        latestAllocationByProject.set(allocation.project_id, allocation);
+      }
+    }
+
+    const enriched = rows.map((row) => {
+      const allocation = latestAllocationByProject.get(row.project_id) || null;
+      return {
+        ...row,
+        allocation: allocation
+          ? {
+              id: allocation.id,
+              status: allocation.status || null,
+              reserved_until: allocation.reserved_until || null
+            }
+          : null
+      };
+    });
+
     res.json({
       success: true,
-      data
+      data: enriched
     });
   } catch (err) {
     next(err);
@@ -735,6 +793,48 @@ const getActiveCatalog = async (req, res, next) => {
     res.json({
       success: true,
       data: enriched
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const getMyProjectAccessRequests = async (req, res, next) => {
+  try {
+    const participantId = req.user.id;
+
+    const { data, error } = await supabase
+      .from('project_access_requests')
+      .select(
+        `
+        id,
+        project_id,
+        status,
+        created_at,
+        reviewed_at,
+        projects (
+          id,
+          title,
+          name,
+          mode
+        )
+      `
+      )
+      .eq('participant_id', participantId)
+      .order('created_at', { ascending: false });
+
+    if (error && isMissingTableOrColumn(error)) {
+      return res.json({
+        success: true,
+        data: []
+      });
+    }
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      data: data || []
     });
   } catch (err) {
     next(err);
@@ -1144,6 +1244,7 @@ module.exports = {
   getCompletedProjects,
   getAvailableProjects,
   getProjectSummary,
+  getMyProjectAccessRequests,
   getAdminProjects,
   updateProjectStatus,
   getProjectStats

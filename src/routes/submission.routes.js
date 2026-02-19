@@ -26,6 +26,13 @@ router.get(
   submissionController.getPendingReviews
 );
 
+router.get(
+  '/admin/reviews',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  submissionController.getReviews
+);
+
 router.patch(
   '/admin/reviews/:id/approve',
   authMiddleware,

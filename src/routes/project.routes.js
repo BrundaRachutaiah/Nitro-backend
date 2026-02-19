@@ -52,6 +52,13 @@ router.get(
   projectController.getActiveCatalog
 );
 
+router.get(
+  '/access-requests/my',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  projectController.getMyProjectAccessRequests
+);
+
 router.post(
   '/:id/request-access',
   authMiddleware,

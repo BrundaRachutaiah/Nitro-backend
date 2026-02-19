@@ -171,10 +171,38 @@ router.post(
 );
 
 router.get(
+  '/payouts/eligible',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.getEligiblePayouts
+);
+
+router.get(
+  '/reports/payouts',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.getPayoutReport
+);
+
+router.get(
+  '/reports/payouts/export',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.exportPayoutReportCSV
+);
+
+router.get(
   '/payout-batches',
   authMiddleware,
   roleMiddleware('ADMIN', 'SUPER_ADMIN'),
   adminController.getPayoutBatches
+);
+
+router.patch(
+  '/payout-batches/:id/mark-paid',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.markPayoutBatchPaid
 );
 
 router.get(
