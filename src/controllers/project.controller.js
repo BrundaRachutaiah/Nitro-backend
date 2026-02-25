@@ -438,7 +438,7 @@ const getAppliedProjects = async (req, res, next) => {
       `
       )
       .eq('participant_id', participantId)
-      .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED])
+      .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED, APPLICATION_STATUS.PURCHASED])
       .order('created_at', { ascending: false });
 
     if (error) throw error;
@@ -448,30 +448,47 @@ const getAppliedProjects = async (req, res, next) => {
 
     let allocationRows = [];
     if (projectIds.length > 0) {
-      let { data: allocations, error: allocationsError } = await supabase
+      let allocationRes = await supabase
         .from('unit_allocations')
         .select('id, project_id, status, reserved_until, created_at')
         .eq('participant_id', participantId)
         .in('project_id', projectIds)
+        .is('completed_at', null)
         .order('created_at', { ascending: false });
 
-      if (allocationsError && isMissingTableOrColumn(allocationsError)) {
-        const fallback = await supabase
+      if (allocationRes.error && /completed_at/i.test(String(allocationRes.error.message || ''))) {
+        allocationRes = await supabase
+          .from('unit_allocations')
+          .select('id, project_id, status, reserved_until, created_at')
+          .eq('participant_id', participantId)
+          .in('project_id', projectIds)
+          .neq('status', 'COMPLETED')
+          .order('reserved_until', { ascending: false });
+      }
+
+      if (allocationRes.error && /status/i.test(String(allocationRes.error.message || ''))) {
+        allocationRes = await supabase
+          .from('unit_allocations')
+          .select('id, project_id, status, reserved_until, created_at')
+          .eq('participant_id', participantId)
+          .in('project_id', projectIds)
+          .order('created_at', { ascending: false });
+      }
+
+      if (allocationRes.error && isMissingTableOrColumn(allocationRes.error)) {
+        allocationRes = await supabase
           .from('unit_allocations')
           .select('id, project_id, status, reserved_until')
           .eq('participant_id', participantId)
           .in('project_id', projectIds)
           .order('reserved_until', { ascending: false });
-
-        allocations = fallback.data || [];
-        allocationsError = fallback.error || null;
       }
 
-      if (allocationsError && !isMissingTableOrColumn(allocationsError)) {
-        throw allocationsError;
+      if (allocationRes.error && !isMissingTableOrColumn(allocationRes.error)) {
+        throw allocationRes.error;
       }
 
-      allocationRows = (allocations || []).map((row) => ({
+      allocationRows = (allocationRes.data || []).map((row) => ({
         ...row,
         created_at: row.created_at || null
       }));
@@ -601,49 +618,72 @@ const getCompletedProjects = async (req, res, next) => {
   try {
     const participantId = req.user.id;
 
-    const baseWithCompletedAt = () =>
-      supabase
-        .from('unit_allocations')
-        .select(
-          `
-          id,
-          completed_at,
-          projects (
-            id,
-            title,
-            reward
-          )
+    let appRes = await supabase
+      .from('project_applications')
+      .select(
         `
+        id,
+        project_id,
+        product_id,
+        allocated_budget,
+        status,
+        reviewed_at,
+        created_at,
+        projects (
+          id,
+          title,
+          reward,
+          status
+        ),
+        project_products (
+          id,
+          name,
+          product_url,
+          product_value
         )
-        .eq('participant_id', participantId);
+      `
+      )
+      .eq('participant_id', participantId)
+      .eq('status', APPLICATION_STATUS.COMPLETED)
+      .order('reviewed_at', { ascending: false })
+      .order('created_at', { ascending: false });
 
-    let { data, error } = await baseWithCompletedAt().not('completed_at', 'is', null);
-
-    if (error && isMissingCompletedAtColumn(error)) {
-      const fallbackByStatus = await supabase
-        .from('unit_allocations')
+    if (appRes.error && /reviewed_at|created_at/i.test(String(appRes.error.message || ''))) {
+      appRes = await supabase
+        .from('project_applications')
         .select(
           `
           id,
+          project_id,
+          product_id,
+          allocated_budget,
+          status,
           projects (
             id,
             title,
-            reward
+            reward,
+            status
+          ),
+          project_products (
+            id,
+            name,
+            product_url,
+            product_value
           )
         `
         )
         .eq('participant_id', participantId)
-        .eq('status', 'COMPLETED');
-
-      ({ data, error } = fallbackByStatus);
-
-      if (error && isMissingStatusColumn(error)) {
-        data = [];
-        error = null;
-      }
+        .eq('status', APPLICATION_STATUS.COMPLETED);
     }
 
-    if (error) throw error;
+    if (appRes.error && !isMissingTableOrColumn(appRes.error)) {
+      throw appRes.error;
+    }
+
+    const data = (appRes.data || []).map((row) => ({
+      ...row,
+      completed_at: row.reviewed_at || row.created_at || null
+    }));
 
     res.json({
       success: true,
@@ -758,17 +798,6 @@ const getActiveCatalog = async (req, res, next) => {
     const { data: projects, error } = await query;
     if (error) throw error;
 
-    const applicationsRes = await supabase
-      .from('project_applications')
-      .select('project_id')
-      .eq('participant_id', participantId);
-
-    if (applicationsRes.error && !isMissingTableOrColumn(applicationsRes.error)) {
-      throw applicationsRes.error;
-    }
-
-    const appliedProjectIds = new Set((applicationsRes.data || []).map((row) => row.project_id));
-
     let accessRows = [];
     const accessRes = await supabase
       .from('project_access_requests')
@@ -783,12 +812,45 @@ const getActiveCatalog = async (req, res, next) => {
 
     const accessMap = new Map(accessRows.map((row) => [row.project_id, row.status]));
     const withCreatorName = await attachCreatorNames(projects || []);
-    const enriched = (withCreatorName || [])
-      .filter((project) => !appliedProjectIds.has(project.id))
-      .map((project) => ({
-        ...project,
-        access_status: accessMap.get(project.id) || null
-      }));
+    const projectIds = (withCreatorName || []).map((project) => project.id).filter(Boolean);
+
+    let productRows = [];
+    if (projectIds.length) {
+      let productRes = await supabase
+        .from('project_products')
+        .select('id, project_id, name, product_url, is_active')
+        .in('project_id', projectIds);
+
+      if (productRes.error && /is_active/i.test(String(productRes.error.message || ''))) {
+        productRes = await supabase
+          .from('project_products')
+          .select('id, project_id, name, product_url')
+          .in('project_id', projectIds);
+      }
+
+      if (productRes.error && !isMissingTableOrColumn(productRes.error)) {
+        throw productRes.error;
+      }
+
+      productRows = productRes.data || [];
+    }
+
+    const productCountByProject = new Map();
+    for (const row of productRows) {
+      const projectId = row.project_id;
+      if (!projectId) continue;
+      if (Object.prototype.hasOwnProperty.call(row, 'is_active') && row.is_active !== true) continue;
+      if (!String(row.name || '').trim()) continue;
+      if (!String(row.product_url || '').trim()) continue;
+      productCountByProject.set(projectId, (productCountByProject.get(projectId) || 0) + 1);
+    }
+
+    const enriched = (withCreatorName || []).map((project) => ({
+      ...project,
+      access_status: accessMap.get(project.id) || null,
+      product_count: Number(productCountByProject.get(project.id) || 0),
+      has_products: Number(productCountByProject.get(project.id) || 0) > 0
+    }));
 
     res.json({
       success: true,
@@ -943,29 +1005,28 @@ const getProjectProductsForParticipant = async (req, res, next) => {
   try {
     const participantId = req.user.id;
     const { id: projectId } = req.params;
-
     const accessRes = await supabase
       .from('project_access_requests')
       .select('id, status')
       .eq('project_id', projectId)
       .eq('participant_id', participantId)
       .maybeSingle();
-
-    const access = accessRes.data;
-    if (!accessRes.error) {
-      if (!access || access.status !== 'APPROVED') {
-        return res.status(403).json({
-          success: false,
-          message: access?.status === 'PENDING'
-            ? 'Project access request is pending admin approval'
-            : 'Project is locked. Request access first.',
-          data: {
-            access_status: access?.status || null
-          }
-        });
-      }
-    } else if (!isMissingTableOrColumn(accessRes.error)) {
+    if (accessRes.error && !isMissingTableOrColumn(accessRes.error)) {
       throw accessRes.error;
+    }
+    const access = accessRes.data;
+
+    const { data: project, error: projectError } = await supabase
+      .from('projects')
+      .select('id, status')
+      .eq('id', projectId)
+      .maybeSingle();
+    if (projectError) throw projectError;
+    if (!project || project.status !== PROJECT_STATUS.PUBLISHED) {
+      return res.status(404).json({
+        success: false,
+        message: 'Active project not found'
+      });
     }
 
     const { data: products, error: productError } = await supabase
@@ -980,7 +1041,7 @@ const getProjectProductsForParticipant = async (req, res, next) => {
     res.json({
       success: true,
       data: {
-        access_status: access?.status || 'APPROVED',
+        access_status: access?.status || 'PUBLIC',
         products: products || []
       }
     });

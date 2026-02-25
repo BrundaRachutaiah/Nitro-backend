@@ -1,5 +1,7 @@
 const supabase = require('../config/supabaseClient');
 
+const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+
 /**
  * Get current user profile
  */
@@ -34,18 +36,56 @@ const getMyProfile = async (req, res, next) => {
 const updateMyProfile = async (req, res, next) => {
   try {
     const userId = req.user.id;
-    const { full_name } = req.body;
+    const { full_name, email } = req.body;
 
-    if (!full_name) {
+    const normalizedFullName = String(full_name || '').trim();
+
+    if (!normalizedFullName) {
       return res.status(400).json({
         success: false,
         message: 'full_name is required'
       });
     }
 
+    const updates = { full_name: normalizedFullName };
+
+    if (email !== undefined) {
+      const normalizedEmail = String(email || '').trim().toLowerCase();
+      if (!normalizedEmail) {
+        return res.status(400).json({
+          success: false,
+          message: 'email cannot be empty'
+        });
+      }
+
+      if (!isValidEmail(normalizedEmail)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid email format'
+        });
+      }
+
+      const { data: emailOwner, error: emailLookupError } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('email', normalizedEmail)
+        .neq('id', userId)
+        .maybeSingle();
+
+      if (emailLookupError) throw emailLookupError;
+      if (emailOwner) {
+        return res.status(409).json({
+          success: false,
+          message: 'Email is already in use'
+        });
+      }
+
+      updates.email = normalizedEmail;
+    }
+
     const { data, error } = await supabase
       .from('profiles')
-      .update({ full_name })
+      .update(updates)
       .eq('id', userId)
       .select()
       .single();

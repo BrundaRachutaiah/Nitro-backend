@@ -21,6 +21,13 @@ router.get(
   applicationController.getMyApplications
 );
 
+router.patch(
+  '/applications/:id/purchased',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  applicationController.markApplicationPurchased
+);
+
 router.get(
   '/applications/payment-details',
   authMiddleware,

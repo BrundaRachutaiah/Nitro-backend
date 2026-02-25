@@ -64,7 +64,7 @@ const getApprovedApplicationMap = async (participantIds, projectIds) => {
     )
     .in('participant_id', participantIds)
     .in('project_id', projectIds)
-    .eq('status', 'APPROVED')
+    .in('status', ['APPROVED', 'PURCHASED'])
     .order('created_at', { ascending: false });
 
   if (appRes.error && /created_at/i.test(String(appRes.error.message || ''))) {
@@ -85,7 +85,7 @@ const getApprovedApplicationMap = async (participantIds, projectIds) => {
       )
       .in('participant_id', participantIds)
       .in('project_id', projectIds)
-      .eq('status', 'APPROVED');
+      .in('status', ['APPROVED', 'PURCHASED']);
   }
 
   if (appRes.error) throw appRes.error;
@@ -136,14 +136,26 @@ const enrichReviewRows = async (rows) => {
     (projects || []).map((item) => [item.id, item.title || item.name || null])
   );
   const appMap = await getApprovedApplicationMap(participantIds, projectIds);
+  const { data: profiles, error: profileError } = participantIds.length
+    ? await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', participantIds)
+    : { data: [], error: null };
+  if (profileError) throw profileError;
+
+  const profileMap = new Map((profiles || []).map((item) => [item.id, item]));
 
   return rows.map((row) => {
     const app = appMap.get(buildAppMapKey(row.participant_id, row.project_id)) || {};
+    const profile = profileMap.get(row.participant_id) || {};
     return {
       ...row,
       project_name: projectMap.get(row.project_id) || null,
       product_id: app.product_id || null,
-      product_name: app.product_name || null
+      product_name: app.product_name || null,
+      participant_name: profile.full_name || null,
+      participant_email: profile.email || null
     };
   });
 };
@@ -234,7 +246,7 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
     .select('product_id, allocated_budget')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
-    .eq('status', 'APPROVED')
+    .in('status', ['APPROVED', 'PURCHASED'])
     .maybeSingle();
 
   let productAmount = Number(application?.allocated_budget || 0);
@@ -256,11 +268,38 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
     .from('payouts')
     .insert({
       participant_id: participantId,
+      user_id: participantId,
       project_id: projectId,
       purchase_proof_id: proof.id,
       amount: totalAmount,
       status: 'ELIGIBLE'
     });
+  if (insertError && isMissingSchemaObjectError(insertError)) {
+    const fallbackInsert = await supabase
+      .from('payouts')
+      .insert({
+        participant_id: participantId,
+        project_id: projectId,
+        purchase_proof_id: proof.id,
+        amount: totalAmount,
+        status: 'ELIGIBLE'
+      });
+    if (fallbackInsert.error && !isMissingSchemaObjectError(fallbackInsert.error)) {
+      throw fallbackInsert.error;
+    }
+    if (!fallbackInsert.error) return;
+
+    const fallbackInsertNoProof = await supabase
+      .from('payouts')
+      .insert({
+        participant_id: participantId,
+        project_id: projectId,
+        amount: totalAmount,
+        status: 'ELIGIBLE'
+      });
+    if (fallbackInsertNoProof.error) throw fallbackInsertNoProof.error;
+    return;
+  }
 
   if (insertError) throw insertError;
 };
@@ -523,41 +562,63 @@ const approveReview = async (req, res, next) => {
       .maybeSingle();
 
     if (error) throw error;
-    if (!review) {
-      return res.status(404).json({
-        success: false,
-        message: 'Review not found or already processed'
-      });
+    let reviewRow = review;
+    let alreadyProcessed = false;
+
+    if (!reviewRow) {
+      const { data: existingReview, error: existingReviewError } = await supabase
+        .from('participant_reviews')
+        .select('id, allocation_id, participant_id, project_id, status')
+        .eq('id', id)
+        .maybeSingle();
+      if (existingReviewError) throw existingReviewError;
+      if (!existingReview) {
+        return res.status(404).json({
+          success: false,
+          message: 'Review not found'
+        });
+      }
+      reviewRow = existingReview;
+      alreadyProcessed = String(existingReview.status || '').toUpperCase() === 'APPROVED';
     }
 
     const { data: project, error: projectError } = await supabase
       .from('projects')
       .select('reward')
-      .eq('id', review.project_id)
+      .eq('id', reviewRow.project_id)
       .maybeSingle();
+    if (!projectError) {
+      try {
+        await ensureEligiblePayout({
+          participantId: reviewRow.participant_id,
+          projectId: reviewRow.project_id,
+          fallbackReward: project?.reward
+        });
+      } catch (sideEffectError) {
+        console.error('approveReview ensureEligiblePayout warning:', sideEffectError);
+      }
+    }
 
-    if (projectError) throw projectError;
-
-    await ensureEligiblePayout({
-      participantId: review.participant_id,
-      projectId: review.project_id,
-      fallbackReward: project?.reward
-    });
-
-    await markAllocationCompleted({
-      allocationId: review.allocation_id,
-      participantId: review.participant_id
-    });
+    try {
+      await markAllocationCompleted({
+        allocationId: reviewRow.allocation_id,
+        participantId: reviewRow.participant_id
+      });
+    } catch (allocationError) {
+      console.error('approveReview markAllocationCompleted warning:', allocationError);
+    }
 
     res.json({
       success: true,
-      message: 'Review approved and payout eligibility created'
+      message: alreadyProcessed
+        ? 'Review already approved'
+        : 'Review approved and payout eligibility created'
     });
 
     const { data: participant } = await supabase
       .from('profiles')
       .select('email')
-      .eq('id', review.participant_id)
+      .eq('id', reviewRow.participant_id)
       .maybeSingle();
 
     if (participant?.email) {

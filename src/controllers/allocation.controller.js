@@ -236,7 +236,7 @@ const getMyAllocationTracking = async (req, res, next) => {
         .order('created_at', { ascending: false }),
       supabase
         .from('participant_reviews')
-        .select('id, allocation_id, participant_id, review_url, status, created_at')
+        .select('id, allocation_id, participant_id, review_text, review_url, status, created_at')
         .eq('participant_id', participantId)
         .in('allocation_id', allocationIds)
         .order('created_at', { ascending: false }),
@@ -274,7 +274,7 @@ const getMyAllocationTracking = async (req, res, next) => {
             )
             .eq('participant_id', participantId)
             .in('project_id', projectIds)
-            .eq('status', 'APPROVED')
+            .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
             .order('created_at', { ascending: false })
         : Promise.resolve({ data: [], error: null })
     ]);
@@ -311,9 +311,26 @@ const getMyAllocationTracking = async (req, res, next) => {
       }));
     }
 
-    const reviewRows = reviewsRes.error
-      ? (isMissingSchemaObjectError(reviewsRes.error) ? [] : (() => { throw reviewsRes.error; })())
-      : (reviewsRes.data || []);
+    let reviewRows = reviewsRes.data || [];
+    if (reviewsRes.error) {
+      if (!isMissingSchemaObjectError(reviewsRes.error)) throw reviewsRes.error;
+
+      const fallbackReviews = await supabase
+        .from('participant_reviews')
+        .select('id, allocation_id, participant_id, review_url, status, created_at')
+        .eq('participant_id', participantId)
+        .in('allocation_id', allocationIds)
+        .order('created_at', { ascending: false });
+
+      if (fallbackReviews.error && !isMissingSchemaObjectError(fallbackReviews.error)) {
+        throw fallbackReviews.error;
+      }
+
+      reviewRows = (fallbackReviews.data || []).map((item) => ({
+        ...item,
+        review_text: item?.review_text || null
+      }));
+    }
 
     const feedbackRows = feedbacksRes.error
       ? (isMissingSchemaObjectError(feedbacksRes.error) ? [] : (() => { throw feedbacksRes.error; })())
@@ -354,7 +371,7 @@ const getMyAllocationTracking = async (req, res, next) => {
             .select('id, project_id, product_id, allocated_budget, status')
             .eq('participant_id', participantId)
             .in('project_id', projectIds)
-            .eq('status', 'APPROVED')
+            .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
             .order('created_at', { ascending: false })
         : { data: [], error: null };
 

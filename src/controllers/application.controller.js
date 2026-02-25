@@ -116,13 +116,15 @@ const applyToProject = async (req, res, next) => {
       throw accessCheck.error;
     }
 
-    // Prevent duplicate application
+    // Prevent duplicate active application for the same product.
+    // Re-apply is allowed after the previous one reaches COMPLETED.
     const { data: existing } = await supabase
       .from('project_applications')
       .select('id')
       .eq('project_id', projectId)
       .eq('participant_id', participantId)
       .eq('product_id', productId)
+      .in('status', ['PENDING', 'APPROVED', 'PURCHASED'])
       .maybeSingle();
 
     if (existing) {
@@ -256,12 +258,49 @@ const getMyApplications = async (req, res, next) => {
           product_value
         )
       `)
-      .eq('participant_id', participantId);
+      .eq('participant_id', participantId)
+      .order('created_at', { ascending: false });
 
     if (error) throw error;
 
     res.json({
       success: true,
+      data
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const markApplicationPurchased = async (req, res, next) => {
+  try {
+    const participantId = req.user.id;
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('project_applications')
+      .update({
+        status: 'PURCHASED',
+        reviewed_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .eq('participant_id', participantId)
+      .eq('status', 'APPROVED')
+      .select('id, project_id, product_id, status')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Application not found or not in approved state'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Application moved to applied list',
       data
     });
   } catch (err) {
@@ -358,6 +397,7 @@ const savePaymentDetails = async (req, res, next) => {
 module.exports = {
   applyToProject,
   getMyApplications,
+  markApplicationPurchased,
   getPaymentDetails,
   savePaymentDetails
 };
