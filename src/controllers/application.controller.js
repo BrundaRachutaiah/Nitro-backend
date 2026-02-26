@@ -1,17 +1,6 @@
 const supabase = require('../config/supabaseClient');
 const { logActivity } = require('../services/activityLog.service');
 
-const isMissingTableOrColumn = (error) => {
-  const message = String(error?.message || '').toLowerCase();
-  return (
-    message.includes('does not exist')
-    || message.includes('column')
-    || message.includes('schema cache')
-    || message.includes('relation')
-    || message.includes('table')
-  );
-};
-
 const hasValue = (value) => String(value || '').trim().length > 0;
 
 const isPaymentDetailsComplete = (details) => {
@@ -26,13 +15,6 @@ const isPaymentDetailsComplete = (details) => {
   ];
   return required.every((field) => hasValue(details[field]));
 };
-
-const toIndiaDateKey = (value) => new Intl.DateTimeFormat('en-CA', {
-  timeZone: 'Asia/Kolkata',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit'
-}).format(new Date(value));
 
 /**
  * Apply to a project (Participant)
@@ -50,10 +32,10 @@ const applyToProject = async (req, res, next) => {
       });
     }
 
-    // Check project exists & is active
+    // Check project exists
     const { data: project, error: projectError } = await supabase
       .from('projects')
-      .select('id, title, start_date, end_date, status')
+      .select('id, title, status')
       .eq('id', projectId)
       .single();
 
@@ -64,24 +46,7 @@ const applyToProject = async (req, res, next) => {
       });
     }
 
-    // Compare by India calendar day to avoid timezone edge cases around midnight.
-    const todayKey = toIndiaDateKey(new Date());
-    const startKey = toIndiaDateKey(project.start_date);
-    const endKey = toIndiaDateKey(project.end_date);
-
-    if (todayKey < startKey || todayKey > endKey) {
-      return res.status(400).json({
-        success: false,
-        message: `Project is not active. Today (${todayKey}) must be between start date (${startKey}) and end date (${endKey}).`,
-        data: {
-          today: todayKey,
-          startDate: startKey,
-          endDate: endKey,
-          projectStatus: String(project.status || '').toUpperCase()
-        }
-      });
-    }
-
+    // Check product exists in this project
     const { data: product, error: productError } = await supabase
       .from('project_products')
       .select('id, project_id, name')
@@ -98,39 +63,20 @@ const applyToProject = async (req, res, next) => {
       });
     }
 
-    const accessCheck = await supabase
-      .from('project_access_requests')
+    // Only block if there is already a PENDING request waiting for admin review
+    const { data: existing } = await supabase
+      .from('project_applications')
       .select('id, status')
       .eq('project_id', projectId)
       .eq('participant_id', participantId)
-      .maybeSingle();
-
-    if (!accessCheck.error) {
-      if (!accessCheck.data || accessCheck.data.status !== 'APPROVED') {
-        return res.status(403).json({
-          success: false,
-          message: 'Project access is not approved yet'
-        });
-      }
-    } else if (!isMissingTableOrColumn(accessCheck.error)) {
-      throw accessCheck.error;
-    }
-
-    // Prevent duplicate active application for the same product.
-    // Re-apply is allowed after the previous one reaches COMPLETED.
-    const { data: existing } = await supabase
-      .from('project_applications')
-      .select('id')
-      .eq('project_id', projectId)
-      .eq('participant_id', participantId)
       .eq('product_id', productId)
-      .in('status', ['PENDING', 'APPROVED', 'PURCHASED'])
+      .eq('status', 'PENDING')
       .maybeSingle();
 
     if (existing) {
       return res.status(400).json({
         success: false,
-        message: 'Already applied to this product'
+        message: 'Your request for this product is already pending review. We will notify you once it is reviewed.'
       });
     }
 
@@ -221,7 +167,7 @@ const applyToProject = async (req, res, next) => {
 
     res.status(201).json({
       success: true,
-      message: 'Product application submitted for admin approval',
+      message: 'Your request has been submitted. We will check availability and inform you shortly.',
       data
     });
   } catch (err) {
