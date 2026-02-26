@@ -31,6 +31,17 @@ const toAmount = (value) => {
   const num = Number(value);
   return Number.isFinite(num) ? num : 0;
 };
+const APPROVED_APPLICATION_STATUSES = ['APPROVED', 'PURCHASED', 'COMPLETED'];
+const hasProvidedNumber = (value) =>
+  value !== undefined
+  && value !== null
+  && String(value).trim() !== '';
+
+const getApplicationBudgetAmount = (row, productValueMap = new Map()) => {
+  const allocated = toAmount(row?.allocated_budget);
+  if (allocated > 0) return allocated;
+  return toAmount(productValueMap.get(row?.product_id));
+};
 
 const getApprovedApplicationBreakdownMap = async ({ participantIds = [], projectIds = [] } = {}) => {
   if (!participantIds.length || !projectIds.length) return new Map();
@@ -112,6 +123,98 @@ const fillParticipantIdentity = async (rows = []) => {
       };
     })
   );
+};
+
+const sendParticipantDecisionSummaryNotification = async ({
+  participantId,
+  projectId,
+  projectTitle = null,
+  preferredType = 'PRODUCT_APPLICATION_APPROVED'
+} = {}) => {
+  if (!participantId || !projectId) return;
+
+  let appRes = await supabase
+    .from('project_applications')
+    .select('id, status, product_id, reviewed_at, created_at')
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .in('status', ['APPROVED', 'REJECTED'])
+    .order('reviewed_at', { ascending: false });
+
+  if (appRes.error && /reviewed_at/i.test(String(appRes.error.message || ''))) {
+    appRes = await supabase
+      .from('project_applications')
+      .select('id, status, product_id, created_at')
+      .eq('participant_id', participantId)
+      .eq('project_id', projectId)
+      .in('status', ['APPROVED', 'REJECTED'])
+      .order('created_at', { ascending: false });
+  }
+  if (appRes.error) throw appRes.error;
+
+  const rows = appRes.data || [];
+  if (!rows.length) return;
+
+  const latestByProduct = new Map();
+  for (const row of rows) {
+    if (!row.product_id) continue;
+    if (!latestByProduct.has(row.product_id)) {
+      latestByProduct.set(row.product_id, row);
+    }
+  }
+
+  const productIds = [...latestByProduct.keys()];
+  let productNameMap = new Map();
+  if (productIds.length) {
+    const { data: products, error: productsError } = await supabase
+      .from('project_products')
+      .select('id, name')
+      .in('id', productIds);
+    if (productsError && !isMissingSchemaObjectError(productsError)) throw productsError;
+    productNameMap = new Map((products || []).map((row) => [row.id, row.name || row.id]));
+  }
+
+  const approved = [];
+  const rejected = [];
+  for (const row of latestByProduct.values()) {
+    const name = productNameMap.get(row.product_id) || row.product_id;
+    const status = String(row.status || '').toUpperCase();
+    if (status === 'APPROVED') approved.push(name);
+    if (status === 'REJECTED') rejected.push(name);
+  }
+
+  const approvedText = approved.length ? `Approved: ${approved.join(', ')}` : null;
+  const rejectedText = rejected.length ? `Rejected: ${rejected.join(', ')}` : null;
+  const summaryText = [approvedText, rejectedText].filter(Boolean).join(' | ');
+  if (!summaryText) return;
+
+  const { data: participantProfile } = await supabase
+    .from('profiles')
+    .select('id, full_name, email')
+    .eq('id', participantId)
+    .maybeSingle();
+
+  await supabase
+    .from('notifications')
+    .insert({
+      user_id: participantId,
+      type: preferredType,
+      title: 'Product request update',
+      message: `${projectTitle || 'Project'}: ${summaryText}`
+    });
+
+  if (participantProfile?.email) {
+    await sendEmail({
+      to: participantProfile.email,
+      subject: `Nitro product request update - ${projectTitle || 'Project'}`,
+      html: `
+        <p>Hi ${participantProfile.full_name || 'Participant'},</p>
+        <p>Your product request status was updated.</p>
+        <p><b>${projectTitle || 'Project'}</b>: ${summaryText}</p>
+        <p>You can log in to Nitro to view details.</p>
+      `
+    });
+  }
 };
 
 /**
@@ -1539,20 +1642,28 @@ const rejectProjectAccessRequest = async (req, res, next) => {
 const getPendingProductApplications = async (req, res, next) => {
   try {
     const requestedStatus = String(req.query.status || 'PENDING').toUpperCase();
-    const { data: applications, error } = await supabase
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25));
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+
+    const { data: applications, count, error } = await supabase
       .from('project_applications')
       .select(
-        `
+      `
         id,
         project_id,
         participant_id,
         product_id,
+        allocated_budget,
         status,
         created_at
-      `
+      `,
+      { count: 'exact' }
       )
       .in('status', requestedStatus === 'ALL' ? ['PENDING', 'APPROVED', 'REJECTED'] : [requestedStatus])
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
+      .range(from, to);
 
     if (error) throw error;
 
@@ -1564,7 +1675,7 @@ const getPendingProductApplications = async (req, res, next) => {
     if (projectIds.length) {
       const { data: projectRows, error: projectError } = await supabase
         .from('projects')
-        .select('id, title, mode')
+        .select('id, title, mode, reward, created_by')
         .in('id', projectIds);
       if (projectError) throw projectError;
       projects = projectRows || [];
@@ -1580,12 +1691,26 @@ const getPendingProductApplications = async (req, res, next) => {
       profiles = profileRows || [];
     }
 
+    const { data: approvedRows, error: approvedError } = projectIds.length
+      ? await supabase
+          .from('project_applications')
+          .select('id, project_id, product_id, allocated_budget, status')
+          .in('project_id', projectIds)
+          .in('status', APPROVED_APPLICATION_STATUSES)
+      : { data: [], error: null };
+    if (approvedError) throw approvedError;
+
+    const approvedProductIds = [
+      ...new Set((approvedRows || []).map((row) => row.product_id).filter(Boolean))
+    ];
+    const allProductIds = [...new Set([...productIds, ...approvedProductIds])];
+
     let projectProducts = [];
-    if (productIds.length) {
+    if (allProductIds.length) {
       const { data: productRows, error: productError } = await supabase
         .from('project_products')
         .select('id, name, product_url, product_value')
-        .in('id', productIds);
+        .in('id', allProductIds);
       if (productError) throw productError;
       projectProducts = productRows || [];
     }
@@ -1593,17 +1718,77 @@ const getPendingProductApplications = async (req, res, next) => {
     const projectMap = new Map(projects.map((item) => [item.id, item]));
     const profileMap = new Map(profiles.map((item) => [item.id, item]));
     const productMap = new Map(projectProducts.map((item) => [item.id, item]));
+    const productValueMap = new Map(projectProducts.map((item) => [item.id, toAmount(item.product_value)]));
 
-    const data = (applications || []).map((row) => ({
-      ...row,
-      projects: projectMap.get(row.project_id) || null,
-      profiles: profileMap.get(row.participant_id) || null,
-      project_products: productMap.get(row.product_id) || null
+    const approvedSpendByProject = new Map();
+    for (const row of (approvedRows || [])) {
+      const amount = getApplicationBudgetAmount(row, productValueMap);
+      if (!row.project_id || amount <= 0) continue;
+      approvedSpendByProject.set(
+        row.project_id,
+        toAmount(approvedSpendByProject.get(row.project_id)) + amount
+      );
+    }
+
+    const data = (applications || []).map((row) => {
+      const project = projectMap.get(row.project_id) || null;
+      const product = productMap.get(row.product_id) || null;
+      const projectBudget = toAmount(project?.reward);
+      const spentBudget = toAmount(approvedSpendByProject.get(row.project_id));
+      const remainingBudget = Math.max(0, projectBudget - spentBudget);
+      const requestedAmount = getApplicationBudgetAmount(row, productValueMap);
+
+      return {
+        ...row,
+        projects: project,
+        profiles: profileMap.get(row.participant_id) || null,
+        project_products: product,
+        requested_amount: requestedAmount,
+        suggested_allocated_budget: requestedAmount,
+        project_budget: projectBudget,
+        project_spent_budget: spentBudget,
+        project_remaining_budget: remainingBudget,
+        can_approve: String(row.status || '').toUpperCase() === 'PENDING'
+          ? requestedAmount <= remainingBudget
+          : null
+      };
+    });
+
+    const groupedMap = new Map();
+    for (const row of data) {
+      const key = `${row.participant_id || ''}::${row.project_id || ''}`;
+      if (!groupedMap.has(key)) {
+        groupedMap.set(key, {
+          key,
+          participant_id: row.participant_id,
+          participant_name: row?.profiles?.full_name || row.participant_id || '-',
+          participant_email: row?.profiles?.email || '-',
+          project_id: row.project_id,
+          project_title: row?.projects?.title || row.project_id || '-',
+          project_budget: row.project_budget,
+          project_spent_budget: row.project_spent_budget,
+          project_remaining_budget: row.project_remaining_budget,
+          items: []
+        });
+      }
+      groupedMap.get(key).items.push(row);
+    }
+
+    const groups = Array.from(groupedMap.values()).map((group) => ({
+      ...group,
+      row_span: group.items.length
     }));
 
     res.json({
       success: true,
-      data: data || []
+      data: data || [],
+      groups,
+      meta: {
+        page,
+        limit,
+        total: Number(count || 0),
+        total_pages: Math.ceil(Number(count || 0) / limit)
+      }
     });
   } catch (err) {
     next(err);
@@ -1614,9 +1799,7 @@ const approveProductApplication = async (req, res, next) => {
   try {
     const { id } = req.params;
     const { allocated_budget, eligibility_notes } = req.body;
-    const normalizedAllocatedBudget = Number(allocated_budget || 0);
-
-    if (!Number.isFinite(normalizedAllocatedBudget) || normalizedAllocatedBudget < 0) {
+    if (hasProvidedNumber(allocated_budget) && (!Number.isFinite(Number(allocated_budget)) || Number(allocated_budget) < 0)) {
       return res.status(400).json({
         success: false,
         message: 'allocated_budget must be a valid non-negative number'
@@ -1638,41 +1821,70 @@ const approveProductApplication = async (req, res, next) => {
       });
     }
 
-    let remainingBudget = null;
-    if (pendingApplication.product_id) {
-      const { data: productRow, error: productError } = await supabase
+    const [{ data: projectRow, error: projectError }, { data: productRow, error: productError }] = await Promise.all([
+      supabase
+        .from('projects')
+        .select('id, title, reward')
+        .eq('id', pendingApplication.project_id)
+        .maybeSingle(),
+      pendingApplication.product_id
+        ? supabase
+            .from('project_products')
+            .select('id, name, product_value')
+            .eq('id', pendingApplication.product_id)
+            .maybeSingle()
+        : Promise.resolve({ data: null, error: null })
+    ]);
+    if (projectError) throw projectError;
+    if (productError && !/column|schema|does not exist|relation/i.test(String(productError.message || ''))) {
+      throw productError;
+    }
+
+    const defaultAllocatedBudget = toAmount(productRow?.product_value);
+    const normalizedAllocatedBudget = hasProvidedNumber(allocated_budget)
+      ? Number(allocated_budget)
+      : defaultAllocatedBudget;
+
+    if (!Number.isFinite(normalizedAllocatedBudget) || normalizedAllocatedBudget <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'allocated_budget must be greater than 0'
+      });
+    }
+
+    const { data: approvedRows, error: approvedError } = await supabase
+      .from('project_applications')
+      .select('id, project_id, product_id, allocated_budget, status')
+      .eq('project_id', pendingApplication.project_id)
+      .in('status', APPROVED_APPLICATION_STATUSES);
+    if (approvedError) throw approvedError;
+
+    const approvedProductIds = [
+      ...new Set((approvedRows || []).map((row) => row.product_id).filter(Boolean))
+    ];
+    let approvedProducts = [];
+    if (approvedProductIds.length) {
+      const { data: productRows, error: approvedProductsError } = await supabase
         .from('project_products')
         .select('id, product_value')
-        .eq('id', pendingApplication.product_id)
-        .maybeSingle();
+        .in('id', approvedProductIds);
+      if (approvedProductsError) throw approvedProductsError;
+      approvedProducts = productRows || [];
+    }
 
-      if (productError && !/column|schema|does not exist|relation/i.test(String(productError.message || ''))) {
-        throw productError;
-      }
+    const productValueMap = new Map(approvedProducts.map((row) => [row.id, toAmount(row.product_value)]));
+    const alreadyAllocated = (approvedRows || []).reduce(
+      (sum, row) => sum + getApplicationBudgetAmount(row, productValueMap),
+      0
+    );
 
-      if (productRow && Number(productRow.product_value || 0) > 0) {
-        const { data: approvedRows, error: approvedError } = await supabase
-          .from('project_applications')
-          .select('allocated_budget')
-          .eq('project_id', pendingApplication.project_id)
-          .eq('product_id', pendingApplication.product_id)
-          .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
-
-        if (approvedError) throw approvedError;
-
-        const alreadyAllocated = (approvedRows || []).reduce(
-          (sum, row) => sum + Number(row?.allocated_budget || 0),
-          0
-        );
-
-        remainingBudget = Math.max(0, Number(productRow.product_value || 0) - alreadyAllocated);
-        if (normalizedAllocatedBudget > remainingBudget) {
-          return res.status(400).json({
-            success: false,
-            message: `Allocated budget exceeds remaining product budget. Remaining: Rs ${remainingBudget}.`
-          });
-        }
-      }
+    const projectBudget = toAmount(projectRow?.reward);
+    const remainingBudgetBeforeApproval = Math.max(0, projectBudget - alreadyAllocated);
+    if (normalizedAllocatedBudget > remainingBudgetBeforeApproval) {
+      return res.status(400).json({
+        success: false,
+        message: `Allocated budget exceeds remaining project budget. Remaining: Rs ${remainingBudgetBeforeApproval}.`
+      });
     }
 
     const { data: application, error } = await supabase
@@ -1749,30 +1961,30 @@ const approveProductApplication = async (req, res, next) => {
       if (allocationError) throw allocationError;
     }
 
-    await supabase
-      .from('notifications')
-      .insert({
-        user_id: application.participant_id,
-        type: 'PRODUCT_APPLICATION_APPROVED',
-        title: 'Application approved',
-        message: 'Your product request was approved. You can continue with purchase and proof upload.'
-      });
+    await sendParticipantDecisionSummaryNotification({
+      participantId: application.participant_id,
+      projectId: application.project_id,
+      projectTitle: projectRow?.title || 'Project',
+      preferredType: 'PRODUCT_APPLICATION_APPROVED'
+    });
 
     res.json({
       success: true,
       message: 'Product application approved and allocation created',
       data: {
-        remaining_budget: remainingBudget
+        approved_budget: normalizedAllocatedBudget,
+        remaining_project_budget: Math.max(0, remainingBudgetBeforeApproval - normalizedAllocatedBudget)
       }
     });
 
+    const productLabel = productRow?.name || 'selected product';
     await logActivity({
       actorId: req.user?.id,
       actorRole: req.user?.role,
       action: 'PRODUCT_APPLICATION_APPROVED',
       entityType: 'PROJECT_APPLICATION',
       entityId: id,
-      message: `Product application ${id} approved`
+      message: `Product application ${id} approved for ${productLabel} (Rs ${normalizedAllocatedBudget})`
     });
   } catch (err) {
     next(err);
@@ -1794,7 +2006,7 @@ const rejectProductApplication = async (req, res, next) => {
       })
       .eq('id', id)
       .eq('status', 'PENDING')
-      .select('id, participant_id')
+      .select('id, participant_id, project_id, product_id')
       .maybeSingle();
 
     if (error) throw error;
@@ -1805,14 +2017,20 @@ const rejectProductApplication = async (req, res, next) => {
       });
     }
 
-    await supabase
-      .from('notifications')
-      .insert({
-        user_id: data.participant_id,
-        type: 'PRODUCT_APPLICATION_REJECTED',
-        title: 'Application rejected',
-        message: 'Your product application was rejected by admin.'
-      });
+    const { data: projectRow } = data?.project_id
+      ? await supabase
+          .from('projects')
+          .select('id, title')
+          .eq('id', data.project_id)
+          .maybeSingle()
+      : { data: null };
+
+    await sendParticipantDecisionSummaryNotification({
+      participantId: data.participant_id,
+      projectId: data.project_id,
+      projectTitle: projectRow?.title || 'Project',
+      preferredType: 'PRODUCT_APPLICATION_REJECTED'
+    });
 
     res.json({
       success: true,

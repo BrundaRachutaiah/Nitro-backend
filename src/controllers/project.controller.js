@@ -45,6 +45,11 @@ const attachCreatorNames = async (rows = []) => {
   }));
 };
 
+const toAmount = (value) => {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : 0;
+};
+
 /**
  * Create project (Admin)
  */
@@ -207,6 +212,56 @@ const getAllProjects = async (req, res, next) => {
     if (error) throw error;
 
     const enrichedData = await attachCreatorNames(data || []);
+
+    if (['ADMIN', 'SUPER_ADMIN'].includes(String(req.user?.role || '').toUpperCase())) {
+      const projectIds = enrichedData.map((row) => row.id).filter(Boolean);
+
+      if (projectIds.length) {
+        const { data: approvedApps, error: approvedAppsError } = await supabase
+          .from('project_applications')
+          .select('project_id, product_id, allocated_budget, status')
+          .in('project_id', projectIds)
+          .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+        if (approvedAppsError) throw approvedAppsError;
+
+        const productIds = [...new Set((approvedApps || []).map((row) => row.product_id).filter(Boolean))];
+        let products = [];
+        if (productIds.length) {
+          const { data: productRows, error: productError } = await supabase
+            .from('project_products')
+            .select('id, product_value')
+            .in('id', productIds);
+          if (productError && !isMissingTableOrColumn(productError)) throw productError;
+          products = productRows || [];
+        }
+
+        const productValueMap = new Map((products || []).map((row) => [row.id, toAmount(row.product_value)]));
+        const spentByProject = new Map();
+        for (const row of (approvedApps || [])) {
+          const amount = toAmount(row.allocated_budget) > 0
+            ? toAmount(row.allocated_budget)
+            : toAmount(productValueMap.get(row.product_id));
+          if (!row.project_id || amount <= 0) continue;
+          spentByProject.set(row.project_id, toAmount(spentByProject.get(row.project_id)) + amount);
+        }
+
+        const withBudgets = enrichedData.map((row) => {
+          const allocatedBudget = toAmount(row.reward);
+          const spentBudget = toAmount(spentByProject.get(row.id));
+          return {
+            ...row,
+            allocated_budget: allocatedBudget,
+            spent_budget: spentBudget,
+            remaining_budget: Math.max(0, allocatedBudget - spentBudget)
+          };
+        });
+
+        return res.json({
+          success: true,
+          data: withBudgets
+        });
+      }
+    }
 
     res.json({
       success: true,
