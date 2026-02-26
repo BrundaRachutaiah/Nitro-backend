@@ -32,7 +32,6 @@ const applyToProject = async (req, res, next) => {
       });
     }
 
-    // Check project exists
     // Check project exists and is active
     const { data: project, error: projectError } = await supabase
       .from('projects')
@@ -54,13 +53,6 @@ const applyToProject = async (req, res, next) => {
       });
     }
 
-    if (String(project.status || '').toLowerCase() !== 'published') {
-      return res.status(400).json({
-        success: false,
-        message: 'Project is not active'
-      });
-    }
-
     // Check product exists in this project
     const { data: product, error: productError } = await supabase
       .from('project_products')
@@ -78,23 +70,7 @@ const applyToProject = async (req, res, next) => {
       });
     }
 
-    // Only block if there is already a PENDING request waiting for admin review
-    const { data: existing } = await supabase
-      .from('project_applications')
-      .select('id, status')
-      .eq('project_id', projectId)
-      .eq('participant_id', participantId)
-      .eq('product_id', productId)
-      .eq('status', 'PENDING')
-      .maybeSingle();
-
-    if (existing) {
-      return res.status(400).json({
-        success: false,
-        message: 'Your request for this product is already pending review. We will notify you once it is reviewed.'
-      });
-    }
-
+    // Allow re-submission at any time — participant can always send a new request
     const hasAddressInput = Object.values(address || {}).some(hasValue);
     const hasBankInput = Object.values(bankDetails || {}).some(hasValue);
 
@@ -145,7 +121,17 @@ const applyToProject = async (req, res, next) => {
       .select()
       .single();
 
-    if (error) throw error;
+    // Handle unique constraint — treat duplicate as already pending (never crash with 500)
+    if (error) {
+      if (error.code === '23505') {
+        return res.status(200).json({
+          success: true,
+          alreadyPending: true,
+          message: 'You have already applied for this product. Please wait for admin approval.'
+        });
+      }
+      throw error;
+    }
 
     const { data: participantProfile } = await supabase
       .from('profiles')
