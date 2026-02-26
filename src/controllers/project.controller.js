@@ -146,6 +146,7 @@ const createProject = async (req, res, next) => {
           project_id: data.id,
           name: String(item?.name || '').trim(),
           product_url: String(item?.product_url || '').trim(),
+          image_url: String(item?.image_url || '').trim() || null,
           product_value: Number(item?.product_value || item?.price || 0)
         }))
         .filter((item) => item.name && item.product_url);
@@ -362,6 +363,7 @@ const updateProject = async (req, res, next) => {
           project_id: id,
           name: String(item?.name || '').trim(),
           product_url: String(item?.product_url || '').trim(),
+          image_url: String(item?.image_url || '').trim() || null,
           product_value: Number(item?.product_value || item?.price || 0)
         }))
         .filter((item) => item.name && item.product_url);
@@ -781,10 +783,14 @@ const getActiveCatalog = async (req, res, next) => {
     const participantId = req.user.id;
     const { mode, q } = req.query;
 
+    const nowIso = new Date().toISOString();
+
     let query = supabase
       .from('projects')
       .select('id, name, title, description, reward, total_units, category, mode, status, start_date, end_date, product_url, created_by, created_at')
       .eq('status', PROJECT_STATUS.PUBLISHED)
+      .or(`start_date.is.null,start_date.lte.${nowIso}`)
+      .or(`end_date.is.null,end_date.gte.${nowIso}`)
       .order('created_at', { ascending: false });
 
     if (mode && [PROJECT_MODE.MARKETPLACE, PROJECT_MODE.D2C].includes(String(mode).toUpperCase())) {
@@ -915,12 +921,14 @@ const requestProjectAccess = async (req, res, next) => {
       .maybeSingle();
 
     if (projectError) throw projectError;
-    if (!project || project.status !== PROJECT_STATUS.PUBLISHED) {
+    if (!project || String(project.status || '').toLowerCase() !== PROJECT_STATUS.PUBLISHED) {
       return res.status(404).json({
         success: false,
         message: 'Active project not found'
       });
     }
+
+    // Fetch all active products — treat is_active NULL as active for backwards compat
 
     const { data: existing, error: existingError } = await supabase
       .from('project_access_requests')
@@ -1003,46 +1011,51 @@ const requestProjectAccess = async (req, res, next) => {
 
 const getProjectProductsForParticipant = async (req, res, next) => {
   try {
-    const participantId = req.user.id;
     const { id: projectId } = req.params;
-    const accessRes = await supabase
-      .from('project_access_requests')
-      .select('id, status')
-      .eq('project_id', projectId)
-      .eq('participant_id', participantId)
-      .maybeSingle();
-    if (accessRes.error && !isMissingTableOrColumn(accessRes.error)) {
-      throw accessRes.error;
-    }
-    const access = accessRes.data;
 
+    // Only check that the project is published — no access-request gate needed
     const { data: project, error: projectError } = await supabase
       .from('projects')
       .select('id, status')
       .eq('id', projectId)
       .maybeSingle();
     if (projectError) throw projectError;
-    if (!project || project.status !== PROJECT_STATUS.PUBLISHED) {
+    if (!project || String(project.status || '').toLowerCase() !== PROJECT_STATUS.PUBLISHED) {
       return res.status(404).json({
         success: false,
         message: 'Active project not found'
       });
     }
 
-    const { data: products, error: productError } = await supabase
+    // Fetch products — treat is_active NULL as active for backwards compatibility
+    let productRes = await supabase
       .from('project_products')
-      .select('id, name, product_url, product_value, is_active, created_at')
+      .select('id, name, product_url, image_url, product_value, is_active, created_at')
       .eq('project_id', projectId)
-      .eq('is_active', true)
       .order('created_at', { ascending: false });
 
-    if (productError && !isMissingTableOrColumn(productError)) throw productError;
+    // Fallback if is_active column does not exist in DB
+    if (productRes.error && /is_active/i.test(String(productRes.error.message || ''))) {
+      productRes = await supabase
+        .from('project_products')
+        .select('id, name, product_url, image_url, product_value, created_at')
+        .eq('project_id', projectId)
+        .order('created_at', { ascending: false });
+    }
+
+    if (productRes.error && !isMissingTableOrColumn(productRes.error)) throw productRes.error;
+
+    // Only exclude products explicitly set to false — null counts as active
+    const products = (productRes.data || []).filter((p) => {
+      if (Object.prototype.hasOwnProperty.call(p, 'is_active') && p.is_active === false) return false;
+      return true;
+    });
 
     res.json({
       success: true,
       data: {
-        access_status: access?.status || 'PUBLIC',
-        products: products || []
+        access_status: 'PUBLIC',
+        products
       }
     });
   } catch (err) {

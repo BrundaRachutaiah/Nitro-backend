@@ -33,6 +33,7 @@ const applyToProject = async (req, res, next) => {
     }
 
     // Check project exists
+    // Check project exists and is active
     const { data: project, error: projectError } = await supabase
       .from('projects')
       .select('id, title, status')
@@ -43,6 +44,20 @@ const applyToProject = async (req, res, next) => {
       return res.status(404).json({
         success: false,
         message: 'Project not found'
+      });
+    }
+
+    if (String(project.status || '').toLowerCase() !== 'published') {
+      return res.status(400).json({
+        success: false,
+        message: 'Project is not currently active'
+      });
+    }
+
+    if (String(project.status || '').toLowerCase() !== 'published') {
+      return res.status(400).json({
+        success: false,
+        message: 'Project is not active'
       });
     }
 
