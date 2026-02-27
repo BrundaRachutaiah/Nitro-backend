@@ -192,7 +192,27 @@ const getProofStatus = async (allocationId, participantId) => {
     .maybeSingle();
 
   if (error) throw error;
-  return String(data?.status || '').toUpperCase() || null;
+  if (!data?.id) return null;
+  return String(data?.status || '').toUpperCase() || 'PENDING';
+};
+
+const getProofStatusByProduct = async (allocationId, participantId, productId) => {
+  if (!productId) return getProofStatus(allocationId, participantId);
+
+  let lookup = await supabase
+    .from('purchase_proofs')
+    .select('id, status')
+    .eq('allocation_id', allocationId)
+    .eq('participant_id', participantId)
+    .eq('product_id', productId)
+    .maybeSingle();
+
+  if (lookup.error && isMissingSchemaObjectError(lookup.error)) {
+    return getProofStatus(allocationId, participantId);
+  }
+  if (lookup.error) throw lookup.error;
+  if (!lookup.data?.id) return null;
+  return String(lookup.data?.status || '').toUpperCase() || 'PENDING';
 };
 
 const ensureEligiblePayout = async ({ participantId, projectId }) => {
@@ -307,7 +327,7 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
 const submitFeedback = async (req, res, next) => {
   try {
     const participantId = req.user.id;
-    const { allocationId, rating, feedbackText } = req.body;
+    const { allocationId, productId, rating, feedbackText } = req.body;
 
     if (!allocationId || !rating || !feedbackText) {
       return res.status(400).json({
@@ -332,7 +352,7 @@ const submitFeedback = async (req, res, next) => {
       });
     }
 
-    const proofStatus = await getProofStatus(allocationId, participantId);
+    const proofStatus = await getProofStatusByProduct(allocationId, participantId, productId);
     if (proofStatus !== 'APPROVED') {
       return res.status(400).json({
         success: false,
@@ -340,13 +360,27 @@ const submitFeedback = async (req, res, next) => {
       });
     }
 
-    const { data: reviewProof, error: reviewProofError } = await supabase
+    let reviewProofRes = await supabase
       .from('participant_reviews')
       .select('id, status')
       .eq('allocation_id', allocationId)
       .eq('participant_id', participantId)
+      .eq('product_id', productId || null)
       .neq('status', 'REJECTED')
       .maybeSingle();
+
+    if (reviewProofRes.error && isMissingSchemaObjectError(reviewProofRes.error)) {
+      reviewProofRes = await supabase
+        .from('participant_reviews')
+        .select('id, status')
+        .eq('allocation_id', allocationId)
+        .eq('participant_id', participantId)
+        .neq('status', 'REJECTED')
+        .maybeSingle();
+    }
+
+    const reviewProofError = reviewProofRes.error;
+    const reviewProof = reviewProofRes.data;
 
     if (reviewProofError) throw reviewProofError;
     if (!reviewProof) {
@@ -364,12 +398,25 @@ const submitFeedback = async (req, res, next) => {
       });
     }
 
-    const { data: existing, error: existingError } = await supabase
+    let existingRes = await supabase
       .from('internal_feedbacks')
       .select('id')
       .eq('allocation_id', allocationId)
       .eq('participant_id', participantId)
+      .eq('product_id', productId || null)
       .maybeSingle();
+
+    if (existingRes.error && isMissingSchemaObjectError(existingRes.error)) {
+      existingRes = await supabase
+        .from('internal_feedbacks')
+        .select('id')
+        .eq('allocation_id', allocationId)
+        .eq('participant_id', participantId)
+        .maybeSingle();
+    }
+
+    const existingError = existingRes.error;
+    const existing = existingRes.data;
 
     if (existingError) throw existingError;
     if (existing) {
@@ -379,11 +426,12 @@ const submitFeedback = async (req, res, next) => {
       });
     }
 
-    const { data, error } = await supabase
+    let insertRes = await supabase
       .from('internal_feedbacks')
       .insert({
         allocation_id: allocationId,
         participant_id: participantId,
+        product_id: productId || null,
         project_id: allocation.project_id,
         rating: normalizedRating,
         feedback_text: String(feedbackText).trim()
@@ -391,7 +439,22 @@ const submitFeedback = async (req, res, next) => {
       .select()
       .single();
 
-    if (error) throw error;
+    if (insertRes.error && isMissingSchemaObjectError(insertRes.error)) {
+      insertRes = await supabase
+        .from('internal_feedbacks')
+        .insert({
+          allocation_id: allocationId,
+          participant_id: participantId,
+          project_id: allocation.project_id,
+          rating: normalizedRating,
+          feedback_text: String(feedbackText).trim()
+        })
+        .select()
+        .single();
+    }
+
+    if (insertRes.error) throw insertRes.error;
+    const data = insertRes.data;
 
     await ensureEligiblePayout({
       participantId,
@@ -414,7 +477,7 @@ const submitFeedback = async (req, res, next) => {
 const submitReview = async (req, res, next) => {
   try {
     const participantId = req.user.id;
-    const { allocationId, reviewText, reviewUrl } = req.body;
+    const { allocationId, productId, reviewText, reviewUrl } = req.body;
 
     if (!allocationId) {
       return res.status(400).json({
@@ -453,7 +516,7 @@ const submitReview = async (req, res, next) => {
       });
     }
 
-    const proofStatus = await getProofStatus(allocationId, participantId);
+    const proofStatus = await getProofStatusByProduct(allocationId, participantId, productId);
     if (!proofStatus || proofStatus === 'REJECTED') {
       return res.status(400).json({
         success: false,
@@ -461,35 +524,80 @@ const submitReview = async (req, res, next) => {
       });
     }
 
-    const { data: existing, error: existingError } = await supabase
+    let existingRes = await supabase
       .from('participant_reviews')
-      .select('id')
+      .select('id, status')
       .eq('allocation_id', allocationId)
       .eq('participant_id', participantId)
+      .eq('product_id', productId || null)
       .maybeSingle();
 
+    if (existingRes.error && isMissingSchemaObjectError(existingRes.error)) {
+      existingRes = await supabase
+        .from('participant_reviews')
+        .select('id, status')
+        .eq('allocation_id', allocationId)
+        .eq('participant_id', participantId)
+        .maybeSingle();
+    }
+
+    const existingError = existingRes.error;
+    const existing = existingRes.data;
+
     if (existingError) throw existingError;
-    if (existing) {
+    const existingStatus = String(existing?.status || '').toUpperCase();
+    if (existing && existingStatus !== 'REJECTED') {
       return res.status(400).json({
         success: false,
         message: 'Review already submitted for this allocation'
       });
     }
 
-    const { data, error } = await supabase
-      .from('participant_reviews')
-      .insert({
-        allocation_id: allocationId,
-        participant_id: participantId,
-        project_id: allocation.project_id,
-        review_text: String(reviewText || '').trim(),
-        review_url: String(reviewUrl || '').trim(),
-        status: 'PENDING'
-      })
-      .select()
-      .single();
+    let writeRes;
+    if (existing && existingStatus === 'REJECTED') {
+      writeRes = await supabase
+        .from('participant_reviews')
+        .update({
+          review_text: String(reviewText || '').trim(),
+          review_url: String(reviewUrl || '').trim(),
+          status: 'PENDING'
+        })
+        .eq('id', existing.id)
+        .select()
+        .single();
+    } else {
+      writeRes = await supabase
+        .from('participant_reviews')
+        .insert({
+          allocation_id: allocationId,
+          participant_id: participantId,
+          product_id: productId || null,
+          project_id: allocation.project_id,
+          review_text: String(reviewText || '').trim(),
+          review_url: String(reviewUrl || '').trim(),
+          status: 'PENDING'
+        })
+        .select()
+        .single();
 
-    if (error) throw error;
+      if (writeRes.error && isMissingSchemaObjectError(writeRes.error)) {
+        writeRes = await supabase
+          .from('participant_reviews')
+          .insert({
+            allocation_id: allocationId,
+            participant_id: participantId,
+            project_id: allocation.project_id,
+            review_text: String(reviewText || '').trim(),
+            review_url: String(reviewUrl || '').trim(),
+            status: 'PENDING'
+          })
+          .select()
+          .single();
+      }
+    }
+
+    if (writeRes.error) throw writeRes.error;
+    const data = writeRes.data;
 
     res.status(201).json({
       success: true,

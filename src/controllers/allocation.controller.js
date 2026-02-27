@@ -17,6 +17,9 @@ const isMissingSchemaObjectError = (error) => {
   );
 };
 
+const buildAllocationProductKey = (allocationId, productId) =>
+  `${allocationId}::${productId || '__allocation__'}`;
+
 /**
  * Allocate unit for an application (Admin)
  */
@@ -230,19 +233,19 @@ const getMyAllocationTracking = async (req, res, next) => {
     const [proofsRes, reviewsRes, feedbacksRes, payoutsRes, applicationsRes] = await Promise.all([
       supabase
         .from('purchase_proofs')
-        .select('id, allocation_id, participant_id, status, file_url, created_at')
+        .select('id, allocation_id, participant_id, product_id, status, file_url, created_at')
         .eq('participant_id', participantId)
         .in('allocation_id', allocationIds)
         .order('created_at', { ascending: false }),
       supabase
         .from('participant_reviews')
-        .select('id, allocation_id, participant_id, review_text, review_url, status, created_at')
+        .select('id, allocation_id, participant_id, product_id, review_text, review_url, status, created_at')
         .eq('participant_id', participantId)
         .in('allocation_id', allocationIds)
         .order('created_at', { ascending: false }),
       supabase
         .from('internal_feedbacks')
-        .select('id, allocation_id, participant_id, rating, created_at')
+        .select('id, allocation_id, participant_id, product_id, rating, created_at')
         .eq('participant_id', participantId)
         .in('allocation_id', allocationIds)
         .order('created_at', { ascending: false }),
@@ -414,21 +417,36 @@ const getMyAllocationTracking = async (req, res, next) => {
     }
 
     const proofsByAllocation = new Map();
+    const proofsByAllocationProduct = new Map();
     for (const item of proofRows) {
+      const pairKey = buildAllocationProductKey(item.allocation_id, item.product_id);
+      if (!proofsByAllocationProduct.has(pairKey)) {
+        proofsByAllocationProduct.set(pairKey, item);
+      }
       if (!proofsByAllocation.has(item.allocation_id)) {
         proofsByAllocation.set(item.allocation_id, item);
       }
     }
 
     const reviewsByAllocation = new Map();
+    const reviewsByAllocationProduct = new Map();
     for (const item of reviewRows) {
+      const pairKey = buildAllocationProductKey(item.allocation_id, item.product_id);
+      if (!reviewsByAllocationProduct.has(pairKey)) {
+        reviewsByAllocationProduct.set(pairKey, item);
+      }
       if (!reviewsByAllocation.has(item.allocation_id)) {
         reviewsByAllocation.set(item.allocation_id, item);
       }
     }
 
     const feedbacksByAllocation = new Map();
+    const feedbacksByAllocationProduct = new Map();
     for (const item of feedbackRows) {
+      const pairKey = buildAllocationProductKey(item.allocation_id, item.product_id);
+      if (!feedbacksByAllocationProduct.has(pairKey)) {
+        feedbacksByAllocationProduct.set(pairKey, item);
+      }
       if (!feedbacksByAllocation.has(item.allocation_id)) {
         feedbacksByAllocation.set(item.allocation_id, item);
       }
@@ -446,11 +464,13 @@ const getMyAllocationTracking = async (req, res, next) => {
       }
     }
 
-    const applicationByProjectId = new Map();
+    const applicationsByProjectId = new Map();
     for (const item of approvedApplications) {
-      if (item.project_id && !applicationByProjectId.has(item.project_id)) {
-        applicationByProjectId.set(item.project_id, item);
+      if (!item?.project_id) continue;
+      if (!applicationsByProjectId.has(item.project_id)) {
+        applicationsByProjectId.set(item.project_id, []);
       }
+      applicationsByProjectId.get(item.project_id).push(item);
     }
 
     const rows = allocations.map((allocation) => {
@@ -460,12 +480,39 @@ const getMyAllocationTracking = async (req, res, next) => {
       const payout = (proof?.id && payoutsByProofId.get(proof.id))
         || payoutsByProjectId.get(allocation.project_id)
         || null;
-      const application = applicationByProjectId.get(allocation.project_id) || null;
+      const projectApplications = applicationsByProjectId.get(allocation.project_id) || [];
+      const primaryApplication = projectApplications[0] || null;
+      const selectedProducts = projectApplications.map((item) => ({
+        ...(item || {}),
+        application_id: item?.id || null,
+        product_id: item?.product_id || null,
+        product_name: item?.project_products?.name || null,
+        product_url: item?.project_products?.product_url || null,
+        product_value: Number(item?.project_products?.product_value || 0),
+        application_status: String(item?.status || '').toUpperCase(),
+        purchase_proof: proofsByAllocationProduct.get(
+          buildAllocationProductKey(allocation.id, item?.product_id)
+        ) || null,
+        review_submission: reviewsByAllocationProduct.get(
+          buildAllocationProductKey(allocation.id, item?.product_id)
+        ) || null,
+        feedback_submission: feedbacksByAllocationProduct.get(
+          buildAllocationProductKey(allocation.id, item?.product_id)
+        ) || null
+      }));
+
+      // Compatibility fallback: if DB stores proof/review at allocation-level (no product_id),
+      // attach those records to the single product so participant can continue the flow.
+      if (selectedProducts.length === 1) {
+        if (!selectedProducts[0].purchase_proof && proof) selectedProducts[0].purchase_proof = proof;
+        if (!selectedProducts[0].review_submission && review) selectedProducts[0].review_submission = review;
+        if (!selectedProducts[0].feedback_submission && feedback) selectedProducts[0].feedback_submission = feedback;
+      }
 
       return {
         ...allocation,
-        selected_product: application?.project_products || null,
-        allocated_budget: Number(application?.allocated_budget || 0),
+        selected_product: primaryApplication?.project_products || null,
+        selected_products: selectedProducts,
         purchase_proof: proof,
         review_submission: review,
         feedback_submission: feedback,

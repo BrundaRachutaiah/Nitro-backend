@@ -16,6 +16,18 @@ const isPaymentDetailsComplete = (details) => {
   return required.every((field) => hasValue(details[field]));
 };
 
+const isMissingSchemaObjectError = (error) => {
+  const text = String(error?.message || '').toLowerCase();
+  return (
+    text.includes('does not exist')
+    || text.includes('could not find')
+    || text.includes('schema cache')
+    || text.includes('column')
+    || text.includes('relation')
+    || text.includes('table')
+  );
+};
+
 /**
  * Apply to a project (Participant)
  */
@@ -108,29 +120,92 @@ const applyToProject = async (req, res, next) => {
 
       if (detailUpsertError) throw detailUpsertError;
     }
-
-    // Create application
-    const { data, error } = await supabase
+    let existingRes = await supabase
       .from('project_applications')
-      .insert({
-        project_id: projectId,
-        participant_id: participantId,
-        product_id: productId,
-        status: 'PENDING'
-      })
-      .select()
-      .single();
+      .select('id, status, created_at')
+      .eq('project_id', projectId)
+      .eq('participant_id', participantId)
+      .eq('product_id', productId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    // Handle unique constraint — treat duplicate as already pending (never crash with 500)
-    if (error) {
-      if (error.code === '23505') {
-        return res.status(200).json({
-          success: true,
-          alreadyPending: true,
-          message: 'You have already applied for this product. Please wait for admin approval.'
-        });
+    if (existingRes.error && /created_at/i.test(String(existingRes.error.message || ''))) {
+      existingRes = await supabase
+        .from('project_applications')
+        .select('id, status')
+        .eq('project_id', projectId)
+        .eq('participant_id', participantId)
+        .eq('product_id', productId)
+        .limit(1)
+        .maybeSingle();
+    }
+
+    if (existingRes.error && !isMissingSchemaObjectError(existingRes.error)) throw existingRes.error;
+
+    const existing = existingRes.data || null;
+    const existingStatus = String(existing?.status || '').toUpperCase();
+
+    if (existing && existingStatus === 'PENDING') {
+      return res.status(200).json({
+        success: true,
+        alreadyPending: true,
+        message: 'You have already applied for this product. Please wait for admin approval.',
+        data: existing
+      });
+    }
+
+    let data = null;
+    if (existing && ['REJECTED', 'COMPLETED', 'PURCHASED', 'APPROVED'].includes(existingStatus)) {
+      let updateRes = await supabase
+        .from('project_applications')
+        .update({
+          status: 'PENDING',
+          allocated_budget: null,
+          reviewed_at: null
+        })
+        .eq('id', existing.id)
+        .select()
+        .single();
+
+      if (updateRes.error && isMissingSchemaObjectError(updateRes.error)) {
+        updateRes = await supabase
+          .from('project_applications')
+          .update({
+            status: 'PENDING',
+            allocated_budget: null
+          })
+          .eq('id', existing.id)
+          .select()
+          .single();
       }
-      throw error;
+
+      if (updateRes.error) throw updateRes.error;
+      data = updateRes.data;
+    } else {
+      const insertRes = await supabase
+        .from('project_applications')
+        .insert({
+          project_id: projectId,
+          participant_id: participantId,
+          product_id: productId,
+          status: 'PENDING'
+        })
+        .select()
+        .single();
+
+      if (insertRes.error) {
+        if (insertRes.error.code === '23505') {
+          return res.status(200).json({
+            success: true,
+            alreadyPending: true,
+            message: 'You have already applied for this product. Please wait for admin approval.'
+          });
+        }
+        throw insertRes.error;
+      }
+
+      data = insertRes.data;
     }
 
     const { data: participantProfile } = await supabase
