@@ -58,7 +58,8 @@ const uploadPurchaseProof = async (req, res, next) => {
       });
     }
 
-    if (allocation.status !== ALLOCATION_STATUS.RESERVED) {
+    const activeStatuses = [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED];
+    if (!activeStatuses.includes(allocation.status)) {
       return res.status(400).json({
         success: false,
         message: 'Allocation is not active'
@@ -79,15 +80,23 @@ const uploadPurchaseProof = async (req, res, next) => {
       }
     }
 
-    let existingLookup = await supabase
+    // Check if a proof already exists for this specific product (or for the allocation if no productId)
+    let existingQuery = supabase
       .from('purchase_proofs')
       .select('id')
       .eq('allocation_id', allocationId)
-      .eq('participant_id', participantId)
-      .eq('product_id', productId || null)
-      .maybeSingle();
+      .eq('participant_id', participantId);
+
+    if (productId) {
+      existingQuery = existingQuery.eq('product_id', productId);
+    } else {
+      existingQuery = existingQuery.is('product_id', null);
+    }
+
+    let existingLookup = await existingQuery.maybeSingle();
 
     if (existingLookup.error && isMissingSchemaObjectError(existingLookup.error)) {
+      // Fallback: schema may not have product_id column, check by allocation only
       existingLookup = await supabase
         .from('purchase_proofs')
         .select('id')
@@ -103,12 +112,13 @@ const uploadPurchaseProof = async (req, res, next) => {
     if (existingLookup.data) {
       return res.status(400).json({
         success: false,
-        message: 'Purchase proof already uploaded'
+        message: 'Purchase proof already uploaded for this product'
       });
     }
 
     const fileExt = path.extname(req.file.originalname);
-    const fileName = `invoice${fileExt}`;
+    const uniqueSuffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const fileName = `invoice_${uniqueSuffix}${fileExt}`;
     const filePath = `${participantId}/${allocationId}/${productId || 'set'}/${fileName}`;
 
     const { error: uploadError } = await supabase.storage

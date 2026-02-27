@@ -554,6 +554,28 @@ const getActiveAllocations = async (req, res, next) => {
       .is('completed_at', null)
       .order('reserved_until', { ascending: true });
 
+    // Fallback: if completed_at column doesn't exist, query without it
+    if (error && /completed_at/i.test(String(error.message || ''))) {
+      const fallback = await supabase
+        .from('unit_allocations')
+        .select(`
+          id,
+          reserved_until,
+          created_at,
+          projects (
+            id,
+            title,
+            reward
+          )
+        `)
+        .eq('participant_id', participantId)
+        .neq('status', 'COMPLETED')
+        .order('reserved_until', { ascending: true });
+
+      if (fallback.error) throw fallback.error;
+      return res.json({ success: true, data: fallback.data });
+    }
+
     if (error) throw error;
 
     res.json({
@@ -579,7 +601,6 @@ const getAllocationById = async (req, res, next) => {
         `
         id,
         reserved_until,
-        completed_at,
         created_at,
         projects (
           id,
@@ -652,23 +673,63 @@ const updateAllocationStatus = async (req, res, next) => {
     let error;
 
     if (status === ALLOCATION_STATUS.PURCHASED) {
-      ({ data, error } = await supabase
+      // Try with completed_at filter; fall back without it if column doesn't exist
+      let res = await supabase
         .from('unit_allocations')
         .update({ status: ALLOCATION_STATUS.PURCHASED })
         .eq('id', id)
         .eq('participant_id', participantId)
         .is('completed_at', null)
         .select()
-        .maybeSingle());
+        .maybeSingle();
+
+      if (res.error && /completed_at/i.test(String(res.error.message || ''))) {
+        res = await supabase
+          .from('unit_allocations')
+          .update({ status: ALLOCATION_STATUS.PURCHASED })
+          .eq('id', id)
+          .eq('participant_id', participantId)
+          .neq('status', ALLOCATION_STATUS.COMPLETED)
+          .select()
+          .maybeSingle();
+      }
+
+      if (res.error && /status.*column|column.*status/i.test(String(res.error.message || ''))) {
+        res = await supabase
+          .from('unit_allocations')
+          .update({ status: ALLOCATION_STATUS.PURCHASED })
+          .eq('id', id)
+          .eq('participant_id', participantId)
+          .select()
+          .maybeSingle();
+      }
+
+      data = res.data;
+      error = res.error;
     } else {
-      ({ data, error } = await supabase
+      // COMPLETED: try with completed_at, fall back to just status update
+      const completedPayload = { status: ALLOCATION_STATUS.COMPLETED };
+      let res = await supabase
         .from('unit_allocations')
-        .update({ completed_at: new Date().toISOString(), status: ALLOCATION_STATUS.COMPLETED })
+        .update({ ...completedPayload, completed_at: new Date().toISOString() })
         .eq('id', id)
         .eq('participant_id', participantId)
         .is('completed_at', null)
         .select()
-        .maybeSingle());
+        .maybeSingle();
+
+      if (res.error && /completed_at/i.test(String(res.error.message || ''))) {
+        res = await supabase
+          .from('unit_allocations')
+          .update(completedPayload)
+          .eq('id', id)
+          .eq('participant_id', participantId)
+          .select()
+          .maybeSingle();
+      }
+
+      data = res.data;
+      error = res.error;
     }
 
     if (error) throw error;
