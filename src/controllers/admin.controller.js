@@ -2606,7 +2606,6 @@ const getPayoutBatches = async (req, res, next) => {
         .select('id, payout_batch_id, participant_id, project_id, product_id, amount, status')
         .in('payout_batch_id', batchIds);
 
-      // fallback if product_id or project_id column missing
       if (payoutsRes.error && /product_id|project_id/i.test(String(payoutsRes.error.message || ''))) {
         payoutsRes = await supabase
           .from('payouts')
@@ -2618,62 +2617,73 @@ const getPayoutBatches = async (req, res, next) => {
 
     const payoutRows = payoutsRes.data || [];
     const participantIds = [...new Set(payoutRows.map((row) => row.participant_id).filter(Boolean))];
-
-    // Direct product_id from payouts (may be null for older rows)
-    const directProductIds = [...new Set(payoutRows.map((row) => row.product_id).filter(Boolean))];
+    const projectIds    = [...new Set(payoutRows.map((row) => row.project_id).filter(Boolean))];
+    const productIds    = [...new Set(payoutRows.map((row) => row.product_id).filter(Boolean))];
 
     let profilesRes = { data: [], error: null };
-    let detailsRes = { data: [], error: null };
+    let detailsRes  = { data: [], error: null };
     let productsRes = { data: [], error: null };
     let applicationsRes = { data: [], error: null };
 
-    // Fetch products directly linked on payout rows
-    if (directProductIds.length) {
+    // Fetch products for direct product_ids on payouts
+    if (productIds.length) {
       productsRes = await supabase
         .from('project_products')
         .select('id, name, product_value')
-        .in('id', directProductIds);
+        .in('id', productIds);
       if (productsRes.error && !isMissingSchemaObjectError(productsRes.error)) throw productsRes.error;
     }
 
-    // Always fetch applications for ALL participants in this batch — covers both old rows
-    // (no product_id on payout) and new rows (product_id set but we want product name anyway)
+    // Fetch applications WITH nested product join — same approach as getEligiblePayouts
     if (participantIds.length) {
-      let appRes = await supabase
+      let appQuery = supabase
         .from('project_applications')
         .select(`
+          id,
           participant_id,
           project_id,
-          allocated_budget,
           product_id,
-          project_products ( id, name, product_value )
+          allocated_budget,
+          status,
+          project_products (
+            id,
+            name,
+            product_value
+          )
         `)
         .in('participant_id', participantIds)
-        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
-      if (appRes.error && !isMissingSchemaObjectError(appRes.error)) {
-        // fallback without join if schema issue
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('created_at', { ascending: true });
+
+      if (projectIds.length) {
+        appQuery = appQuery.in('project_id', projectIds);
+      }
+
+      let appRes = await appQuery;
+
+      // Fallback: if nested join fails, fetch flat + fetch products separately
+      if (appRes.error) {
         appRes = await supabase
           .from('project_applications')
-          .select('participant_id, project_id, allocated_budget, product_id')
+          .select('id, participant_id, project_id, product_id, allocated_budget, status')
           .in('participant_id', participantIds)
-          .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+          .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+          .order('created_at', { ascending: true });
       }
       if (appRes.error && !isMissingSchemaObjectError(appRes.error)) throw appRes.error;
       applicationsRes = appRes;
 
-      // Also fetch product names for product_ids found in applications
+      // Collect any product_ids from applications not yet in productsRes
       const appProductIds = [...new Set((applicationsRes.data || []).map((r) => r.product_id).filter(Boolean))];
-      const missingProductIds = appProductIds.filter((id) => !directProductIds.includes(id));
+      const knownProductIds = new Set((productsRes.data || []).map((r) => r.id));
+      const missingProductIds = appProductIds.filter((id) => !knownProductIds.has(id));
       if (missingProductIds.length) {
-        const moreProductsRes = await supabase
+        const extraRes = await supabase
           .from('project_products')
           .select('id, name, product_value')
           .in('id', missingProductIds);
-        if (!moreProductsRes.error) {
-          productsRes = {
-            data: [...(productsRes.data || []), ...(moreProductsRes.data || [])],
-            error: null
-          };
+        if (!extraRes.error) {
+          productsRes = { data: [...(productsRes.data || []), ...(extraRes.data || [])], error: null };
         }
       }
     }
@@ -2722,7 +2732,12 @@ const getPayoutBatches = async (req, res, next) => {
     const detailMap = new Map((detailsRes.data || []).map((row) => [row.participant_id, row]));
     const productMap = new Map((productsRes.data || []).map((row) => [row.id, row]));
 
-    // Build application map: participant_id -> list of apps (each has product info)
+    // Build lookup maps for product resolution.
+    // KEY INSIGHT from debug: payout rows have NO project_id / product_id (old schema).
+    // So we match by: participant_id + amount matches app's allocated_budget.
+    // Each app is consumed once so multiple products per participant work correctly.
+
+    // Map: participantId → sorted list of apps (sorted by allocated_budget desc to match largest first)
     const appsByParticipant = new Map();
     for (const app of (applicationsRes.data || [])) {
       const pid = app.participant_id;
@@ -2731,8 +2746,8 @@ const getPayoutBatches = async (req, res, next) => {
       appsByParticipant.get(pid).push(app);
     }
 
-    // Track which app index we've used per participant (to pair each payout row with next app)
-    const appIndexByParticipant = new Map();
+    // Track consumed apps by reference so each app is only used once
+    const usedApps = new Set();
 
     const participantsByBatchId = new Map();
 
@@ -2747,45 +2762,77 @@ const getPayoutBatches = async (req, res, next) => {
 
       const profile = profileMap.get(participantId) || {};
       const details = detailMap.get(participantId) || {};
+      const participantApps = appsByParticipant.get(participantId) || [];
 
-      // Resolve product name and amount
       let productName = null;
       let productAmount = null;
+      let resolvedApp = null;
 
-      // Strategy 1: product_id directly on payout row
-      if (payout.product_id && productMap.has(payout.product_id)) {
+      // Strategy 1: payout has product_id → direct exact match
+      if (payout.product_id) {
         const prod = productMap.get(payout.product_id);
-        productName = prod.name || null;
-        productAmount = toAmount(prod.product_value);
+        if (prod) {
+          productName = prod.name || null;
+          productAmount = toAmount(prod.product_value);
+        }
+        const exactApp = participantApps.find(
+          (a) => !usedApps.has(a) && a.product_id === payout.product_id
+        );
+        if (exactApp) {
+          if (exactApp.allocated_budget != null) productAmount = toAmount(exactApp.allocated_budget);
+          resolvedApp = exactApp;
+        }
       }
 
-      // Strategy 2: match via project_id on payout → application
+      // Strategy 2: payout has project_id → match unused app for same project+amount
       if (!productName && payout.project_id) {
-        const apps = appsByParticipant.get(participantId) || [];
-        const matchedApp = apps.find((a) => a.project_id === payout.project_id);
+        // Try to match by project_id AND amount first
+        let matchedApp = participantApps.find(
+          (a) => !usedApps.has(a) &&
+                 a.project_id === payout.project_id &&
+                 toAmount(a.allocated_budget) === toAmount(payout.amount)
+        );
+        // Fallback: just match by project_id
+        if (!matchedApp) {
+          matchedApp = participantApps.find(
+            (a) => !usedApps.has(a) && a.project_id === payout.project_id
+          );
+        }
         if (matchedApp) {
-          productName = matchedApp?.project_products?.name
-            || (matchedApp.product_id && productMap.get(matchedApp.product_id)?.name)
-            || null;
-          productAmount = toAmount(matchedApp?.allocated_budget || matchedApp?.project_products?.product_value
-            || (matchedApp.product_id && productMap.get(matchedApp.product_id)?.product_value));
+          const prod = matchedApp.product_id ? productMap.get(matchedApp.product_id) : null;
+          productName = prod?.name || null;
+          productAmount = toAmount(matchedApp.allocated_budget ?? prod?.product_value);
+          resolvedApp = matchedApp;
         }
       }
 
-      // Strategy 3: sequential — take next unused application for this participant
-      if (!productName) {
-        const apps = appsByParticipant.get(participantId) || [];
-        const idx = appIndexByParticipant.get(participantId) || 0;
-        const app = apps[idx];
-        if (app) {
-          productName = app?.project_products?.name
-            || (app.product_id && productMap.get(app.product_id)?.name)
-            || null;
-          productAmount = toAmount(app?.allocated_budget || app?.project_products?.product_value
-            || (app.product_id && productMap.get(app.product_id)?.product_value));
-          appIndexByParticipant.set(participantId, idx + 1);
+      // Strategy 3: match by amount — find unused app whose allocated_budget equals payout.amount
+      if (!productName && payout.amount) {
+        const amountMatch = participantApps.find(
+          (a) => !usedApps.has(a) && toAmount(a.allocated_budget) === toAmount(payout.amount)
+        );
+        if (amountMatch) {
+          const prod = amountMatch.product_id ? productMap.get(amountMatch.product_id) : null;
+          productName = prod?.name || null;
+          productAmount = toAmount(amountMatch.allocated_budget ?? prod?.product_value);
+          resolvedApp = amountMatch;
         }
       }
+
+      // Strategy 4: sequential fallback — take next unused app for this participant
+      if (!productName) {
+        const unusedApp = participantApps.find((a) => !usedApps.has(a));
+        if (unusedApp) {
+          const prod = unusedApp.product_id ? productMap.get(unusedApp.product_id) : null;
+          productName = prod?.name || null;
+          productAmount = toAmount(unusedApp.allocated_budget ?? prod?.product_value);
+          resolvedApp = unusedApp;
+        }
+      }
+
+      // Mark this app as consumed — it will not be matched to any other payout row
+      if (resolvedApp) usedApps.add(resolvedApp);
+
 
       participantsByBatchId.get(batchId).push({
         id: participantId,
