@@ -96,13 +96,20 @@ const uploadPurchaseProof = async (req, res, next) => {
     let existingLookup = await existingQuery.maybeSingle();
 
     if (existingLookup.error && isMissingSchemaObjectError(existingLookup.error)) {
-      // Fallback: schema may not have product_id column, check by allocation only
-      existingLookup = await supabase
-        .from('purchase_proofs')
-        .select('id')
-        .eq('allocation_id', allocationId)
-        .eq('participant_id', participantId)
-        .maybeSingle();
+      if (productId) {
+        // Schema doesn't have product_id column yet — cannot safely check per-product.
+        // Skip the duplicate check to avoid incorrectly blocking other products in the
+        // same allocation. Each product will get its own row once the schema is updated.
+        existingLookup = { data: null, error: null };
+      } else {
+        // No productId provided — safe to fall back to allocation-level check
+        existingLookup = await supabase
+          .from('purchase_proofs')
+          .select('id')
+          .eq('allocation_id', allocationId)
+          .eq('participant_id', participantId)
+          .maybeSingle();
+      }
     }
 
     if (existingLookup.error && !isMissingSchemaObjectError(existingLookup.error)) {
@@ -143,19 +150,32 @@ const uploadPurchaseProof = async (req, res, next) => {
         status: 'PENDING'
       })
       .select()
-      .single();
+      .maybeSingle();
 
     if (insertRes.error && isMissingSchemaObjectError(insertRes.error)) {
-      insertRes = await supabase
+      // product_id column missing — insert without it, then fetch back the new row
+      const fallbackInsert = await supabase
         .from('purchase_proofs')
         .insert({
           allocation_id: allocationId,
           participant_id: participantId,
           file_url: publicUrl.publicUrl,
           status: 'PENDING'
-        })
-        .select()
-        .single();
+        });
+
+      if (fallbackInsert.error && !isMissingSchemaObjectError(fallbackInsert.error)) {
+        insertRes = { data: null, error: fallbackInsert.error };
+      } else {
+        // Fetch back any proof for this allocation (no created_at column exists)
+        const fetchBack = await supabase
+          .from('purchase_proofs')
+          .select()
+          .eq('allocation_id', allocationId)
+          .eq('participant_id', participantId)
+          .limit(1)
+          .maybeSingle();
+        insertRes = fetchBack;
+      }
     }
 
     if (insertRes.error) throw insertRes.error;

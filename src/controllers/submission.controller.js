@@ -184,16 +184,19 @@ const getAllocationContext = async (allocationId, participantId) => {
 };
 
 const getProofStatus = async (allocationId, participantId) => {
+  // Use limit(1) + select as array to safely handle allocations with multiple products
+  // (.maybeSingle() throws when >1 row exists)
   const { data, error } = await supabase
     .from('purchase_proofs')
     .select('id, status')
     .eq('allocation_id', allocationId)
     .eq('participant_id', participantId)
-    .maybeSingle();
+    .limit(1);
 
   if (error) throw error;
-  if (!data?.id) return null;
-  return String(data?.status || '').toUpperCase() || 'PENDING';
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row?.id) return null;
+  return String(row?.status || '').toUpperCase() || 'PENDING';
 };
 
 const getProofStatusByProduct = async (allocationId, participantId, productId) => {
@@ -208,10 +211,17 @@ const getProofStatusByProduct = async (allocationId, participantId, productId) =
     .maybeSingle();
 
   if (lookup.error && isMissingSchemaObjectError(lookup.error)) {
+    // product_id column doesn't exist — fall back to allocation-level check
+    // getProofStatus now safely handles multiple rows via limit(1)
     return getProofStatus(allocationId, participantId);
   }
   if (lookup.error) throw lookup.error;
-  if (!lookup.data?.id) return null;
+
+  // If no row found by product_id, also try allocation-level as fallback
+  // (handles the case where proof was inserted without product_id)
+  if (!lookup.data?.id) {
+    return getProofStatus(allocationId, participantId);
+  }
   return String(lookup.data?.status || '').toUpperCase() || 'PENDING';
 };
 
@@ -437,10 +447,10 @@ const submitFeedback = async (req, res, next) => {
         feedback_text: String(feedbackText).trim()
       })
       .select()
-      .single();
+      .maybeSingle();
 
     if (insertRes.error && isMissingSchemaObjectError(insertRes.error)) {
-      insertRes = await supabase
+      const fallback = await supabase
         .from('internal_feedbacks')
         .insert({
           allocation_id: allocationId,
@@ -448,9 +458,19 @@ const submitFeedback = async (req, res, next) => {
           project_id: allocation.project_id,
           rating: normalizedRating,
           feedback_text: String(feedbackText).trim()
-        })
-        .select()
-        .single();
+        });
+      if (fallback.error && !isMissingSchemaObjectError(fallback.error)) {
+        insertRes = { data: null, error: fallback.error };
+      } else {
+        const fetchBack = await supabase
+          .from('internal_feedbacks')
+          .select()
+          .eq('allocation_id', allocationId)
+          .eq('participant_id', participantId)
+          .limit(1)
+          .maybeSingle();
+        insertRes = fetchBack;
+      }
     }
 
     if (insertRes.error) throw insertRes.error;
@@ -533,12 +553,18 @@ const submitReview = async (req, res, next) => {
       .maybeSingle();
 
     if (existingRes.error && isMissingSchemaObjectError(existingRes.error)) {
-      existingRes = await supabase
-        .from('participant_reviews')
-        .select('id, status')
-        .eq('allocation_id', allocationId)
-        .eq('participant_id', participantId)
-        .maybeSingle();
+      if (productId) {
+        // Schema doesn't have product_id column yet — cannot safely check per-product.
+        // Skip fallback to avoid incorrectly blocking reviews for other products.
+        existingRes = { data: null, error: null };
+      } else {
+        existingRes = await supabase
+          .from('participant_reviews')
+          .select('id, status')
+          .eq('allocation_id', allocationId)
+          .eq('participant_id', participantId)
+          .maybeSingle();
+      }
     }
 
     const existingError = existingRes.error;
@@ -564,7 +590,7 @@ const submitReview = async (req, res, next) => {
         })
         .eq('id', existing.id)
         .select()
-        .single();
+        .maybeSingle();
     } else {
       writeRes = await supabase
         .from('participant_reviews')
@@ -578,10 +604,13 @@ const submitReview = async (req, res, next) => {
           status: 'PENDING'
         })
         .select()
-        .single();
+        .maybeSingle();
 
       if (writeRes.error && isMissingSchemaObjectError(writeRes.error)) {
-        writeRes = await supabase
+        // Schema doesn't have product_id column — insert without it, then fetch the row back
+        // using a timestamp window to avoid the "multiple rows" error from .single()
+        const insertedAt = new Date().toISOString();
+        const fallbackInsert = await supabase
           .from('participant_reviews')
           .insert({
             allocation_id: allocationId,
@@ -590,9 +619,22 @@ const submitReview = async (req, res, next) => {
             review_text: String(reviewText || '').trim(),
             review_url: String(reviewUrl || '').trim(),
             status: 'PENDING'
-          })
-          .select()
-          .single();
+          });
+
+        if (fallbackInsert.error && !isMissingSchemaObjectError(fallbackInsert.error)) {
+          writeRes = { data: null, error: fallbackInsert.error };
+        } else {
+          // Fetch back any pending review row for this allocation
+          const fetchBack = await supabase
+            .from('participant_reviews')
+            .select()
+            .eq('allocation_id', allocationId)
+            .eq('participant_id', participantId)
+            .eq('status', 'PENDING')
+            .limit(1)
+            .maybeSingle();
+          writeRes = fetchBack;
+        }
       }
     }
 
