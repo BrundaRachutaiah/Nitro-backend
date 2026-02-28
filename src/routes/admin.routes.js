@@ -219,6 +219,20 @@ router.get(
   adminController.exportPayoutBatchCSV
 );
 
+router.get(
+  '/payouts/:payoutId/export',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.exportPayoutCSV
+);
+
+router.patch(
+  '/payouts/:payoutId/mark-paid',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.markPayoutPaid
+);
+
 // Support tickets
 router.get(
   '/support/tickets',

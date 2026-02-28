@@ -2351,10 +2351,20 @@ const getEligiblePayouts = async (req, res, next) => {
   try {
     await backfillEligiblePayouts();
 
-    let payoutsRes = await supabase
+    // Optional filters from query params
+    const filterProjectId = req.query.project_id ? String(req.query.project_id) : null;
+    const filterClientId = req.query.client_id ? String(req.query.client_id) : null;
+
+    let payoutsQuery = supabase
       .from('payouts')
       .select('id, participant_id, project_id, product_id, amount, status, created_at, payout_batch_id')
       .order('created_at', { ascending: true });
+
+    if (filterProjectId) {
+      payoutsQuery = payoutsQuery.eq('project_id', filterProjectId);
+    }
+
+    let payoutsRes = await payoutsQuery;
 
     let hasProductColumn = true;
     if (payoutsRes.error && /product_id/i.test(String(payoutsRes.error.message || ''))) {
@@ -2391,7 +2401,7 @@ const getEligiblePayouts = async (req, res, next) => {
       projectIds.length
         ? supabase
             .from('projects')
-            .select('id, title, name, reward')
+            .select('id, title, name, reward, total_units, created_by')
             .in('id', projectIds)
         : Promise.resolve({ data: [], error: null }),
       productIds.length
@@ -2432,6 +2442,58 @@ const getEligiblePayouts = async (req, res, next) => {
     if (productsRes.error && !isMissingSchemaObjectError(productsRes.error)) throw productsRes.error;
     if (applicationsRes.error && !isMissingSchemaObjectError(applicationsRes.error)) throw applicationsRes.error;
 
+    // Fetch client (brand) profiles — the users who created each project
+    const clientIds = [...new Set((projectsRes.data || []).map((p) => p.created_by).filter(Boolean))];
+    let clientProfileMap = new Map();
+    if (clientIds.length) {
+      const { data: clientProfiles } = await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', clientIds);
+      clientProfileMap = new Map((clientProfiles || []).map((p) => [p.id, p]));
+    }
+
+    // Fetch project budgets: total allocated_budget per project from approved/purchased/completed apps
+    let projectBudgetMap = new Map(); // projectId -> { total_budget, spent_budget }
+    if (projectIds.length) {
+      // Get project budget from the projects table if it exists, or compute from applications
+      const { data: budgetApps } = await supabase
+        .from('project_applications')
+        .select('project_id, allocated_budget')
+        .in('project_id', projectIds)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .not('allocated_budget', 'is', null);
+
+      const spentByProject = new Map();
+      for (const app of (budgetApps || [])) {
+        const prev = toAmount(spentByProject.get(app.project_id));
+        spentByProject.set(app.project_id, prev + toAmount(app.allocated_budget));
+      }
+
+      // Also try to get the project's own budget field if it exists
+      const { data: projectBudgets } = await supabase
+        .from('projects')
+        .select('id, budget')
+        .in('id', projectIds);
+
+      for (const proj of (projectBudgets || [])) {
+        const spent = toAmount(spentByProject.get(proj.id));
+        const total = toAmount(proj.budget);
+        projectBudgetMap.set(proj.id, {
+          total_budget: total,
+          spent_budget: spent,
+          remaining_budget: total > 0 ? Math.max(0, total - spent) : null
+        });
+      }
+
+      // For projects without a budget field, still store spent
+      for (const [pid, spent] of spentByProject.entries()) {
+        if (!projectBudgetMap.has(pid)) {
+          projectBudgetMap.set(pid, { total_budget: null, spent_budget: spent, remaining_budget: null });
+        }
+      }
+    }
+
     const profileMap = new Map((profilesRes.data || []).map((row) => [row.id, row]));
     const projectMap = new Map((projectsRes.data || []).map((row) => [row.id, row]));
     const productMap = new Map((productsRes.data || []).map((row) => [row.id, row]));
@@ -2452,6 +2514,8 @@ const getEligiblePayouts = async (req, res, next) => {
       const mappedProductAmount = product ? toAmount(product.product_value) : 0;
       const productAmount = appProductAmount || mappedProductAmount || toAmount(breakdown.productAmount);
       const computedTotal = rewardAmount + productAmount;
+      const clientProfile = project.created_by ? (clientProfileMap.get(project.created_by) || null) : null;
+      const budgetInfo = projectBudgetMap.get(row.project_id) || null;
       return {
         ...row,
         profiles: profileMap.get(row.participant_id) || null,
@@ -2459,15 +2523,49 @@ const getEligiblePayouts = async (req, res, next) => {
         product_name: product?.name || app?.project_products?.name || null,
         reward_amount: rewardAmount,
         product_amount: productAmount,
+        allocated_budget: toAmount(app?.allocated_budget),
         total_amount: computedTotal > 0
           ? Number(computedTotal)
-          : Number(row.amount || breakdown.totalAmount || 0)
+          : Number(row.amount || breakdown.totalAmount || 0),
+        client: clientProfile
+          ? {
+              id: project.created_by,
+              full_name: clientProfile.full_name || clientProfile.email || null,
+              email: clientProfile.email || null
+            }
+          : null,
+        project_budget: budgetInfo
       };
     });
 
+    // Apply client filter if provided (post-filter since we need project data)
+    const filteredRows = filterClientId
+      ? rows.filter((row) => row.client?.id === filterClientId)
+      : rows;
+
+    // Build filter options for the frontend
+    const uniqueProjects = [...projectMap.values()].map((p) => ({
+      id: p.id,
+      title: p.title || p.name || p.id,
+      client_id: p.created_by || null,
+      client_name: p.created_by ? (clientProfileMap.get(p.created_by)?.full_name || clientProfileMap.get(p.created_by)?.email || null) : null
+    }));
+    const uniqueClients = [...clientProfileMap.entries()].map(([id, profile]) => ({
+      id,
+      full_name: profile.full_name || profile.email || id,
+      email: profile.email || null
+    }));
+
     res.json({
       success: true,
-      data: rows
+      data: filteredRows,
+      meta: {
+        total: filteredRows.length,
+        filter_options: {
+          projects: uniqueProjects,
+          clients: uniqueClients
+        }
+      }
     });
   } catch (err) {
     next(err);
@@ -2505,16 +2603,80 @@ const getPayoutBatches = async (req, res, next) => {
     if (batchIds.length) {
       payoutsRes = await supabase
         .from('payouts')
-        .select('id, payout_batch_id, participant_id')
+        .select('id, payout_batch_id, participant_id, project_id, product_id, amount, status')
         .in('payout_batch_id', batchIds);
+
+      // fallback if product_id or project_id column missing
+      if (payoutsRes.error && /product_id|project_id/i.test(String(payoutsRes.error.message || ''))) {
+        payoutsRes = await supabase
+          .from('payouts')
+          .select('id, payout_batch_id, participant_id, amount, status')
+          .in('payout_batch_id', batchIds);
+      }
       if (payoutsRes.error) throw payoutsRes.error;
     }
 
     const payoutRows = payoutsRes.data || [];
     const participantIds = [...new Set(payoutRows.map((row) => row.participant_id).filter(Boolean))];
 
+    // Direct product_id from payouts (may be null for older rows)
+    const directProductIds = [...new Set(payoutRows.map((row) => row.product_id).filter(Boolean))];
+
     let profilesRes = { data: [], error: null };
     let detailsRes = { data: [], error: null };
+    let productsRes = { data: [], error: null };
+    let applicationsRes = { data: [], error: null };
+
+    // Fetch products directly linked on payout rows
+    if (directProductIds.length) {
+      productsRes = await supabase
+        .from('project_products')
+        .select('id, name, product_value')
+        .in('id', directProductIds);
+      if (productsRes.error && !isMissingSchemaObjectError(productsRes.error)) throw productsRes.error;
+    }
+
+    // Always fetch applications for ALL participants in this batch — covers both old rows
+    // (no product_id on payout) and new rows (product_id set but we want product name anyway)
+    if (participantIds.length) {
+      let appRes = await supabase
+        .from('project_applications')
+        .select(`
+          participant_id,
+          project_id,
+          allocated_budget,
+          product_id,
+          project_products ( id, name, product_value )
+        `)
+        .in('participant_id', participantIds)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+      if (appRes.error && !isMissingSchemaObjectError(appRes.error)) {
+        // fallback without join if schema issue
+        appRes = await supabase
+          .from('project_applications')
+          .select('participant_id, project_id, allocated_budget, product_id')
+          .in('participant_id', participantIds)
+          .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+      }
+      if (appRes.error && !isMissingSchemaObjectError(appRes.error)) throw appRes.error;
+      applicationsRes = appRes;
+
+      // Also fetch product names for product_ids found in applications
+      const appProductIds = [...new Set((applicationsRes.data || []).map((r) => r.product_id).filter(Boolean))];
+      const missingProductIds = appProductIds.filter((id) => !directProductIds.includes(id));
+      if (missingProductIds.length) {
+        const moreProductsRes = await supabase
+          .from('project_products')
+          .select('id, name, product_value')
+          .in('id', missingProductIds);
+        if (!moreProductsRes.error) {
+          productsRes = {
+            data: [...(productsRes.data || []), ...(moreProductsRes.data || [])],
+            error: null
+          };
+        }
+      }
+    }
     if (participantIds.length) {
       profilesRes = await supabase
         .from('profiles')
@@ -2558,6 +2720,20 @@ const getPayoutBatches = async (req, res, next) => {
 
     const profileMap = new Map((profilesRes.data || []).map((row) => [row.id, row]));
     const detailMap = new Map((detailsRes.data || []).map((row) => [row.participant_id, row]));
+    const productMap = new Map((productsRes.data || []).map((row) => [row.id, row]));
+
+    // Build application map: participant_id -> list of apps (each has product info)
+    const appsByParticipant = new Map();
+    for (const app of (applicationsRes.data || [])) {
+      const pid = app.participant_id;
+      if (!pid) continue;
+      if (!appsByParticipant.has(pid)) appsByParticipant.set(pid, []);
+      appsByParticipant.get(pid).push(app);
+    }
+
+    // Track which app index we've used per participant (to pair each payout row with next app)
+    const appIndexByParticipant = new Map();
+
     const participantsByBatchId = new Map();
 
     for (const payout of payoutRows) {
@@ -2566,18 +2742,59 @@ const getPayoutBatches = async (req, res, next) => {
       if (!batchId || !participantId) continue;
 
       if (!participantsByBatchId.has(batchId)) {
-        participantsByBatchId.set(batchId, new Map());
+        participantsByBatchId.set(batchId, []);
       }
-
-      const bucket = participantsByBatchId.get(batchId);
-      if (bucket.has(participantId)) continue;
 
       const profile = profileMap.get(participantId) || {};
       const details = detailMap.get(participantId) || {};
-      bucket.set(participantId, {
+
+      // Resolve product name and amount
+      let productName = null;
+      let productAmount = null;
+
+      // Strategy 1: product_id directly on payout row
+      if (payout.product_id && productMap.has(payout.product_id)) {
+        const prod = productMap.get(payout.product_id);
+        productName = prod.name || null;
+        productAmount = toAmount(prod.product_value);
+      }
+
+      // Strategy 2: match via project_id on payout → application
+      if (!productName && payout.project_id) {
+        const apps = appsByParticipant.get(participantId) || [];
+        const matchedApp = apps.find((a) => a.project_id === payout.project_id);
+        if (matchedApp) {
+          productName = matchedApp?.project_products?.name
+            || (matchedApp.product_id && productMap.get(matchedApp.product_id)?.name)
+            || null;
+          productAmount = toAmount(matchedApp?.allocated_budget || matchedApp?.project_products?.product_value
+            || (matchedApp.product_id && productMap.get(matchedApp.product_id)?.product_value));
+        }
+      }
+
+      // Strategy 3: sequential — take next unused application for this participant
+      if (!productName) {
+        const apps = appsByParticipant.get(participantId) || [];
+        const idx = appIndexByParticipant.get(participantId) || 0;
+        const app = apps[idx];
+        if (app) {
+          productName = app?.project_products?.name
+            || (app.product_id && productMap.get(app.product_id)?.name)
+            || null;
+          productAmount = toAmount(app?.allocated_budget || app?.project_products?.product_value
+            || (app.product_id && productMap.get(app.product_id)?.product_value));
+          appIndexByParticipant.set(participantId, idx + 1);
+        }
+      }
+
+      participantsByBatchId.get(batchId).push({
         id: participantId,
+        payout_id: payout.id,
+        payout_status: normalizeStatus(payout.status),
         full_name: profile.full_name || null,
         email: profile.email || null,
+        product_name: productName,
+        product_amount: productAmount,
         bank_account_name: details.bank_account_name || null,
         bank_account_number: details.bank_account_number || null,
         bank_ifsc: details.bank_ifsc || null,
@@ -2592,8 +2809,7 @@ const getPayoutBatches = async (req, res, next) => {
     }
 
     const enrichedRows = batchRows.map((batch) => {
-      const participantMap = participantsByBatchId.get(batch.id) || new Map();
-      const participants = Array.from(participantMap.values());
+      const participants = participantsByBatchId.get(batch.id) || [];
       return {
         ...batch,
         participant_count: participants.length,
@@ -3175,19 +3391,30 @@ const exportPayoutReportCSV = async (req, res, next) => {
 /**
  * Export payout batch CSV
  */
-const fetchPayoutExportRows = async ({ batchIds = [] } = {}) => {
-  if (!Array.isArray(batchIds) || !batchIds.length) return [];
+const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => {
+  if ((!batchIds.length) && (!payoutIds.length)) return [];
 
   let payoutsRes = await supabase
     .from('payouts')
-    .select('id, amount, status, payout_batch_id, participant_id, project_id')
-    .in('payout_batch_id', batchIds);
+    .select('id, amount, status, payout_batch_id, participant_id, project_id');
 
-  if (payoutsRes.error && isMissingSchemaObjectError(payoutsRes.error)) {
+  if (payoutIds.length) {
     payoutsRes = await supabase
       .from('payouts')
-      .select('id, amount, status, payout_batch_id')
+      .select('id, amount, status, payout_batch_id, participant_id, project_id')
+      .in('id', payoutIds);
+  } else {
+    payoutsRes = await supabase
+      .from('payouts')
+      .select('id, amount, status, payout_batch_id, participant_id, project_id')
       .in('payout_batch_id', batchIds);
+  }
+
+  if (payoutsRes.error && isMissingSchemaObjectError(payoutsRes.error)) {
+    const fallbackQuery = payoutIds.length
+      ? supabase.from('payouts').select('id, amount, status, payout_batch_id').in('id', payoutIds)
+      : supabase.from('payouts').select('id, amount, status, payout_batch_id').in('payout_batch_id', batchIds);
+    payoutsRes = await fallbackQuery;
   }
   if (payoutsRes.error) throw payoutsRes.error;
   const payouts = payoutsRes.data || [];
@@ -3290,6 +3517,74 @@ const buildPayoutExportCsvRows = (payouts = []) => {
   });
 };
 
+/* ── Export a single payout row (per participant) as CSV ── */
+const exportPayoutCSV = async (req, res, next) => {
+  try {
+    const { payoutId } = req.params;
+
+    const payouts = await fetchPayoutExportRows({ payoutIds: [payoutId] });
+    if (!payouts.length) {
+      return res.status(404).json({ success: false, message: 'Payout not found' });
+    }
+
+    const csvData = buildPayoutExportCsvRows(payouts);
+    const fields = [
+      'payout_batch_id', 'payout_id', 'participant_name', 'participant_email',
+      'account_holder_name', 'bank_account_number', 'bank_ifsc', 'bank_name',
+      'participant_address', 'project_title', 'amount', 'status'
+    ];
+    const parser = new Parser({ fields });
+    const csv = parser.parse(csvData);
+
+    res.header('Content-Type', 'text/csv');
+    res.attachment(`payout_${payoutId}.csv`);
+    res.send(csv);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/* ── Mark a single payout row as PAID (per participant) ── */
+const markPayoutPaid = async (req, res, next) => {
+  try {
+    const { payoutId } = req.params;
+
+    const { data: payout, error: lookupErr } = await supabase
+      .from('payouts')
+      .select('id, status, participant_id, project_id')
+      .eq('id', payoutId)
+      .maybeSingle();
+
+    if (lookupErr) throw lookupErr;
+    if (!payout) {
+      return res.status(404).json({ success: false, message: 'Payout not found' });
+    }
+    if (normalizeStatus(payout.status) === 'PAID') {
+      return res.status(400).json({ success: false, message: 'Payout is already marked as paid' });
+    }
+
+    const { error: updateErr } = await supabase
+      .from('payouts')
+      .update({ status: 'PAID' })
+      .eq('id', payoutId);
+    if (updateErr) throw updateErr;
+
+    // If participant has a project_application, mark it COMPLETED
+    if (payout.participant_id && payout.project_id) {
+      await supabase
+        .from('project_applications')
+        .update({ status: 'COMPLETED' })
+        .eq('participant_id', payout.participant_id)
+        .eq('project_id', payout.project_id)
+        .in('status', ['APPROVED', 'PURCHASED']);
+    }
+
+    res.json({ success: true, message: 'Payout marked as paid successfully' });
+  } catch (err) {
+    next(err);
+  }
+};
+
 const exportPayoutBatchCSV = async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -3350,6 +3645,8 @@ const exportPayoutBatchesCSV = async (req, res, next) => {
 
     if (batchIdsQuery.length) {
       batchQuery = batchQuery.in('id', batchIdsQuery);
+    } else if (statusFilter === 'ACTIVE') {
+      batchQuery = batchQuery.neq('status', 'PAID');
     } else if (statusFilter === 'IN_BATCH') {
       batchQuery = batchQuery.in('status', ['IN_BATCH', 'PENDING']);
     } else if (statusFilter !== 'ALL') {
@@ -3361,17 +3658,17 @@ const exportPayoutBatchesCSV = async (req, res, next) => {
 
     const selectedBatchIds = (batches || []).map((row) => row.id).filter(Boolean);
     if (!selectedBatchIds.length) {
-      return res.status(404).json({
+      return res.status(400).json({
         success: false,
-        message: 'No payout batches found for the selected filter'
+        message: 'No payout batches found for the selected filter. Please create a batch first.'
       });
     }
 
     const payouts = await fetchPayoutExportRows({ batchIds: selectedBatchIds });
     if (!payouts.length) {
-      return res.status(404).json({
+      return res.status(400).json({
         success: false,
-        message: 'No payouts found for the selected batches'
+        message: 'No payouts found in the selected batches.'
       });
     }
 
@@ -3674,6 +3971,8 @@ module.exports = {
   markPayoutBatchPaid,
   exportPayoutBatchesCSV,
   exportPayoutBatchCSV,
+  exportPayoutCSV,
+  markPayoutPaid,
   getAdminSupportTickets,
   getAdminSupportTicketById,
   updateSupportTicketStatus,
@@ -3681,5 +3980,3 @@ module.exports = {
   getPayoutAnalytics,
   getSupportAnalytics
 };
-
-
