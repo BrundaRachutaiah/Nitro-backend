@@ -15,6 +15,18 @@ const isMissingSchemaObjectError = (error) => {
   );
 };
 
+// Detects PostgreSQL unique constraint violations (error code 23505)
+const isUniqueConstraintError = (error) => {
+  const code = String(error?.code || '');
+  const msg  = String(error?.message || '').toLowerCase();
+  return (
+    code === '23505'
+    || msg.includes('duplicate key')
+    || msg.includes('unique constraint')
+    || msg.includes('violates unique')
+  );
+};
+
 const markAllocationCompleted = async ({ allocationId, participantId }) => {
   const completionRes = await supabase
     .from('unit_allocations')
@@ -370,14 +382,18 @@ const submitFeedback = async (req, res, next) => {
       });
     }
 
-    let reviewProofRes = await supabase
+    // Scope review-proof check to the specific product to avoid a review for
+    // Product B blocking feedback for Product A.
+    let reviewProofQuery = supabase
       .from('participant_reviews')
       .select('id, status')
       .eq('allocation_id', allocationId)
       .eq('participant_id', participantId)
-      .eq('product_id', productId || null)
-      .neq('status', 'REJECTED')
-      .maybeSingle();
+      .neq('status', 'REJECTED');
+
+    let reviewProofRes = await (productId
+      ? reviewProofQuery.eq('product_id', productId).maybeSingle()
+      : reviewProofQuery.is('product_id', null).maybeSingle());
 
     if (reviewProofRes.error && isMissingSchemaObjectError(reviewProofRes.error)) {
       reviewProofRes = await supabase
@@ -408,13 +424,10 @@ const submitFeedback = async (req, res, next) => {
       });
     }
 
-    let existingRes = await supabase
-      .from('internal_feedbacks')
-      .select('id')
-      .eq('allocation_id', allocationId)
-      .eq('participant_id', participantId)
-      .eq('product_id', productId || null)
-      .maybeSingle();
+    // Scope feedback duplicate check to the specific product
+    let existingRes = await (productId
+      ? supabase.from('internal_feedbacks').select('id').eq('allocation_id', allocationId).eq('participant_id', participantId).eq('product_id', productId).maybeSingle()
+      : supabase.from('internal_feedbacks').select('id').eq('allocation_id', allocationId).eq('participant_id', participantId).is('product_id', null).maybeSingle());
 
     if (existingRes.error && isMissingSchemaObjectError(existingRes.error)) {
       existingRes = await supabase
@@ -544,13 +557,24 @@ const submitReview = async (req, res, next) => {
       });
     }
 
-    let existingRes = await supabase
+    // Build the duplicate-check query.
+    // IMPORTANT: When productId is provided we must filter by that specific product.
+    // Using .eq('product_id', null) would match ALL rows whose product_id IS NULL,
+    // which incorrectly blocks reviews for other products in the same allocation.
+    let existingBaseQuery = supabase
       .from('participant_reviews')
       .select('id, status')
       .eq('allocation_id', allocationId)
-      .eq('participant_id', participantId)
-      .eq('product_id', productId || null)
-      .maybeSingle();
+      .eq('participant_id', participantId);
+
+    let existingRes;
+    if (productId) {
+      // Filter to this specific product only
+      existingRes = await existingBaseQuery.eq('product_id', productId).maybeSingle();
+    } else {
+      // No productId — use IS NULL so we only match allocation-level reviews
+      existingRes = await existingBaseQuery.is('product_id', null).maybeSingle();
+    }
 
     if (existingRes.error && isMissingSchemaObjectError(existingRes.error)) {
       if (productId) {
@@ -575,7 +599,7 @@ const submitReview = async (req, res, next) => {
     if (existing && existingStatus !== 'REJECTED') {
       return res.status(400).json({
         success: false,
-        message: 'Review already submitted for this allocation'
+        message: 'Review already submitted for this product'
       });
     }
 
@@ -606,10 +630,9 @@ const submitReview = async (req, res, next) => {
         .select()
         .maybeSingle();
 
+      // ── Handle schema fallback (product_id column missing) ──────────────────
       if (writeRes.error && isMissingSchemaObjectError(writeRes.error)) {
-        // Schema doesn't have product_id column — insert without it, then fetch the row back
-        // using a timestamp window to avoid the "multiple rows" error from .single()
-        const insertedAt = new Date().toISOString();
+        // Schema doesn't have product_id column — try insert without it.
         const fallbackInsert = await supabase
           .from('participant_reviews')
           .insert({
@@ -621,10 +644,28 @@ const submitReview = async (req, res, next) => {
             status: 'PENDING'
           });
 
-        if (fallbackInsert.error && !isMissingSchemaObjectError(fallbackInsert.error)) {
-          writeRes = { data: null, error: fallbackInsert.error };
+        if (fallbackInsert.error) {
+          // If the old schema has a unique constraint on (allocation_id, participant_id)
+          // and this participant already has a row (e.g. for their first product),
+          // UPDATE that row rather than INSERT a new one.
+          if (isUniqueConstraintError(fallbackInsert.error)) {
+            const upsertRes = await supabase
+              .from('participant_reviews')
+              .update({
+                review_text: String(reviewText || '').trim(),
+                review_url: String(reviewUrl || '').trim(),
+                status: 'PENDING'
+              })
+              .eq('allocation_id', allocationId)
+              .eq('participant_id', participantId)
+              .select()
+              .maybeSingle();
+            writeRes = upsertRes;
+          } else if (!isMissingSchemaObjectError(fallbackInsert.error)) {
+            writeRes = { data: null, error: fallbackInsert.error };
+          }
         } else {
-          // Fetch back any pending review row for this allocation
+          // Insert succeeded — fetch back the row
           const fetchBack = await supabase
             .from('participant_reviews')
             .select()
@@ -634,6 +675,30 @@ const submitReview = async (req, res, next) => {
             .limit(1)
             .maybeSingle();
           writeRes = fetchBack;
+        }
+      }
+
+      // ── Handle unique constraint on (allocation_id, participant_id, product_id) ──
+      // This happens when the DB constraint doesn't yet include product_id as a
+      // separate column, causing a duplicate key error for the second product.
+      if (writeRes.error && isUniqueConstraintError(writeRes.error)) {
+        // The row already exists — this is effectively "already submitted".
+        // Fetch the existing row and return it as success so the UI advances.
+        const fetchExisting = await supabase
+          .from('participant_reviews')
+          .select()
+          .eq('allocation_id', allocationId)
+          .eq('participant_id', participantId)
+          .limit(1)
+          .maybeSingle();
+        if (!fetchExisting.error && fetchExisting.data) {
+          writeRes = { data: fetchExisting.data, error: null };
+        } else {
+          // Cannot recover — surface a friendly message instead of raw DB error
+          return res.status(400).json({
+            success: false,
+            message: 'Review already submitted for this product'
+          });
         }
       }
     }

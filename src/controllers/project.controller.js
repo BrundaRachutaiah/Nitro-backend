@@ -495,7 +495,7 @@ const getAppliedProjects = async (req, res, next) => {
       `
       )
       .eq('participant_id', participantId)
-      .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED, APPLICATION_STATUS.PURCHASED])
+      .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED, APPLICATION_STATUS.PURCHASED, APPLICATION_STATUS.REJECTED])
       .order('created_at', { ascending: false });
 
     if (error) throw error;

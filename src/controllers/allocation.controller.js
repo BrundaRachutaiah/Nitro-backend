@@ -492,13 +492,19 @@ const getMyAllocationTracking = async (req, res, next) => {
         application_status: String(item?.status || '').toUpperCase(),
         purchase_proof: proofsByAllocationProduct.get(
           buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || null,
+        ) || proofsByAllocationProduct.get(
+          buildAllocationProductKey(allocation.id, null)
+        ) || proofsByAllocation.get(allocation.id) || null,
         review_submission: reviewsByAllocationProduct.get(
           buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || null,
+        ) || reviewsByAllocationProduct.get(
+          buildAllocationProductKey(allocation.id, null)
+        ) || reviewsByAllocation.get(allocation.id) || null,
         feedback_submission: feedbacksByAllocationProduct.get(
           buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || null
+        ) || feedbacksByAllocationProduct.get(
+          buildAllocationProductKey(allocation.id, null)
+        ) || feedbacksByAllocation.get(allocation.id) || null
       }));
 
       // Compatibility fallback: if DB stores proof/review at allocation-level (no product_id),
