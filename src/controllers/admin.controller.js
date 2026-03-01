@@ -777,7 +777,7 @@ const getParticipantById = async (req, res, next) => {
     }
 
     const completedProducts = applications
-      .filter((app) => String(app.status || '').toUpperCase() === 'APPROVED')
+      .filter((app) => ['APPROVED', 'PURCHASED', 'COMPLETED'].includes(String(app.status || '').toUpperCase()))
       .map((app) => {
         const allocation = allocationsByProject.get(app.project_id) || null;
         const proof = allocation ? proofsByAllocation.get(allocation.id) || null : null;
@@ -892,6 +892,11 @@ const getAdminDashboardSummary = async (req, res, next) => {
     payoutsQuery = applyDateFilter(payoutsQuery, range);
     const payoutsPending = await payoutsQuery;
 
+    const { count: payoutsEligible } = await supabase
+      .from('payouts')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'ELIGIBLE');
+
     res.json({
       success: true,
       data: {
@@ -899,7 +904,8 @@ const getAdminDashboardSummary = async (req, res, next) => {
         participants_approved: participantsApproved.count || 0,
         projects_active: projectsActive.count || 0,
         purchase_proofs_pending: purchaseProofsPending.count || 0,
-        payouts_pending: payoutsPending.count || 0
+        payouts_pending: payoutsPending.count || 0,
+        payouts_eligible: payoutsEligible || 0
       }
     });
   } catch (err) {
@@ -955,6 +961,11 @@ const getDashboardSummary = async (req, res, next) => {
     payoutsQuery = applyDateFilter(payoutsQuery, range);
     const payoutsPending = await payoutsQuery;
 
+    const { count: payoutsEligible } = await supabase
+      .from('payouts')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'ELIGIBLE');
+
     res.json({
       success: true,
       data: {
@@ -962,7 +973,8 @@ const getDashboardSummary = async (req, res, next) => {
         participants_approved: participantsApproved.count || 0,
         projects_active: projectsActive.count || 0,
         purchase_proofs_pending: purchaseProofsPending.count || 0,
-        payouts_pending: payoutsPending.count || 0
+        payouts_pending: payoutsPending.count || 0,
+        payouts_eligible: payoutsEligible || 0
       }
     });
   } catch (err) {
@@ -2131,7 +2143,9 @@ const approvePurchaseProof = async (req, res, next) => {
     let payoutCreated = false;
     if (allocation) {
       const projectMode = String(allocation?.projects?.mode || '').toUpperCase();
-      if (projectMode === 'D2C') {
+      // FIX: For both D2C and MARKETPLACE, create payout on proof approval
+      // (MARKETPLACE proof approval signals purchase happened — review approval creates final payout via ensureEligiblePayout)
+      if (projectMode === 'D2C' || projectMode === 'MARKETPLACE') {
         const { data: existingPayout, error: payoutLookupError } = await supabase
           .from('payouts')
           .select('id')
@@ -2357,14 +2371,16 @@ const getEligiblePayouts = async (req, res, next) => {
 
     let payoutsQuery = supabase
       .from('payouts')
-      .select('id, participant_id, project_id, product_id, amount, status, created_at, payout_batch_id')
-      .order('created_at', { ascending: true });
+      .select('id, participant_id, project_id, product_id, amount, status, created_at, payout_batch_id');
 
     if (filterProjectId) {
       payoutsQuery = payoutsQuery.eq('project_id', filterProjectId);
     }
+    
+    // Always filter for ELIGIBLE in the query for performance
+    payoutsQuery = payoutsQuery.eq('status', 'ELIGIBLE');
 
-    let payoutsRes = await payoutsQuery;
+    let payoutsRes = await payoutsQuery.order('created_at', { ascending: true });
 
     let hasProductColumn = true;
     if (payoutsRes.error && /product_id/i.test(String(payoutsRes.error.message || ''))) {
@@ -2372,6 +2388,7 @@ const getEligiblePayouts = async (req, res, next) => {
       payoutsRes = await supabase
         .from('payouts')
         .select('id, participant_id, project_id, amount, status, created_at, payout_batch_id')
+        .eq('status', 'ELIGIBLE')
         .order('created_at', { ascending: true });
     }
 
@@ -2379,8 +2396,10 @@ const getEligiblePayouts = async (req, res, next) => {
       payoutsRes = await supabase
         .from('payouts')
         .select(hasProductColumn ? 'id, participant_id, project_id, product_id, amount, status, payout_batch_id' : 'id, participant_id, project_id, amount, status, payout_batch_id')
+        .eq('status', 'ELIGIBLE');
     }
     if (payoutsRes.error) throw payoutsRes.error;
+    console.log('payoutsRes.data', payoutsRes.data);
 
     const data = (payoutsRes.data || []).filter(
       (row) => normalizeStatus(row?.status) === 'ELIGIBLE'
@@ -2623,7 +2642,17 @@ const getPayoutBatches = async (req, res, next) => {
     let profilesRes = { data: [], error: null };
     let detailsRes  = { data: [], error: null };
     let productsRes = { data: [], error: null };
+    let projectsRes = { data: [], error: null };
     let applicationsRes = { data: [], error: null };
+
+    // Fetch projects to get reward amounts for matching
+    if (projectIds.length) {
+      projectsRes = await supabase
+        .from('projects')
+        .select('id, title, reward')
+        .in('id', projectIds);
+      if (projectsRes.error) throw projectsRes.error;
+    }
 
     // Fetch products for direct product_ids on payouts
     if (productIds.length) {
@@ -2728,16 +2757,12 @@ const getPayoutBatches = async (req, res, next) => {
       if (detailsRes.error && !isMissingSchemaObjectError(detailsRes.error)) throw detailsRes.error;
     }
 
+    const projectMapLookup = new Map((projectsRes.data || []).map((row) => [row.id, row]));
     const profileMap = new Map((profilesRes.data || []).map((row) => [row.id, row]));
     const detailMap = new Map((detailsRes.data || []).map((row) => [row.participant_id, row]));
     const productMap = new Map((productsRes.data || []).map((row) => [row.id, row]));
 
-    // Build lookup maps for product resolution.
-    // KEY INSIGHT from debug: payout rows have NO project_id / product_id (old schema).
-    // So we match by: participant_id + amount matches app's allocated_budget.
-    // Each app is consumed once so multiple products per participant work correctly.
-
-    // Map: participantId → sorted list of apps (sorted by allocated_budget desc to match largest first)
+    // Map: participantId → sorted list of apps
     const appsByParticipant = new Map();
     for (const app of (applicationsRes.data || [])) {
       const pid = app.participant_id;
@@ -2746,9 +2771,8 @@ const getPayoutBatches = async (req, res, next) => {
       appsByParticipant.get(pid).push(app);
     }
 
-    // Track consumed apps by reference so each app is only used once
+    // Track consumed apps by reference
     const usedApps = new Set();
-
     const participantsByBatchId = new Map();
 
     for (const payout of payoutRows) {
@@ -2762,11 +2786,16 @@ const getPayoutBatches = async (req, res, next) => {
 
       const profile = profileMap.get(participantId) || {};
       const details = detailMap.get(participantId) || {};
+      const project = projectMapLookup.get(payout.project_id) || {};
+      const rewardAmount = toAmount(project.reward);
       const participantApps = appsByParticipant.get(participantId) || [];
 
       let productName = null;
       let productAmount = null;
       let resolvedApp = null;
+
+      // Derived product amount (Total - Reward)
+      const expectedProductAmount = Math.max(0, toAmount(payout.amount) - rewardAmount);
 
       // Strategy 1: payout has product_id → direct exact match
       if (payout.product_id) {
@@ -2784,13 +2813,13 @@ const getPayoutBatches = async (req, res, next) => {
         }
       }
 
-      // Strategy 2: payout has project_id → match unused app for same project+amount
+      // Strategy 2: payout has project_id → match unused app for same project+product_amount
       if (!productName && payout.project_id) {
-        // Try to match by project_id AND amount first
+        // Try to match by project_id AND product_amount first
         let matchedApp = participantApps.find(
           (a) => !usedApps.has(a) &&
                  a.project_id === payout.project_id &&
-                 toAmount(a.allocated_budget) === toAmount(payout.amount)
+                 toAmount(a.allocated_budget) === expectedProductAmount
         );
         // Fallback: just match by project_id
         if (!matchedApp) {
@@ -2806,10 +2835,10 @@ const getPayoutBatches = async (req, res, next) => {
         }
       }
 
-      // Strategy 3: match by amount — find unused app whose allocated_budget equals payout.amount
-      if (!productName && payout.amount) {
+      // Strategy 3: match by product_amount — find unused app whose allocated_budget equals expectedProductAmount
+      if (!productName && expectedProductAmount > 0) {
         const amountMatch = participantApps.find(
-          (a) => !usedApps.has(a) && toAmount(a.allocated_budget) === toAmount(payout.amount)
+          (a) => !usedApps.has(a) && toAmount(a.allocated_budget) === expectedProductAmount
         );
         if (amountMatch) {
           const prod = amountMatch.product_id ? productMap.get(amountMatch.product_id) : null;
@@ -2819,7 +2848,7 @@ const getPayoutBatches = async (req, res, next) => {
         }
       }
 
-      // Strategy 4: sequential fallback — take next unused app for this participant
+      // Strategy 4: fallback to next unused app for this participant
       if (!productName) {
         const unusedApp = participantApps.find((a) => !usedApps.has(a));
         if (unusedApp) {
@@ -2830,9 +2859,14 @@ const getPayoutBatches = async (req, res, next) => {
         }
       }
 
-      // Mark this app as consumed — it will not be matched to any other payout row
-      if (resolvedApp) usedApps.add(resolvedApp);
+      // Final fallback if still no product name but we have a product amount
+      if (!productName && expectedProductAmount > 0) {
+        productAmount = expectedProductAmount;
+        productName = "Product";
+      }
 
+      // Mark this app as consumed
+      if (resolvedApp) usedApps.add(resolvedApp);
 
       participantsByBatchId.get(batchId).push({
         id: participantId,
@@ -2841,7 +2875,9 @@ const getPayoutBatches = async (req, res, next) => {
         full_name: profile.full_name || null,
         email: profile.email || null,
         product_name: productName,
-        product_amount: productAmount,
+        product_amount: productAmount || expectedProductAmount,
+        reward_amount: rewardAmount,
+        total_amount: toAmount(payout.amount),
         bank_account_name: details.bank_account_name || null,
         bank_account_number: details.bank_account_number || null,
         bank_ifsc: details.bank_ifsc || null,
@@ -3072,6 +3108,9 @@ const backfillEligiblePayouts = async () => {
   const allFeedbacks = feedbackRes.data || [];
 
   // ── 7. Resolve allocation_id → project_id for reviews & proofs ────────────
+  // CRITICAL FIX: fetch ALL allocations for these participants (not just by IDs from proofs)
+  // This catches cases where proofs have allocation_ids that don't appear in a narrow lookup
+  // because the allocation was completed, soft-deleted, or the IDs mismatched.
   const allAllocIds = [...new Set([
     ...(allReviews || []).map(r => r.allocation_id),
     ...allProofs.map(p => p.allocation_id),
@@ -3079,10 +3118,23 @@ const backfillEligiblePayouts = async () => {
   ].filter(Boolean))];
 
   let allocMap = new Map();
+  // Fetch by IDs from proofs/reviews
   if (allAllocIds.length) {
     const { data: allocs } = await supabase
-      .from('unit_allocations').select('id, project_id').in('id', allAllocIds);
-    allocMap = new Map((allocs || []).map(a => [a.id, a.project_id]));
+      .from('unit_allocations').select('id, project_id, participant_id').in('id', allAllocIds);
+    for (const a of (allocs || [])) allocMap.set(a.id, a.project_id);
+  }
+  // ALSO fetch ALL allocations for these participants directly — catches completed allocations
+  // whose IDs may not appear in narrow allAllocIds set
+  if (participantIds.length) {
+    const { data: participantAllocs } = await supabase
+      .from('unit_allocations')
+      .select('id, project_id, participant_id')
+      .in('participant_id', participantIds)
+      .in('project_id', projectIds);
+    for (const a of (participantAllocs || [])) {
+      if (!allocMap.has(a.id)) allocMap.set(a.id, a.project_id);
+    }
   }
 
   // Build eligibility lookup: participantId::projectId → { hasReview, hasProof, proofId }
@@ -3110,52 +3162,64 @@ const backfillEligiblePayouts = async () => {
     if (pid) getOrCreate(fb.participant_id, pid).hasReview = true; // feedbacks count as review signal
   }
 
+  // CRITICAL FIX: For any participant who has an approved proof but allocMap
+  // didn't resolve their allocation_id to a project_id, do a direct fallback lookup.
+  // This handles D2C participants whose proof allocation_id was not in allocMap.
+  const proofParticipantsWithNoProject = allProofs.filter(p => !allocMap.get(p.allocation_id));
+  if (proofParticipantsWithNoProject.length) {
+    // For each such proof, find any approved application for this participant
+    // and mark them eligible — the proof existence is sufficient for D2C
+    for (const proof of proofParticipantsWithNoProject) {
+      const participantApps = applications.filter(a => a.participant_id === proof.participant_id);
+      for (const app of participantApps) {
+        const project = projectMap.get(app.project_id);
+        const mode = String(project?.mode || '').toUpperCase();
+        if (mode !== 'MARKETPLACE') {
+          // D2C: approved proof = eligible regardless of allocation resolution
+          const entry = getOrCreate(proof.participant_id, app.project_id);
+          entry.hasProof = true;
+          if (!entry.proofId) entry.proofId = proof.id;
+        }
+      }
+    }
+  }
+
   // ── 8. Fetch existing payouts to skip already-covered products ────────────
   let existingPayoutsRes = await supabase
     .from('payouts')
     .select('id, participant_id, project_id, product_id, status')
     .in('participant_id', participantIds)
     .in('project_id', projectIds);
-  if (existingPayoutsRes.error && /product_id/i.test(String(existingPayoutsRes.error?.message || ''))) {
+
+  if (existingPayoutsRes.error && /product_id/i.test(String(existingPayoutsRes.error.message || ''))) {
     existingPayoutsRes = await supabase
       .from('payouts')
       .select('id, participant_id, project_id, status')
       .in('participant_id', participantIds)
       .in('project_id', projectIds);
   }
+
+  if (existingPayoutsRes.error) throw existingPayoutsRes.error;
+
+  const existingPayouts = existingPayoutsRes.data || [];
+
   // Build covered set: participantId::projectId::productId
   const coveredSet = new Set();
-  for (const p of (existingPayoutsRes.data || [])) {
-    if (['ELIGIBLE','IN_BATCH','EXPORTED','PAID'].includes(String(p.status||'').toUpperCase())) {
-      coveredSet.add(`${p.participant_id}::${p.project_id}::${p.product_id||'__none__'}`);
+  for (const p of existingPayouts) {
+    if (['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID'].includes(String(p.status || '').toUpperCase())) {
+      coveredSet.add(`${p.participant_id}::${p.project_id}::${p.product_id || '__none__'}`);
     }
   }
 
   // ── 9. For each application, create ELIGIBLE payout if needed ─────────────
-  const insertPayout = async (payload) => {
-    const candidates = [
-      { ...payload },
-      { ...payload, user_id: undefined },
-      { ...payload, purchase_proof_id: undefined },
-      { ...payload, user_id: undefined, purchase_proof_id: undefined },
-      { ...payload, product_id: undefined, user_id: undefined, purchase_proof_id: undefined },
-    ];
-    for (const candidate of candidates) {
-      const clean = Object.fromEntries(Object.entries(candidate).filter(([, v]) => v !== undefined));
-      const { error } = await supabase.from('payouts').insert(clean);
-      if (!error) return true;
-      if (!isMissingSchemaObjectError(error)) throw error;
-    }
-    return false;
-  };
-
+  const newPayouts = [];
   for (const app of applications) {
     const { participant_id: participantId, project_id: projectId, product_id: productId } = app;
     if (!participantId || !projectId) continue;
 
     const eligKey = `${participantId}::${projectId}`;
     const eligi = eligibilityMap.get(eligKey);
-    if (!eligi) continue; // no approved review or proof → skip
+    if (!eligi) continue;
 
     const project = projectMap.get(projectId);
     const mode = String(project?.mode || '').toUpperCase();
@@ -3168,13 +3232,13 @@ const backfillEligiblePayouts = async () => {
     }
     if (!isEligible) continue;
 
-    const covKey = `${participantId}::${projectId}::${productId||'__none__'}`;
-    if (coveredSet.has(covKey)) continue; // already has a payout for this product
+    const covKey = `${participantId}::${projectId}::${productId || '__none__'}`;
+    if (coveredSet.has(covKey)) continue;
 
     const rewardAmount = toAmount(project?.reward);
     const productAmount = toAmount(app.allocated_budget || productMap.get(productId)?.product_value);
 
-    const inserted = await insertPayout({
+    newPayouts.push({
       participant_id: participantId,
       user_id: participantId,
       project_id: projectId,
@@ -3183,8 +3247,52 @@ const backfillEligiblePayouts = async () => {
       amount: rewardAmount + productAmount,
       status: 'ELIGIBLE',
     });
+  }
 
-    if (inserted) coveredSet.add(covKey);
+  if (newPayouts.length > 0) {
+    let { error: insertError } = await supabase
+      .from('payouts')
+      .insert(newPayouts);
+    
+    // If bulk insert fails because of missing columns, try a safer bulk insert or fallback
+    if (insertError && isMissingSchemaObjectError(insertError)) {
+      const isMissingProduct = /product_id/i.test(insertError.message);
+      const isMissingUserId = /user_id/i.test(insertError.message);
+      const isMissingProofId = /purchase_proof_id/i.test(insertError.message);
+
+      if (isMissingProduct || isMissingUserId || isMissingProofId) {
+        const saferPayouts = newPayouts.map(p => {
+          const s = { ...p };
+          if (isMissingProduct) delete s.product_id;
+          if (isMissingUserId) delete s.user_id;
+          if (isMissingProofId) delete s.purchase_proof_id;
+          return s;
+        });
+        const retry = await supabase.from('payouts').insert(saferPayouts);
+        insertError = retry.error;
+      }
+    }
+
+    // Individual fallback if still failing
+    if (insertError && isMissingSchemaObjectError(insertError)) {
+      for (const p of newPayouts) {
+        // Try different column combinations if schema is unknown
+        const candidates = [
+          { ...p },
+          { ...p, user_id: undefined },
+          { ...p, purchase_proof_id: undefined },
+          { ...p, user_id: undefined, purchase_proof_id: undefined },
+          { ...p, product_id: undefined, user_id: undefined, purchase_proof_id: undefined },
+        ];
+        for (const candidate of candidates) {
+          const clean = Object.fromEntries(Object.entries(candidate).filter(([, v]) => v !== undefined));
+          const { error } = await supabase.from('payouts').insert(clean);
+          if (!error) break;
+        }
+      }
+    } else if (insertError) {
+      throw insertError;
+    }
   }
 };
 const getPayoutReportRows = async ({ projectId = null, paidFilter = 'ALL' } = {}) => {

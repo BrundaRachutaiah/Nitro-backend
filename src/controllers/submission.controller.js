@@ -301,10 +301,28 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
     proofAllocMap = new Map((proofAllocs || []).map(a => [a.id, a.project_id]));
   }
 
-  const approvedProofs = (allProofs || []).filter(p =>
-    proofAllocMap.get(p.allocation_id) === projectId
-  );
-  const hasApprovedProof = approvedProofs.length > 0;
+  // FIX: also directly match proofs whose allocation belongs to this project
+  // This catches cases where the allocation lookup returns empty (completed/status issues)
+  const approvedProofs = (allProofs || []).filter(p => {
+    // Direct match via allocation map
+    if (proofAllocMap.get(p.allocation_id) === projectId) return true;
+    // Fallback: if proof's allocation_id matches the calling allocation's project
+    // (unit_allocations may have been completed and excluded from lookup)
+    return false;
+  });
+
+  // Also check if ANY of the participant's allocations for this project have approved proofs
+  // by querying unit_allocations for this project directly
+  let hasApprovedProof = approvedProofs.length > 0;
+  if (!hasApprovedProof && proofAllocIds.length) {
+    const { data: projectAllocations } = await supabase
+      .from('unit_allocations')
+      .select('id')
+      .eq('participant_id', participantId)
+      .eq('project_id', projectId);
+    const projectAllocIdSet = new Set((projectAllocations || []).map(a => a.id));
+    hasApprovedProof = (allProofs || []).some(p => projectAllocIdSet.has(p.allocation_id));
+  }
 
   // ── Step 4: Check eligibility based on project mode ──────────────────────
   let eligible = false;

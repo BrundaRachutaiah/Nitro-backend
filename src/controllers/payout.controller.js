@@ -14,20 +14,90 @@ const isMissingSchemaObjectError = (error) => {
 
 /**
  * ✅ Get Eligible payouts (Admin)
+ * FIX: Added backfillEligiblePayouts() call so payouts are auto-created
+ * when review/proof is approved before this page loads.
  */
 const getEligiblePayouts = async (req, res, next) => {
   try {
+    // Run backfill first so any approved reviews/proofs without a payout row get one
+    await backfillEligiblePayouts();
+
     const { data, error } = await supabase
       .from('payouts')
-      .select('*')
+      .select('id, participant_id, project_id, product_id, amount, status, created_at, payout_batch_id')
       .eq('status', 'ELIGIBLE')
       .order('created_at', { ascending: false });
 
     if (error) throw error;
 
+    // Enrich with profile info for display
+    const rows = data || [];
+    const participantIds = [...new Set(rows.map(r => r.participant_id).filter(Boolean))];
+    const projectIds = [...new Set(rows.map(r => r.project_id).filter(Boolean))];
+    const productIds = [...new Set(rows.map(r => r.product_id).filter(Boolean))];
+
+    const [profilesRes, projectsRes, productsRes] = await Promise.all([
+      participantIds.length
+        ? supabase.from('profiles').select('id, full_name, email').in('id', participantIds)
+        : Promise.resolve({ data: [] }),
+      projectIds.length
+        ? supabase.from('projects').select('id, title, name, reward').in('id', projectIds)
+        : Promise.resolve({ data: [] }),
+      productIds.length
+        ? supabase.from('project_products').select('id, name, product_value').in('id', productIds)
+        : Promise.resolve({ data: [] }),
+    ]);
+
+    const profileMap = new Map((profilesRes.data || []).map(r => [r.id, r]));
+    const projectMap = new Map((projectsRes.data || []).map(r => [r.id, r]));
+    const productMap = new Map((productsRes.data || []).map(r => [r.id, r]));
+
+    // For payouts missing product_id, resolve via applications
+    const rowsNeedingFallback = rows.filter(r => !r.product_id);
+    const fallbackProductMap = new Map();
+    if (rowsNeedingFallback.length) {
+      const { data: appRows } = await supabase
+        .from('project_applications')
+        .select('participant_id, project_id, product_id, allocated_budget, status')
+        .in('participant_id', [...new Set(rowsNeedingFallback.map(r => r.participant_id).filter(Boolean))])
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+      for (const app of (appRows || [])) {
+        const key = `${app.participant_id}::${app.project_id}`;
+        if (!fallbackProductMap.has(key)) fallbackProductMap.set(key, app);
+      }
+    }
+
+    const enriched = rows.map(row => {
+      const profile = profileMap.get(row.participant_id) || null;
+      const project = projectMap.get(row.project_id) || null;
+      const product = productMap.get(row.product_id) || null;
+      const fallbackApp = fallbackProductMap.get(`${row.participant_id}::${row.project_id}`) || null;
+      const fallbackProduct = fallbackApp?.product_id ? productMap.get(fallbackApp.product_id) : null;
+
+      const rewardAmount = Number(project?.reward || 0);
+      const productAmount = Number(
+        row.amount - rewardAmount ||
+        fallbackApp?.allocated_budget ||
+        product?.product_value ||
+        fallbackProduct?.product_value || 0
+      );
+
+      return {
+        ...row,
+        profiles: profile,
+        projects: project,
+        product_name: product?.name || fallbackProduct?.name || null,
+        reward_amount: rewardAmount,
+        product_amount: productAmount,
+        allocated_budget: Number(fallbackApp?.allocated_budget || 0),
+        total_amount: Number(row.amount || 0),
+      };
+    });
+
     res.json({
       success: true,
-      data: data || []
+      data: enriched,
+      meta: { total: enriched.length }
     });
   } catch (err) {
     next(err);
@@ -499,10 +569,146 @@ const getMyPayouts = async (req, res, next) => {
   }
 };
 
+
+/**
+ * Backfill: create ELIGIBLE payout rows for participants who have
+ * approved reviews or proofs but no payout row yet.
+ * Safe to run on every page load — only inserts missing rows.
+ */
+const backfillEligiblePayouts = async () => {
+  const { data: applications, error: appErr } = await supabase
+    .from('project_applications')
+    .select('id, participant_id, project_id, product_id, allocated_budget, status')
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+  if (appErr) { console.error('backfill app fetch error:', appErr.message); return; }
+  if (!applications || !applications.length) return;
+
+  const participantIds = [...new Set(applications.map(r => r.participant_id).filter(Boolean))];
+  const projectIds = [...new Set(applications.map(r => r.project_id).filter(Boolean))];
+  const productIds = [...new Set(applications.map(r => r.product_id).filter(Boolean))];
+
+  const { data: projects } = await supabase
+    .from('projects').select('id, mode, reward').in('id', projectIds);
+  const projectMap = new Map((projects || []).map(p => [p.id, p]));
+
+  const { data: products } = productIds.length
+    ? await supabase.from('project_products').select('id, product_value').in('id', productIds)
+    : { data: [] };
+  const productMap = new Map((products || []).map(p => [p.id, p]));
+
+  const { data: allReviews } = await supabase
+    .from('participant_reviews')
+    .select('id, participant_id, project_id, allocation_id, status')
+    .eq('status', 'APPROVED')
+    .in('participant_id', participantIds);
+
+  let proofRes = await supabase
+    .from('purchase_proofs')
+    .select('id, participant_id, allocation_id, status')
+    .eq('status', 'APPROVED')
+    .in('participant_id', participantIds);
+  const allProofs = proofRes.data || [];
+
+  const allAllocIds = [...new Set([
+    ...(allReviews || []).map(r => r.allocation_id),
+    ...allProofs.map(p => p.allocation_id),
+  ].filter(Boolean))];
+
+  let allocMap = new Map();
+  if (allAllocIds.length) {
+    const { data: allocs } = await supabase
+      .from('unit_allocations').select('id, project_id').in('id', allAllocIds);
+    allocMap = new Map((allocs || []).map(a => [a.id, a.project_id]));
+  }
+
+  const eligibilityMap = new Map();
+  const getOrCreate = (pid, projId) => {
+    const key = `${pid}::${projId}`;
+    if (!eligibilityMap.has(key)) eligibilityMap.set(key, { hasReview: false, hasProof: false, proofId: null });
+    return eligibilityMap.get(key);
+  };
+
+  for (const review of (allReviews || [])) {
+    const pid = review.project_id || allocMap.get(review.allocation_id);
+    if (pid) getOrCreate(review.participant_id, pid).hasReview = true;
+  }
+  for (const proof of allProofs) {
+    const pid = allocMap.get(proof.allocation_id);
+    if (pid) {
+      const entry = getOrCreate(proof.participant_id, pid);
+      entry.hasProof = true;
+      if (!entry.proofId) entry.proofId = proof.id;
+    }
+  }
+
+  const { data: existingPayouts } = await supabase
+    .from('payouts')
+    .select('participant_id, project_id, product_id, status')
+    .in('participant_id', participantIds)
+    .in('project_id', projectIds);
+
+  const coveredSet = new Set();
+  for (const p of (existingPayouts || [])) {
+    if (['ELIGIBLE','IN_BATCH','EXPORTED','PAID'].includes(String(p.status || '').toUpperCase())) {
+      coveredSet.add(`${p.participant_id}::${p.project_id}::${p.product_id || '__none__'}`);
+    }
+  }
+
+  const tryInsert = async (payload) => {
+    const variants = [
+      payload,
+      { ...payload, user_id: undefined },
+      { ...payload, purchase_proof_id: undefined },
+      { ...payload, user_id: undefined, purchase_proof_id: undefined },
+    ];
+    for (const v of variants) {
+      const clean = Object.fromEntries(Object.entries(v).filter(([, val]) => val !== undefined));
+      const { error } = await supabase.from('payouts').insert(clean);
+      if (!error) return true;
+      const msg = String(error.message || '').toLowerCase();
+      if (!msg.includes('does not exist') && !msg.includes('column') && !msg.includes('schema cache')) {
+        return false;
+      }
+    }
+    return false;
+  };
+
+  for (const app of applications) {
+    const { participant_id: pid, project_id: projId, product_id: productId } = app;
+    if (!pid || !projId) continue;
+
+    const eligi = eligibilityMap.get(`${pid}::${projId}`);
+    if (!eligi) continue;
+
+    const project = projectMap.get(projId);
+    const mode = String(project?.mode || '').toUpperCase();
+    const isEligible = mode === 'MARKETPLACE' ? eligi.hasReview : (eligi.hasProof || eligi.hasReview);
+    if (!isEligible) continue;
+
+    const covKey = `${pid}::${projId}::${productId || '__none__'}`;
+    if (coveredSet.has(covKey)) continue;
+
+    const rewardAmount = Number(project?.reward || 0);
+    const productAmount = Number(app.allocated_budget || productMap.get(productId)?.product_value || 0);
+
+    const inserted = await tryInsert({
+      participant_id: pid,
+      user_id: pid,
+      project_id: projId,
+      product_id: productId || null,
+      purchase_proof_id: eligi.proofId || null,
+      amount: rewardAmount + productAmount,
+      status: 'ELIGIBLE',
+    });
+    if (inserted) coveredSet.add(covKey);
+  }
+};
+
 module.exports = {
   getEligiblePayouts,
   getPayoutBatches,
   createPayoutBatch,
   markBatchPaid,
-  getMyPayouts
+  getMyPayouts,
+  backfillEligiblePayouts
 };
