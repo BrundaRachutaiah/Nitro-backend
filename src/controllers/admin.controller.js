@@ -3053,7 +3053,7 @@ const backfillEligiblePayouts = async () => {
   let appRes = await supabase
     .from('project_applications')
     .select('id, participant_id, project_id, product_id, allocated_budget, status')
-    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+    .in('status', ['APPROVED', 'PURCHASED']);
   if (appRes.error && !isMissingSchemaObjectError(appRes.error)) throw appRes.error;
 
   const applications = (appRes.data || []);
@@ -3204,11 +3204,12 @@ const backfillEligiblePayouts = async () => {
   const existingPayouts = existingPayoutsRes.data || [];
 
   // Build covered set: participantId::projectId::productId
+  // covered = any existing payout row for this participant+project, regardless of status or product_id
+  // Using participant::project as the key prevents re-creating ELIGIBLE after batch/paid
   const coveredSet = new Set();
   for (const p of existingPayouts) {
-    if (['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID'].includes(String(p.status || '').toUpperCase())) {
-      coveredSet.add(`${p.participant_id}::${p.project_id}::${p.product_id || '__none__'}`);
-    }
+    // Block by participant+project (covers product_id mismatches and null variations)
+    coveredSet.add(`${p.participant_id}::${p.project_id}`);
   }
 
   // ── 9. For each application, create ELIGIBLE payout if needed ─────────────
@@ -3232,7 +3233,8 @@ const backfillEligiblePayouts = async () => {
     }
     if (!isEligible) continue;
 
-    const covKey = `${participantId}::${projectId}::${productId || '__none__'}`;
+    // Check if ANY payout already exists for this participant+project
+    const covKey = `${participantId}::${projectId}`;
     if (coveredSet.has(covKey)) continue;
 
     const rewardAmount = toAmount(project?.reward);
