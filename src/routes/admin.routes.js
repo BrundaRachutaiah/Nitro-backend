@@ -277,4 +277,12 @@ router.get(
   adminController.getSupportAnalytics
 );
 
+// DEBUG: Payout eligibility trace
+router.get(
+  '/debug/payouts',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.debugPayouts
+);
+
 module.exports = router;

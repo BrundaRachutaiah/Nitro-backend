@@ -238,112 +238,168 @@ const getProofStatusByProduct = async (allocationId, participantId, productId) =
 };
 
 const ensureEligiblePayout = async ({ participantId, projectId }) => {
+  if (!participantId || !projectId) return;
 
-  // 1️⃣ Check review approved for this project
-  const { data: review, error: reviewError } = await supabase
-    .from('participant_reviews')
-    .select('id, allocation_id')
-    .eq('participant_id', participantId)
-    .eq('project_id', projectId)
-    .eq('status', 'APPROVED')
-    .maybeSingle();
-
-  if (reviewError) throw reviewError;
-  if (!review) return; // stop if no approved review
-
-  // 2️⃣ Check purchase proof approved for this allocation
-  const { data: proof, error: proofError } = await supabase
-    .from('purchase_proofs')
-    .select('id')
-    .eq('allocation_id', review.allocation_id)
-    .eq('participant_id', participantId)
-    .eq('status', 'APPROVED')
-    .maybeSingle();
-
-  if (proofError) throw proofError;
-  if (!proof) return; // stop if purchase not approved
-
-  // 3️⃣ Prevent duplicate payout
-  const { data: existing } = await supabase
-    .from('payouts')
-    .select('id')
-    .eq('participant_id', participantId)
-    .eq('project_id', projectId)
-    .maybeSingle();
-
-  if (existing) return;
-
-  // 4️⃣ Get reward
+  // ── Step 1: Check project mode ───────────────────────────────────────────
   const { data: project } = await supabase
     .from('projects')
-    .select('reward')
+    .select('id, reward, mode')
     .eq('id', projectId)
     .maybeSingle();
 
   const rewardAmount = Number(project?.reward || 0);
+  const mode = String(project?.mode || '').toUpperCase();
 
-  // 5️⃣ Get product value
-  const { data: application } = await supabase
+  // ── Step 2: Find approved reviews for this participant in this project ────
+  // Reviews can store project_id directly OR link via allocation_id → unit_allocations
+  const { data: allReviews } = await supabase
+    .from('participant_reviews')
+    .select('id, allocation_id, project_id, status')
+    .eq('participant_id', participantId)
+    .eq('status', 'APPROVED');
+
+  const reviews = (allReviews || []).filter(r => {
+    // Match by direct project_id if present
+    if (r.project_id) return r.project_id === projectId;
+    // Otherwise we need to resolve via allocation (done below)
+    return true; // keep all for now, filter after allocation lookup
+  });
+
+  // Resolve allocation_id → project_id for reviews without project_id
+  const reviewAllocIds = reviews.filter(r => !r.project_id).map(r => r.allocation_id).filter(Boolean);
+  let reviewAllocMap = new Map();
+  if (reviewAllocIds.length) {
+    const { data: allocs } = await supabase
+      .from('unit_allocations')
+      .select('id, project_id')
+      .in('id', reviewAllocIds);
+    reviewAllocMap = new Map((allocs || []).map(a => [a.id, a.project_id]));
+  }
+
+  const approvedReviews = reviews.filter(r => {
+    const resolvedProject = r.project_id || reviewAllocMap.get(r.allocation_id);
+    return resolvedProject === projectId;
+  });
+
+  const hasApprovedReview = approvedReviews.length > 0;
+
+  // ── Step 3: Find approved proofs for this participant in this project ─────
+  // Proofs only have allocation_id, no project_id — resolve via unit_allocations
+  const { data: allProofs } = await supabase
+    .from('purchase_proofs')
+    .select('id, allocation_id, status')
+    .eq('participant_id', participantId)
+    .eq('status', 'APPROVED');
+
+  const proofAllocIds = (allProofs || []).map(p => p.allocation_id).filter(Boolean);
+  let proofAllocMap = new Map();
+  if (proofAllocIds.length) {
+    const { data: proofAllocs } = await supabase
+      .from('unit_allocations')
+      .select('id, project_id')
+      .in('id', proofAllocIds);
+    proofAllocMap = new Map((proofAllocs || []).map(a => [a.id, a.project_id]));
+  }
+
+  const approvedProofs = (allProofs || []).filter(p =>
+    proofAllocMap.get(p.allocation_id) === projectId
+  );
+  const hasApprovedProof = approvedProofs.length > 0;
+
+  // ── Step 4: Check eligibility based on project mode ──────────────────────
+  let eligible = false;
+  if (mode === 'MARKETPLACE') {
+    eligible = hasApprovedReview; // marketplace: review only
+  } else {
+    eligible = hasApprovedProof || hasApprovedReview; // D2C / default: either
+  }
+
+  if (!eligible) return; // participant not eligible yet
+
+  // ── Step 5: Get applications (one per product) ───────────────────────────
+  const { data: applications, error: appError } = await supabase
     .from('project_applications')
-    .select('product_id, allocated_budget')
+    .select('id, product_id, allocated_budget')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
-    .in('status', ['APPROVED', 'PURCHASED'])
-    .maybeSingle();
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
 
-  let productAmount = Number(application?.allocated_budget || 0);
+  if (appError && !isMissingSchemaObjectError(appError)) throw appError;
+  const apps = applications || [];
 
-  if (!productAmount && application?.product_id) {
-    const { data: product } = await supabase
-      .from('project_products')
-      .select('product_value')
-      .eq('id', application.product_id)
-      .maybeSingle();
-
-    productAmount = Number(product?.product_value || 0);
-  }
-
-  const totalAmount = rewardAmount + productAmount;
-
-  // 6️⃣ Insert payout
-  const { error: insertError } = await supabase
+  // ── Step 6: Get already-covered products to avoid duplicates ─────────────
+  const { data: existingPayouts } = await supabase
     .from('payouts')
-    .insert({
-      participant_id: participantId,
-      user_id: participantId,
-      project_id: projectId,
-      purchase_proof_id: proof.id,
-      amount: totalAmount,
-      status: 'ELIGIBLE'
-    });
-  if (insertError && isMissingSchemaObjectError(insertError)) {
-    const fallbackInsert = await supabase
-      .from('payouts')
-      .insert({
-        participant_id: participantId,
-        project_id: projectId,
-        purchase_proof_id: proof.id,
-        amount: totalAmount,
-        status: 'ELIGIBLE'
-      });
-    if (fallbackInsert.error && !isMissingSchemaObjectError(fallbackInsert.error)) {
-      throw fallbackInsert.error;
+    .select('id, product_id')
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .in('status', ['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID']);
+
+  const coveredProductIds = new Set(
+    (existingPayouts || []).map(p => p.product_id || '__none__')
+  );
+
+  // Canonical proof id for linking (use first approved proof)
+  const canonicalProofId = approvedProofs[0]?.id || null;
+
+  // ── Step 7: Create payout for each uncovered product ─────────────────────
+  const insertPayout = async (payload) => {
+    const candidates = [
+      { ...payload },
+      { ...payload, user_id: undefined },
+      { ...payload, purchase_proof_id: undefined },
+      { ...payload, user_id: undefined, purchase_proof_id: undefined },
+      { ...payload, product_id: undefined, user_id: undefined, purchase_proof_id: undefined },
+    ];
+    for (const candidate of candidates) {
+      // Clean undefined keys
+      const clean = Object.fromEntries(Object.entries(candidate).filter(([, v]) => v !== undefined));
+      const { error } = await supabase.from('payouts').insert(clean);
+      if (!error) return true;
+      if (!isMissingSchemaObjectError(error)) throw error;
     }
-    if (!fallbackInsert.error) return;
+    return false;
+  };
 
-    const fallbackInsertNoProof = await supabase
-      .from('payouts')
-      .insert({
+  if (apps.length > 0) {
+    for (const application of apps) {
+      const productKey = application.product_id || '__none__';
+      if (coveredProductIds.has(productKey)) continue;
+
+      let productAmount = Number(application.allocated_budget || 0);
+      if (!productAmount && application.product_id) {
+        const { data: prod } = await supabase
+          .from('project_products')
+          .select('product_value')
+          .eq('id', application.product_id)
+          .maybeSingle();
+        productAmount = Number(prod?.product_value || 0);
+      }
+
+      const inserted = await insertPayout({
         participant_id: participantId,
+        user_id: participantId,
         project_id: projectId,
-        amount: totalAmount,
-        status: 'ELIGIBLE'
+        product_id: application.product_id || null,
+        purchase_proof_id: canonicalProofId,
+        amount: rewardAmount + productAmount,
+        status: 'ELIGIBLE',
       });
-    if (fallbackInsertNoProof.error) throw fallbackInsertNoProof.error;
-    return;
+      if (inserted) coveredProductIds.add(productKey);
+    }
+  } else {
+    // No applications — create a reward-only payout if not covered
+    if (!coveredProductIds.has('__none__')) {
+      await insertPayout({
+        participant_id: participantId,
+        user_id: participantId,
+        project_id: projectId,
+        purchase_proof_id: canonicalProofId,
+        amount: rewardAmount,
+        status: 'ELIGIBLE',
+      });
+    }
   }
-
-  if (insertError) throw insertError;
 };
 
 const submitFeedback = async (req, res, next) => {

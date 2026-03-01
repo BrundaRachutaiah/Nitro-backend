@@ -35,7 +35,7 @@ const getEligiblePayouts = async (req, res, next) => {
 };
 
 /**
- * ✅ Get payout batches (Admin)
+ * ✅ Get payout batches (Admin) — enriched with participants & products
  */
 const getPayoutBatches = async (req, res, next) => {
   try {
@@ -46,22 +46,122 @@ const getPayoutBatches = async (req, res, next) => {
       .select('*')
       .order('created_at', { ascending: false });
 
-    // If frontend sends ACTIVE → show only IN_BATCH & EXPORTED
     if (statusFilter === 'ACTIVE') {
       query = query.in('status', ['IN_BATCH', 'EXPORTED']);
     }
-
     if (statusFilter === 'PAID') {
       query = query.eq('status', 'PAID');
     }
 
-    const { data, error } = await query;
-    if (error) throw error;
+    const { data: batches, error: batchError } = await query;
+    if (batchError) throw batchError;
 
-    res.json({
-      success: true,
-      data: data || []
-    });
+    if (!batches || batches.length === 0) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const batchIds = batches.map((b) => b.id);
+
+    // Fetch all payouts for these batches
+    const { data: payouts, error: payoutsError } = await supabase
+      .from('payouts')
+      .select('id, payout_batch_id, participant_id, product_id, amount, status')
+      .in('payout_batch_id', batchIds);
+    if (payoutsError) throw payoutsError;
+
+    const payoutRows = payouts || [];
+
+    // Collect unique participant IDs and product IDs
+    const participantIds = [...new Set(payoutRows.map((p) => p.participant_id).filter(Boolean))];
+    const productIds = [...new Set(payoutRows.map((p) => p.product_id).filter(Boolean))];
+
+    // Fetch profiles
+    let profileMap = new Map();
+    if (participantIds.length) {
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('id, full_name, email, bank_account_number, bank_ifsc, address_line1, address_line2, city, state, pincode, country')
+        .in('id', participantIds);
+      for (const p of (profiles || [])) profileMap.set(p.id, p);
+    }
+
+    // Fetch products
+    let productMap = new Map();
+    if (productIds.length) {
+      const { data: products } = await supabase
+        .from('project_products')
+        .select('id, name, product_value')
+        .in('id', productIds);
+      for (const p of (products || [])) productMap.set(p.id, p);
+    }
+
+    // For payouts missing product_id, try to resolve via project_applications
+    const payoutsWithoutProduct = payoutRows.filter((p) => !p.product_id);
+    const fallbackProductByKey = new Map();
+    if (payoutsWithoutProduct.length) {
+      const { data: appRows } = await supabase
+        .from('project_applications')
+        .select('participant_id, project_id, product_id, status')
+        .in('participant_id', [...new Set(payoutsWithoutProduct.map((p) => p.participant_id).filter(Boolean))])
+        .not('product_id', 'is', null)
+        .in('status', ['PURCHASED', 'COMPLETED', 'APPROVED', 'IN_BATCH', 'PAID']);
+
+      for (const app of (appRows || [])) {
+        const key = `${app.participant_id}`;
+        if (!fallbackProductByKey.has(key)) {
+          fallbackProductByKey.set(key, app.product_id);
+        }
+      }
+
+      // Fetch any product details not yet in productMap
+      const extraProductIds = [...new Set(
+        [...fallbackProductByKey.values()].filter((id) => !productMap.has(id))
+      )];
+      if (extraProductIds.length) {
+        const { data: extraProducts } = await supabase
+          .from('project_products')
+          .select('id, name, product_value')
+          .in('id', extraProductIds);
+        for (const p of (extraProducts || [])) productMap.set(p.id, p);
+      }
+    }
+
+    // Build a map of batchId → array of participant rows
+    const participantsByBatch = new Map();
+    for (const payout of payoutRows) {
+      const bid = payout.payout_batch_id;
+      if (!participantsByBatch.has(bid)) participantsByBatch.set(bid, []);
+
+      const profile = profileMap.get(payout.participant_id) || {};
+      const effectiveProductId = payout.product_id || fallbackProductByKey.get(payout.participant_id) || null;
+      const product = effectiveProductId ? (productMap.get(effectiveProductId) || null) : null;
+
+      participantsByBatch.get(bid).push({
+        id: payout.participant_id,
+        payout_id: payout.id,
+        full_name: profile.full_name || null,
+        email: profile.email || null,
+        bank_account_number: profile.bank_account_number || null,
+        bank_ifsc: profile.bank_ifsc || null,
+        address_line1: profile.address_line1 || null,
+        address_line2: profile.address_line2 || null,
+        city: profile.city || null,
+        state: profile.state || null,
+        pincode: profile.pincode || null,
+        country: profile.country || null,
+        product_name: product?.name || null,
+        product_amount: Number(payout.amount || product?.product_value || 0),
+        payout_status: payout.status,
+      });
+    }
+
+    // Attach participants to each batch
+    const enriched = batches.map((batch) => ({
+      ...batch,
+      participants: participantsByBatch.get(batch.id) || [],
+    }));
+
+    res.json({ success: true, data: enriched });
 
   } catch (err) {
     next(err);
