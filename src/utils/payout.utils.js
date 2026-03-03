@@ -61,9 +61,7 @@ const getProjectReward = async ({ supabase, projectId, fallbackReward = 0 }) => 
 const getProductAmount = async ({ supabase, application }) => {
   if (!application) return 0;
 
-  const allocatedBudget = toAmount(application.allocated_budget);
-  if (allocatedBudget > 0) return allocatedBudget;
-
+  // Always use product_value from project_products — never allocated_budget
   if (!application.product_id) return 0;
 
   const { data, error } = await supabase

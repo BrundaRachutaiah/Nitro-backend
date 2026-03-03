@@ -75,9 +75,8 @@ const getEligiblePayouts = async (req, res, next) => {
       const fallbackProduct = fallbackApp?.product_id ? productMap.get(fallbackApp.product_id) : null;
 
       const rewardAmount = Number(project?.reward || 0);
+      // Only product_value — no reward added
       const productAmount = Number(
-        row.amount - rewardAmount ||
-        fallbackApp?.allocated_budget ||
         product?.product_value ||
         fallbackProduct?.product_value || 0
       );
@@ -87,10 +86,10 @@ const getEligiblePayouts = async (req, res, next) => {
         profiles: profile,
         projects: project,
         product_name: product?.name || fallbackProduct?.name || null,
-        reward_amount: rewardAmount,
+        reward_amount: 0,
         product_amount: productAmount,
         allocated_budget: Number(fallbackApp?.allocated_budget || 0),
-        total_amount: Number(row.amount || 0),
+        total_amount: productAmount,
       };
     });
 
@@ -220,7 +219,7 @@ const getPayoutBatches = async (req, res, next) => {
         pincode: profile.pincode || null,
         country: profile.country || null,
         product_name: product?.name || null,
-        product_amount: Number(payout.amount || product?.product_value || 0),
+        product_amount: Number(product?.product_value || 0), // Always use product_value, never stale payout.amount
         payout_status: payout.status,
       });
     }
@@ -535,19 +534,21 @@ const getMyPayouts = async (req, res, next) => {
         breakdownCache.set(cacheKey, breakdown);
       }
 
-      const totalAmount = Number(row.amount || breakdown.totalAmount || 0);
       const effectiveProductId = row.product_id || fallbackProductByKey.get(cacheKey) || null;
       const effectiveProduct = effectiveProductId ? (productMap.get(effectiveProductId) || null) : null;
+
+      // Only product_value — no reward added
+      const productAmount = effectiveProductId
+        ? Number(effectiveProduct?.product_value || 0)
+        : breakdown.productAmount;
 
       return {
         ...row,
         product_id: effectiveProductId,
         project_products: effectiveProduct,
-        reward_amount: breakdown.rewardAmount,
-        product_amount: effectiveProductId
-          ? Number(effectiveProduct?.product_value || breakdown.productAmount || 0)
-          : breakdown.productAmount,
-        total_amount: totalAmount,
+        reward_amount: 0,
+        product_amount: productAmount,
+        total_amount: productAmount,
         eligibility_reason:
           row.status === 'PAID'
             ? 'Payout paid successfully'
@@ -688,8 +689,8 @@ const backfillEligiblePayouts = async () => {
     const covKey = `${pid}::${projId}::${productId || '__none__'}`;
     if (coveredSet.has(covKey)) continue;
 
-    const rewardAmount = Number(project?.reward || 0);
-    const productAmount = Number(app.allocated_budget || productMap.get(productId)?.product_value || 0);
+    // Only product_value — no reward added
+    const productAmount = Number(productMap.get(productId)?.product_value || 0);
 
     const inserted = await tryInsert({
       participant_id: pid,
@@ -697,7 +698,7 @@ const backfillEligiblePayouts = async () => {
       project_id: projId,
       product_id: productId || null,
       purchase_proof_id: eligi.proofId || null,
-      amount: rewardAmount + productAmount,
+      amount: productAmount,
       status: 'ELIGIBLE',
     });
     if (inserted) coveredSet.add(covKey);
