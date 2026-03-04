@@ -3473,127 +3473,240 @@ const exportPayoutReportCSV = async (req, res, next) => {
  * Export payout batch CSV
  */
 const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => {
-  if ((!batchIds.length) && (!payoutIds.length)) return [];
+  if (!batchIds.length && !payoutIds.length) return [];
 
-  let payoutsRes = await supabase
-    .from('payouts')
-    .select('id, amount, status, payout_batch_id, participant_id, project_id');
-
+  // ── 1. Fetch payout rows ──────────────────────────────────────────────────
+  let payoutsRes;
   if (payoutIds.length) {
     payoutsRes = await supabase
       .from('payouts')
-      .select('id, amount, status, payout_batch_id, participant_id, project_id')
+      .select('id, amount, status, payout_batch_id, participant_id, project_id, product_id')
       .in('id', payoutIds);
   } else {
     payoutsRes = await supabase
       .from('payouts')
-      .select('id, amount, status, payout_batch_id, participant_id, project_id')
+      .select('id, amount, status, payout_batch_id, participant_id, project_id, product_id')
       .in('payout_batch_id', batchIds);
   }
-
+  // schema-cache fallback — drop product_id if column missing
   if (payoutsRes.error && isMissingSchemaObjectError(payoutsRes.error)) {
-    const fallbackQuery = payoutIds.length
-      ? supabase.from('payouts').select('id, amount, status, payout_batch_id').in('id', payoutIds)
-      : supabase.from('payouts').select('id, amount, status, payout_batch_id').in('payout_batch_id', batchIds);
-    payoutsRes = await fallbackQuery;
+    payoutsRes = payoutIds.length
+      ? await supabase.from('payouts').select('id, amount, status, payout_batch_id, participant_id, project_id').in('id', payoutIds)
+      : await supabase.from('payouts').select('id, amount, status, payout_batch_id, participant_id, project_id').in('payout_batch_id', batchIds);
   }
   if (payoutsRes.error) throw payoutsRes.error;
   const payouts = payoutsRes.data || [];
+  if (!payouts.length) return [];
 
-  const participantIds = [...new Set(payouts.map((row) => row.participant_id).filter(Boolean))];
-  const projectIds = [...new Set(payouts.map((row) => row.project_id).filter(Boolean))];
+  const participantIds = [...new Set(payouts.map(r => r.participant_id).filter(Boolean))];
+  const projectIds     = [...new Set(payouts.map(r => r.project_id).filter(Boolean))];
+  const productIds     = [...new Set(payouts.map(r => r.product_id).filter(Boolean))];
 
-  let profilesRes = { data: [], error: null };
+  // ── 2. Participant profiles ───────────────────────────────────────────────
+  const profilesRes = participantIds.length
+    ? await supabase.from('profiles').select('id, full_name, email').in('id', participantIds)
+    : { data: [], error: null };
+  if (profilesRes.error) throw profilesRes.error;
+
+  // ── 3. Bank details ───────────────────────────────────────────────────────
   let detailsRes = { data: [], error: null };
   if (participantIds.length) {
-    profilesRes = await supabase
-      .from('profiles')
-      .select(
-        `
-        id,
-        full_name,
-        email
-      `
-      )
-      .in('id', participantIds);
-
-    if (profilesRes.error && isMissingSchemaObjectError(profilesRes.error)) {
-      profilesRes = await supabase
-        .from('profiles')
-        .select('id, full_name, email')
-        .in('id', participantIds);
-    }
-    if (profilesRes.error) throw profilesRes.error;
-
     detailsRes = await supabase
       .from('participant_details')
-      .select(
-        `
-        participant_id,
-        bank_account_name,
-        bank_account_number,
-        bank_ifsc,
-        bank_name,
-        address_line1,
-        address_line2,
-        city,
-        state,
-        pincode,
-        country
-      `
-      )
+      .select('participant_id, bank_account_name, bank_account_number, bank_ifsc, bank_name')
       .in('participant_id', participantIds);
     if (detailsRes.error && !isMissingSchemaObjectError(detailsRes.error)) throw detailsRes.error;
   }
 
-  let projectsRes = { data: [], error: null };
-  if (projectIds.length) {
-    projectsRes = await supabase
-      .from('projects')
-      .select('id, title, name')
-      .in('id', projectIds);
-    if (projectsRes.error) throw projectsRes.error;
+  // ── 4. Projects + brand profiles ─────────────────────────────────────────
+  const projectsRes = projectIds.length
+    ? await supabase.from('projects').select('id, title, name, created_by').in('id', projectIds)
+    : { data: [], error: null };
+  if (projectsRes.error) throw projectsRes.error;
+
+  const brandIds = [...new Set((projectsRes.data || []).map(p => p.created_by).filter(Boolean))];
+  let brandMap = new Map();
+  if (brandIds.length) {
+    const r = await supabase.from('profiles').select('id, full_name, email').in('id', brandIds);
+    if (!r.error) brandMap = new Map((r.data || []).map(p => [p.id, p]));
   }
 
-  const profileMap = new Map((profilesRes.data || []).map((row) => [row.id, row]));
-  const detailMap = new Map((detailsRes.data || []).map((row) => [row.participant_id, row]));
-  const projectMap = new Map((projectsRes.data || []).map((row) => [row.id, row]));
+  // ── 5. Products (project_products table) ─────────────────────────────────
+  let productMap = new Map();
+  if (productIds.length) {
+    const r = await supabase.from('project_products').select('id, name, product_value').in('id', productIds);
+    if (!r.error) productMap = new Map((r.data || []).map(p => [p.id, p]));
+  }
 
-  return payouts.map((row) => ({
-    ...row,
-    profiles: {
-      ...(profileMap.get(row.participant_id) || {}),
-      ...(detailMap.get(row.participant_id) || {})
-    },
-    projects: projectMap.get(row.project_id) || null
-  }));
-};
+  // ── 6. Fallback product resolution via project_applications ──────────────
+  //    (handles payouts where product_id column is NULL)
+  const needsFallback = payouts.filter(p => !p.product_id && p.participant_id && p.project_id);
+  const fallbackMap = new Map(); // "participantId::projectId" → { product, allocated_budget }
+  if (needsFallback.length) {
+    const fbPids  = [...new Set(needsFallback.map(p => p.participant_id))];
+    const fbProjs = [...new Set(needsFallback.map(p => p.project_id))];
+    const appRes  = await supabase
+      .from('project_applications')
+      .select('participant_id, project_id, product_id, allocated_budget')
+      .in('participant_id', fbPids)
+      .in('project_id', fbProjs)
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+    if (!appRes.error && appRes.data) {
+      const fbProductIds = [...new Set(appRes.data.map(a => a.product_id).filter(Boolean))];
+      let fbProductMap = new Map();
+      if (fbProductIds.length) {
+        const pr = await supabase.from('project_products').select('id, name, product_value').in('id', fbProductIds);
+        if (!pr.error) fbProductMap = new Map((pr.data || []).map(r => [r.id, r]));
+      }
+      for (const app of appRes.data) {
+        const key = `${app.participant_id}::${app.project_id}`;
+        if (!fallbackMap.has(key)) {
+          fallbackMap.set(key, {
+            product:          fbProductMap.get(app.product_id) || null,
+            allocated_budget: Number(app.allocated_budget || 0),
+          });
+        }
+      }
+    }
+  }
 
+  // ── 7. Unit allocations: participant+project → allocation_id ─────────────
+  //    Reviews and proofs are stored by allocation_id, so we need this bridge.
+  let allocByParticipantProject = new Map(); // "participantId::projectId" → allocation_id
+  if (participantIds.length && projectIds.length) {
+    const r = await supabase
+      .from('unit_allocations')
+      .select('id, participant_id, project_id')
+      .in('participant_id', participantIds)
+      .in('project_id', projectIds);
+    if (!r.error) {
+      for (const a of (r.data || [])) {
+        const key = `${a.participant_id}::${a.project_id}`;
+        if (!allocByParticipantProject.has(key)) allocByParticipantProject.set(key, a.id);
+      }
+    }
+  }
+
+  const allAllocIds = [...allocByParticipantProject.values()];
+
+  // ── 8. Purchase proofs (invoices) — fetched by allocation_id ─────────────
+  let proofByAllocId = new Map(); // allocation_id → proof row
+  if (allAllocIds.length) {
+    // Try with product_id column first
+    let r = await supabase
+      .from('purchase_proofs')
+      .select('id, allocation_id, participant_id, product_id, file_url, status')
+      .in('allocation_id', allAllocIds);
+    if (r.error && isMissingSchemaObjectError(r.error)) {
+      r = await supabase
+        .from('purchase_proofs')
+        .select('id, allocation_id, participant_id, file_url, status')
+        .in('allocation_id', allAllocIds);
+    }
+    if (!r.error) {
+      for (const p of (r.data || [])) {
+        // Prefer APPROVED proof; otherwise keep first found
+        const existing = proofByAllocId.get(p.allocation_id);
+        if (!existing || String(p.status || '').toUpperCase() === 'APPROVED') {
+          proofByAllocId.set(p.allocation_id, p);
+        }
+      }
+    }
+  }
+
+  // ── 9. Participant reviews — fetched by allocation_id + direct project_id ─
+  let reviewByAllocId      = new Map(); // allocation_id → review row
+  let reviewByParticipantProject = new Map(); // "participantId::projectId" → review row
+  if (participantIds.length) {
+    const r = await supabase
+      .from('participant_reviews')
+      .select('id, allocation_id, participant_id, project_id, review_text, review_url, status')
+      .in('participant_id', participantIds);
+    if (!r.error) {
+      for (const rev of (r.data || [])) {
+        // By allocation_id
+        if (rev.allocation_id) {
+          const existing = reviewByAllocId.get(rev.allocation_id);
+          if (!existing || String(rev.status || '').toUpperCase() === 'APPROVED') {
+            reviewByAllocId.set(rev.allocation_id, rev);
+          }
+        }
+        // By participant+project (fallback when allocation_id is null on review row)
+        if (rev.project_id) {
+          const key = `${rev.participant_id}::${rev.project_id}`;
+          const existing = reviewByParticipantProject.get(key);
+          if (!existing || String(rev.status || '').toUpperCase() === 'APPROVED') {
+            reviewByParticipantProject.set(key, rev);
+          }
+        }
+      }
+    }
+  }
+
+  // ── Build lookup maps ─────────────────────────────────────────────────────
+  const profileMap = new Map((profilesRes.data || []).map(r => [r.id, r]));
+  const detailMap  = new Map((detailsRes.data  || []).map(r => [r.participant_id, r]));
+  const projectMap = new Map((projectsRes.data || []).map(r => [r.id, r]));
+
+  // ── Assemble final rows ───────────────────────────────────────────────────
+  return payouts.map((row) => {
+    const ppKey   = `${row.participant_id}::${row.project_id}`;
+    const allocId = allocByParticipantProject.get(ppKey) || null;
+
+    // Product: direct product_id → project_products, else fallback via project_applications
+    const directProduct  = productMap.get(row.product_id) || null;
+    const fallback       = fallbackMap.get(ppKey) || null;
+    const resolvedProduct = directProduct || fallback?.product || null;
+    const productValue   = Number(
+      resolvedProduct?.product_value ||
+      fallback?.allocated_budget     ||
+      row.amount || 0
+    );
+
+    // Invoice: look up proof by allocation_id
+    const proof = allocId ? (proofByAllocId.get(allocId) || null) : null;
+
+    // Review: by allocation_id first, then participant+project direct
+    const review = (allocId ? reviewByAllocId.get(allocId) : null)
+                || reviewByParticipantProject.get(ppKey)
+                || null;
+
+    const project = projectMap.get(row.project_id) || null;
+    const brand   = project?.created_by ? (brandMap.get(project.created_by) || null) : null;
+
+    return {
+      ...row,
+      product_amount: productValue,
+      product_name:   resolvedProduct?.name || null,
+      profiles: {
+        ...(profileMap.get(row.participant_id) || {}),
+        ...(detailMap.get(row.participant_id)  || {}),
+      },
+      projects:    project,
+      brand_name:  brand?.full_name || brand?.email || null,
+      review_text: review?.review_text || null,
+      review_url:  review?.review_url  || null,
+      invoice_url: proof?.file_url     || null,
+    };
+  });
+}
 const buildPayoutExportCsvRows = (payouts = []) => {
   return payouts.map((row) => {
     const profile = row?.profiles || {};
-    const addressParts = [
-      profile.address_line1,
-      profile.address_line2,
-      profile.city,
-      profile.state,
-      profile.pincode,
-      profile.country
-    ].filter(Boolean);
-
     return {
-      payout_batch_id: row.payout_batch_id || null,
-      payout_id: row.id,
-      participant_name: profile.full_name || null,
-      participant_email: profile.email || null,
+      brand_name:          row.brand_name  || null,
+      participant_name:    profile.full_name || null,
+      participant_email:   profile.email || null,
+      project_title:       row?.projects?.title || row?.projects?.name || null,
+      product_name:        row.product_name || null,
+      product_value:       row.product_amount || row.amount || null,
+      review_text:         row.review_text  || null,
+      review_screenshot:   row.review_url   || null,
+      invoice_url:         row.invoice_url  || null,
       account_holder_name: profile.bank_account_name || null,
       bank_account_number: profile.bank_account_number || null,
-      bank_ifsc: profile.bank_ifsc || null,
-      bank_name: profile.bank_name || null,
-      participant_address: addressParts.join(', ') || null,
-      project_title: row?.projects?.title || row?.projects?.name || null,
-      amount: row.amount,
-      status: row.status
+      bank_ifsc:           profile.bank_ifsc || null,
+      bank_name:           profile.bank_name || null,
     };
   });
 };
@@ -3610,9 +3723,7 @@ const exportPayoutCSV = async (req, res, next) => {
 
     const csvData = buildPayoutExportCsvRows(payouts);
     const fields = [
-      'payout_batch_id', 'payout_id', 'participant_name', 'participant_email',
-      'account_holder_name', 'bank_account_number', 'bank_ifsc', 'bank_name',
-      'participant_address', 'project_title', 'amount', 'status'
+      'brand_name', 'participant_name', 'participant_email', 'project_title', 'product_name', 'product_value', 'review_text', 'review_screenshot', 'invoice_url', 'account_holder_name', 'bank_account_number', 'bank_ifsc', 'bank_name'
     ];
     const parser = new Parser({ fields });
     const csv = parser.parse(csvData);
@@ -3681,18 +3792,19 @@ const exportPayoutBatchCSV = async (req, res, next) => {
 
     const csvData = buildPayoutExportCsvRows(payouts);
     const fields = [
-      'payout_batch_id',
-      'payout_id',
+      'brand_name',
       'participant_name',
       'participant_email',
+      'project_title',
+      'product_name',
+      'product_value',
+      'review_text',
+      'review_screenshot',
+      'invoice_url',
       'account_holder_name',
       'bank_account_number',
       'bank_ifsc',
-      'bank_name',
-      'participant_address',
-      'project_title',
-      'amount',
-      'status'
+      'bank_name'
     ];
     const parser = new Parser({ fields });
     const csv = parser.parse(csvData);
@@ -3755,18 +3867,19 @@ const exportPayoutBatchesCSV = async (req, res, next) => {
 
     const csvData = buildPayoutExportCsvRows(payouts);
     const fields = [
-      'payout_batch_id',
-      'payout_id',
+      'brand_name',
       'participant_name',
       'participant_email',
+      'project_title',
+      'product_name',
+      'product_value',
+      'review_text',
+      'review_screenshot',
+      'invoice_url',
       'account_holder_name',
       'bank_account_number',
       'bank_ifsc',
-      'bank_name',
-      'participant_address',
-      'project_title',
-      'amount',
-      'status'
+      'bank_name'
     ];
     const parser = new Parser({ fields });
     const csv = parser.parse(csvData);
