@@ -1,5 +1,7 @@
 const supabase = require('../config/supabaseClient');
 const { calculatePayoutBreakdown } = require('../utils/payout.utils');
+const { sendEmail } = require('../services/email.service');
+const { payoutPaidEmail } = require('../services/email.templates');
 const isMissingSchemaObjectError = (error) => {
   const text = String(error?.message || '').toLowerCase();
   return (
@@ -421,6 +423,78 @@ const markBatchPaid = async (req, res, next) => {
         if (appUpdateError) throw appUpdateError;
       }
     }
+
+    // ── Send "Payout Paid" email to each participant ──────────────
+    if ((payouts || []).length > 0) {
+      try {
+        // Collect all unique participant IDs in this batch
+        const paidParticipantIds = [...new Set((payouts || []).map((r) => r.participant_id).filter(Boolean))];
+
+        // Fetch participant profiles (name + email)
+        const { data: profiles } = await supabase
+          .from('users')
+          .select('id, full_name, email')
+          .in('id', paidParticipantIds);
+        const profileMap = new Map((profiles || []).map((p) => [p.id, p]));
+
+        // Fetch project names for each payout
+        const projectIds = [...new Set((payouts || []).map((r) => r.project_id).filter(Boolean))];
+        const { data: projectRows } = await supabase
+          .from('projects')
+          .select('id, title, name')
+          .in('id', projectIds);
+        const projectMap = new Map((projectRows || []).map((p) => [p.id, p]));
+
+        // Fetch product names for each payout
+        const productIds = [...new Set((payouts || []).map((r) => r.product_id).filter(Boolean))];
+        let productMap = new Map();
+        if (productIds.length) {
+          const { data: productRows } = await supabase
+            .from('project_products')
+            .select('id, name, product_value')
+            .in('id', productIds);
+          productMap = new Map((productRows || []).map((p) => [p.id, p]));
+        }
+
+        // Group payout rows by participant, then send one email per participant
+        const payoutsByParticipant = new Map();
+        for (const row of (payouts || [])) {
+          if (!payoutsByParticipant.has(row.participant_id)) {
+            payoutsByParticipant.set(row.participant_id, []);
+          }
+          payoutsByParticipant.get(row.participant_id).push(row);
+        }
+
+        for (const [participantId, participantPayouts] of payoutsByParticipant) {
+          const profile = profileMap.get(participantId);
+          if (!profile?.email) continue;
+
+          // Build line items for this participant
+          const items = participantPayouts.map((row) => {
+            const project = projectMap.get(row.project_id);
+            const product = productMap.get(row.product_id);
+            return {
+              projectName: project?.title || project?.name || 'Campaign',
+              productName: product?.name || null,
+              amount:      Number(product?.product_value || 0),
+            };
+          });
+
+          const totalAmount = items.reduce((s, i) => s + i.amount, 0);
+          const dashboardUrl = `${process.env.FRONTEND_URL || 'https://nitro.com'}/payouts`;
+
+          await sendEmail({
+            to:      profile.email,
+            subject: '💸 Your Nitro Reimbursement Has Been Processed!',
+            html:    payoutPaidEmail(profile.full_name || 'Participant', items, totalAmount, dashboardUrl),
+          });
+        }
+      } catch (emailErr) {
+        // Email failure must never block the API response
+        console.error('[markBatchPaid] Failed to send payout email:', emailErr);
+      }
+    }
+    // ── End email ──────────────────────────────────────────────────
 
     res.json({
       success: true,

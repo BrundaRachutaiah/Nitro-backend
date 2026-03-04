@@ -505,6 +505,103 @@ const allocationExpiredEmail = ({ name, projectName, reapplyUrl = 'https://nitro
   `);
 
 // ─────────────────────────────────────────────
+// 10. PAYOUT PAID — Reimbursement transferred
+// ─────────────────────────────────────────────
+/**
+ * @param {string} name            - Participant's full name
+ * @param {Array}  items           - [{ projectName, productName, amount }]
+ * @param {number} totalAmount     - Total INR paid
+ * @param {string} dashboardUrl    - Link to participant payout page
+ */
+const payoutPaidEmail = (
+  name,
+  items = [],
+  totalAmount = 0,
+  dashboardUrl = 'https://nitro.com/dashboard'
+) => {
+  const fmt = (n) =>
+    new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(Number(n || 0));
+
+  const itemRows = items
+    .map(
+      ({ projectName, productName, amount }) => `
+        <tr>
+          <td style="padding:10px 16px;font-size:14px;color:#4a5568;border-bottom:1px solid #edf0f7;">
+            <strong style="color:#1a1a2e;">${projectName || 'Campaign'}</strong>
+            ${productName ? `<br/><span style="font-size:12px;color:#9aa3b2;">${productName}</span>` : ''}
+          </td>
+          <td style="padding:10px 16px;font-size:14px;font-weight:700;color:#1a7a4a;
+                     text-align:right;border-bottom:1px solid #edf0f7;white-space:nowrap;">
+            ${fmt(amount)}
+          </td>
+        </tr>`
+    )
+    .join('');
+
+  const itemsTable = items.length
+    ? `
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="background:#f8f9fc;border-radius:8px;border:1px solid #edf0f7;
+                    margin:20px 0;overflow:hidden;">
+        <thead>
+          <tr>
+            <th style="padding:10px 16px;font-size:12px;color:#9aa3b2;font-weight:600;
+                       text-transform:uppercase;letter-spacing:0.5px;text-align:left;
+                       background:#f0f2f5;border-bottom:1px solid #edf0f7;">
+              Campaign / Product
+            </th>
+            <th style="padding:10px 16px;font-size:12px;color:#9aa3b2;font-weight:600;
+                       text-transform:uppercase;letter-spacing:0.5px;text-align:right;
+                       background:#f0f2f5;border-bottom:1px solid #edf0f7;">
+              Amount
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          ${itemRows}
+          <tr>
+            <td style="padding:12px 16px;font-size:14px;font-weight:700;color:#1a1a2e;">
+              Total Reimbursement
+            </td>
+            <td style="padding:12px 16px;font-size:16px;font-weight:800;color:#1a7a4a;text-align:right;">
+              ${fmt(totalAmount)}
+            </td>
+          </tr>
+        </tbody>
+      </table>`
+    : infoBox([{ label: 'Total Reimbursement', value: fmt(totalAmount) }]);
+
+  return wrap(`
+    ${heading('Your Reimbursement Has Been Transferred! 💸')}
+    ${subheading('Great news — your payout is on its way')}
+    ${divider()}
+    ${greeting(name)}
+    ${bodyText(
+      `We're pleased to inform you that your reimbursement has been <strong>approved and processed</strong> by our team. 
+       The amount will be credited to your registered payment account within the next few business days, 
+       depending on your bank's processing time.`
+    )}
+    ${itemsTable}
+    ${bodyText(
+      `You can log in to your Nitro dashboard to view the full details of this payout, including 
+       the campaign breakdown and current transfer status.`
+    )}
+    ${ctaButton('View Payout Details', dashboardUrl)}
+    ${divider()}
+    ${bodyText(
+      `If you do not receive the amount within <strong>5 business days</strong>, or if you have any 
+       questions about this payment, please don't hesitate to contact our support team — we're 
+       happy to help.`
+    )}
+    <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">
+      Thank you for being a valued part of the Nitro community!<br/><br/>
+      Warm regards,<br/>
+      <strong style="color:#1a1a2e;">The Nitro Team</strong>
+    </p>
+  `);
+};
+
+// ─────────────────────────────────────────────
 // Exports
 // ─────────────────────────────────────────────
 module.exports = {
@@ -516,5 +613,6 @@ module.exports = {
   reviewApprovedEmail,
   reviewRejectedEmail,
   allocationReminderEmail,
-  allocationExpiredEmail
+  allocationExpiredEmail,
+  payoutPaidEmail,
 };
