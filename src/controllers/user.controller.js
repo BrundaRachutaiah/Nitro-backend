@@ -9,22 +9,47 @@ const getMyProfile = async (req, res, next) => {
   try {
     const userId = req.user.id;
 
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('id, full_name, email, role, status, created_at')
-      .eq('id', userId)
-      .maybeSingle();
+    // profiles table only has basic fields — bank/address live in participant_details
+    const [profileRes, detailsRes] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('id, full_name, email, role, status, created_at')
+        .eq('id', userId)
+        .maybeSingle(),
+      supabase
+        .from('participant_details')
+        .select('bank_account_number, bank_ifsc, bank_account_name, bank_name, address_line1, address_line2, city, state, pincode, country')
+        .eq('participant_id', userId)
+        .maybeSingle()
+    ]);
 
-    if (!data) {
+    if (profileRes.error) throw profileRes.error;
+
+    const profile = profileRes.data;
+    if (!profile) {
       return res.status(404).json({
         success: false,
         message: 'Profile not found'
       });
     }
 
-    if (error) throw error;
+    // Merge: bank/address come entirely from participant_details
+    const details = detailsRes.data || {};
+    const merged = {
+      ...profile,
+      bank_account_number: details.bank_account_number || null,
+      bank_ifsc:           details.bank_ifsc           || null,
+      bank_account_name:   details.bank_account_name   || null,
+      bank_name:           details.bank_name           || null,
+      address_line1:       details.address_line1       || null,
+      address_line2:       details.address_line2       || null,
+      city:                details.city                || null,
+      state:               details.state               || null,
+      pincode:             details.pincode             || null,
+      country:             details.country             || 'India',
+    };
 
-    res.json({ success: true, data });
+    res.json({ success: true, data: merged });
   } catch (err) {
     next(err);
   }

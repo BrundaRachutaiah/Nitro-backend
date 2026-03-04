@@ -144,14 +144,41 @@ const getPayoutBatches = async (req, res, next) => {
     const participantIds = [...new Set(payoutRows.map((p) => p.participant_id).filter(Boolean))];
     const productIds = [...new Set(payoutRows.map((p) => p.product_id).filter(Boolean))];
 
-    // Fetch profiles
+    // Fetch profiles (basic fields only — bank/address are in participant_details)
     let profileMap = new Map();
     if (participantIds.length) {
-      const { data: profiles } = await supabase
-        .from('profiles')
-        .select('id, full_name, email, bank_account_number, bank_ifsc, address_line1, address_line2, city, state, pincode, country')
-        .in('id', participantIds);
-      for (const p of (profiles || [])) profileMap.set(p.id, p);
+      const [profilesRes, detailsRes] = await Promise.all([
+        supabase
+          .from('profiles')
+          .select('id, full_name, email')
+          .in('id', participantIds),
+        supabase
+          .from('participant_details')
+          .select('participant_id, bank_account_number, bank_account_name, bank_ifsc, bank_name, address_line1, address_line2, city, state, pincode, country')
+          .in('participant_id', participantIds)
+      ]);
+
+      // Build a details map keyed by participant_id
+      const detailsMap = new Map();
+      for (const d of (detailsRes.data || [])) detailsMap.set(d.participant_id, d);
+
+      // Merge profile + details into profileMap
+      for (const p of (profilesRes.data || [])) {
+        const d = detailsMap.get(p.id) || {};
+        profileMap.set(p.id, {
+          ...p,
+          bank_account_number: d.bank_account_number || null,
+          bank_account_name:   d.bank_account_name   || null,
+          bank_ifsc:           d.bank_ifsc           || null,
+          bank_name:           d.bank_name           || null,
+          address_line1:       d.address_line1       || null,
+          address_line2:       d.address_line2       || null,
+          city:                d.city                || null,
+          state:               d.state               || null,
+          pincode:             d.pincode             || null,
+          country:             d.country             || null,
+        });
+      }
     }
 
     // Fetch products
@@ -211,7 +238,9 @@ const getPayoutBatches = async (req, res, next) => {
         full_name: profile.full_name || null,
         email: profile.email || null,
         bank_account_number: profile.bank_account_number || null,
+        bank_account_name: profile.bank_account_name || profile.full_name || null,
         bank_ifsc: profile.bank_ifsc || null,
+        bank_name: profile.bank_name || null,
         address_line1: profile.address_line1 || null,
         address_line2: profile.address_line2 || null,
         city: profile.city || null,

@@ -359,32 +359,51 @@ const savePaymentDetails = async (req, res, next) => {
     const participantId = req.user.id;
     const { address = {}, bankDetails = {} } = req.body;
 
-    const requiredAddress = ['address_line1', 'city', 'state', 'pincode'];
-    const missingAddress = requiredAddress.filter((field) => !hasValue(address?.[field]));
+    // Determine if address fields were actually provided (not just empty strings)
+    const hasAddressData = hasValue(address?.address_line1) || hasValue(address?.city) ||
+                           hasValue(address?.state) || hasValue(address?.pincode);
+
     const requiredBank = ['bank_account_number', 'bank_ifsc'];
     const missingBank = requiredBank.filter((field) => !hasValue(bankDetails?.[field]));
 
-    if (missingAddress.length || missingBank.length) {
+    // If address data is provided, validate it is complete
+    if (hasAddressData) {
+      const requiredAddress = ['address_line1', 'city', 'state', 'pincode'];
+      const missingAddress = requiredAddress.filter((field) => !hasValue(address?.[field]));
+      if (missingAddress.length) {
+        return res.status(400).json({
+          success: false,
+          message: 'Address line 1, city, state, and pincode are all required when providing address details'
+        });
+      }
+    }
+
+    // Bank details are always required
+    if (missingBank.length) {
       return res.status(400).json({
         success: false,
-        message: 'Address line 1, city, state, pincode, bank account number, and IFSC are required'
+        message: 'Bank account number and IFSC code are required'
       });
     }
 
+    // Build payload — only include address fields if they were provided
     const detailsPayload = {
       participant_id: participantId,
-      address_line1: String(address.address_line1 || '').trim(),
-      address_line2: hasValue(address.address_line2) ? String(address.address_line2).trim() : null,
-      city: String(address.city || '').trim(),
-      state: String(address.state || '').trim(),
-      pincode: String(address.pincode || '').trim(),
-      country: hasValue(address.country) ? String(address.country).trim() : 'India',
       bank_account_name: hasValue(bankDetails.bank_account_name) ? String(bankDetails.bank_account_name).trim() : null,
       bank_account_number: String(bankDetails.bank_account_number || '').trim(),
       bank_ifsc: String(bankDetails.bank_ifsc || '').trim().toUpperCase(),
       bank_name: hasValue(bankDetails.bank_name) ? String(bankDetails.bank_name).trim() : null,
       updated_at: new Date().toISOString()
     };
+
+    if (hasAddressData) {
+      detailsPayload.address_line1 = String(address.address_line1 || '').trim();
+      detailsPayload.address_line2 = hasValue(address.address_line2) ? String(address.address_line2).trim() : null;
+      detailsPayload.city    = String(address.city    || '').trim();
+      detailsPayload.state   = String(address.state   || '').trim();
+      detailsPayload.pincode = String(address.pincode || '').trim();
+      detailsPayload.country = hasValue(address.country) ? String(address.country).trim() : 'India';
+    }
 
     const { data, error } = await supabase
       .from('participant_details')
