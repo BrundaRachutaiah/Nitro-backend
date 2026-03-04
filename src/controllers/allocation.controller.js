@@ -114,7 +114,7 @@ const allocateUnit = async (req, res, next) => {
     const [{ data: participant }, { data: projectInfo }] = await Promise.all([
       supabase
         .from('profiles')
-        .select('email')
+        .select('email, full_name')
         .eq('id', application.participant_id)
         .maybeSingle(),
       supabase
@@ -126,10 +126,28 @@ const allocateUnit = async (req, res, next) => {
 
     if (participant?.email) {
       const projectName = projectInfo?.title || projectInfo?.name || 'your project';
+
+      // Fetch the allocated product(s) to show in the email
+      const { data: allocProducts } = application.product_id
+        ? await supabase
+            .from('project_products')
+            .select('id, name, product_url, image_url, product_value')
+            .eq('id', application.product_id)
+        : await supabase
+            .from('project_products')
+            .select('id, name, product_url, image_url, product_value')
+            .eq('project_id', application.project_id)
+            .limit(3);
+
       sendEmail({
         to: participant.email,
-        subject: 'Unit reserved for your Nitro project',
-        html: allocationEmail(projectName, new Date(reservedUntil).toLocaleString())
+        subject: `🛒 Unit Reserved — ${projectName}`,
+        html: allocationEmail(
+          participant.full_name,
+          projectName,
+          reservedUntil,
+          allocProducts || []
+        )
       });
     }
   } catch (err) {

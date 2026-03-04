@@ -260,15 +260,20 @@ const approvePurchaseProof = async (req, res, next) => {
 
     const { data: participant } = await supabase
       .from('profiles')
-      .select('email')
+      .select('email, full_name')
       .eq('id', proof.participant_id)
       .maybeSingle();
+
+    const { data: proofProj } = allocation?.project_id
+      ? await supabase.from('projects').select('title, name').eq('id', allocation.project_id).maybeSingle()
+      : { data: null };
+    const reviewProjName = proofProj?.title || proofProj?.name || null;
 
     if (participant?.email) {
       sendEmail({
         to: participant.email,
-        subject: 'Purchase proof approved',
-        html: purchaseApprovedEmail()
+        subject: '✅ Invoice Approved — Submit Your Review',
+        html: purchaseApprovedEmail(participant.full_name, reviewProjName, [])
       });
     }
 
@@ -343,15 +348,15 @@ const rejectPurchaseProof = async (req, res, next) => {
 
     const { data: participant } = await supabase
       .from('profiles')
-      .select('email')
+      .select('email, full_name')
       .eq('id', data.participant_id)
       .maybeSingle();
 
     if (participant?.email) {
       sendEmail({
         to: participant.email,
-        subject: 'Purchase proof rejected',
-        html: purchaseRejectedEmail()
+        subject: '⚠️ Action Required: Re-upload Your Invoice',
+        html: purchaseRejectedEmail(participant.full_name, null)
       });
     }
   } catch (err) {
@@ -365,4 +370,3 @@ module.exports = {
   approvePurchaseProof,
   rejectPurchaseProof
 };
-

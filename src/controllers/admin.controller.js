@@ -10,7 +10,7 @@ const { logActivity } = require('../services/activityLog.service');
 const { calculatePayoutBreakdown } = require('../utils/payout.utils');
 const {
   approvalEmail,
-  purchaseApprovedEmail
+  rejectionEmail
 } = require('../services/email.templates');
 
 const isMissingSchemaObjectError = (error) => {
@@ -279,7 +279,7 @@ const approveParticipant = async (req, res, next) => {
     if (data?.email) {
       sendEmail({
         to: data.email,
-        subject: 'Nitro account approved',
+        subject: '🎉 Your Nitro Account Has Been Approved',
         html: approvalEmail(data.full_name)
       });
     }
@@ -301,7 +301,7 @@ const rejectParticipant = async (req, res, next) => {
       .eq('id', id)
       .eq('role', 'PARTICIPANT')
       .in('status', ['PENDING', 'APPROVED'])
-      .select()
+      .select('id, full_name, email')
       .maybeSingle();
 
     if (!data) {
@@ -317,6 +317,14 @@ const rejectParticipant = async (req, res, next) => {
       success: true,
       message: 'Participant rejected'
     });
+
+    if (data?.email) {
+      sendEmail({
+        to: data.email,
+        subject: 'Update on Your Nitro Application',
+        html: rejectionEmail(data.full_name)
+      });
+    }
 
     await logActivity({
       actorId: req.user?.id,
@@ -2239,15 +2247,21 @@ const approvePurchaseProof = async (req, res, next) => {
 
     const { data: participant } = await supabase
       .from('profiles')
-      .select('email')
+      .select('email, full_name')
       .eq('id', proofRow.participant_id)
       .maybeSingle();
+
+    const { purchaseApprovedEmail } = require('../services/email.templates');
+    const { data: proofProject } = allocation?.project_id
+      ? await supabase.from('projects').select('title, name').eq('id', allocation.project_id).maybeSingle()
+      : { data: null };
+    const proofProjectName = proofProject?.title || proofProject?.name || null;
 
     if (participant?.email) {
       sendEmail({
         to: participant.email,
-        subject: 'Purchase proof approved',
-        html: purchaseApprovedEmail()
+        subject: '✅ Invoice Approved — Submit Your Review',
+        html: purchaseApprovedEmail(participant.full_name, proofProjectName, [])
       });
     }
 

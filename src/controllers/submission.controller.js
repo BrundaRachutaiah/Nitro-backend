@@ -1,5 +1,9 @@
 const supabase = require('../config/supabaseClient');
 const { sendEmail } = require('../services/email.service');
+const {
+  reviewApprovedEmail,
+  reviewRejectedEmail
+} = require('../services/email.templates');
 const { calculatePayoutBreakdown } = require('../utils/payout.utils');
 const { ALLOCATION_STATUS } = require('../utils/constants');
 
@@ -906,15 +910,20 @@ const approveReview = async (req, res, next) => {
 
     const { data: participant } = await supabase
       .from('profiles')
-      .select('email')
+      .select('email, full_name')
       .eq('id', reviewRow.participant_id)
       .maybeSingle();
+
+    const { data: reviewProject } = reviewRow.project_id
+      ? await supabase.from('projects').select('title, name').eq('id', reviewRow.project_id).maybeSingle()
+      : { data: null };
+    const reviewProjectName = reviewProject?.title || reviewProject?.name || null;
 
     if (participant?.email) {
       sendEmail({
         to: participant.email,
-        subject: 'Review approved',
-        html: '<p>Your review was approved and your payout is now eligible.</p>'
+        subject: '🎊 Review Approved — Your Payout Is Unlocked!',
+        html: reviewApprovedEmail(participant.full_name, reviewProjectName)
       });
     }
   } catch (err) {
@@ -931,7 +940,7 @@ const rejectReview = async (req, res, next) => {
       .update({ status: 'REJECTED' })
       .eq('id', id)
       .eq('status', 'PENDING')
-      .select('id, participant_id')
+      .select('id, participant_id, project_id')
       .maybeSingle();
 
     if (error) throw error;
@@ -949,15 +958,20 @@ const rejectReview = async (req, res, next) => {
 
     const { data: participant } = await supabase
       .from('profiles')
-      .select('email')
+      .select('email, full_name')
       .eq('id', data.participant_id)
       .maybeSingle();
+
+    const { data: rejProject } = data.project_id
+      ? await supabase.from('projects').select('title, name').eq('id', data.project_id).maybeSingle()
+      : { data: null };
+    const rejProjectName = rejProject?.title || rejProject?.name || null;
 
     if (participant?.email) {
       sendEmail({
         to: participant.email,
-        subject: 'Review rejected',
-        html: '<p>Your review was rejected. Please update and resubmit.</p>'
+        subject: '📝 Your Review Needs Revision',
+        html: reviewRejectedEmail(participant.full_name, rejProjectName)
       });
     }
   } catch (err) {

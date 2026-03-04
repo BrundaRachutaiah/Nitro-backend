@@ -132,8 +132,9 @@ const processReminderWindow = async ({ startIso, endIso, hoursLeft }) => {
       if (profile?.email) {
         sendEmail({
           to: profile.email,
-          subject: `Nitro reminder: ${hoursLeft} hours left for your reservation`,
+          subject: `⏰ Only ${hoursLeft} Hours Left to Upload Your Invoice`,
           html: allocationReminderEmail({
+            name: profile.full_name,
             projectName,
             hoursLeft,
             expiryDate: new Date(row.reserved_until).toLocaleString()
@@ -206,8 +207,11 @@ const startAllocationExpiryJob = () => {
             if (profile?.email) {
               sendEmail({
                 to: profile.email,
-                subject: 'Nitro: Your reservation has expired',
-                html: allocationExpiredEmail({ projectName })
+                subject: 'Reservation Expired — Re-apply for Your Project',
+                html: allocationExpiredEmail({
+                  name: profile.full_name,
+                  projectName
+                })
               });
             }
           } catch (err) {
