@@ -10,7 +10,8 @@ const { logActivity } = require('../services/activityLog.service');
 const { calculatePayoutBreakdown } = require('../utils/payout.utils');
 const {
   approvalEmail,
-  rejectionEmail
+  rejectionEmail,
+  productDecisionEmail
 } = require('../services/email.templates');
 
 const isMissingSchemaObjectError = (error) => {
@@ -2022,7 +2023,6 @@ const approveProductApplication = async (req, res, next) => {
     let allocationLookup = await supabase
       .from('unit_allocations')
       .select('id')
-      .eq('project_id', application.project_id)
       .eq('participant_id', application.participant_id)
       .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
       .is('completed_at', null)
@@ -2033,7 +2033,6 @@ const approveProductApplication = async (req, res, next) => {
       allocationLookup = await supabase
         .from('unit_allocations')
         .select('id')
-        .eq('project_id', application.project_id)
         .eq('participant_id', application.participant_id)
         .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
         .limit(1)
@@ -2043,7 +2042,6 @@ const approveProductApplication = async (req, res, next) => {
         allocationLookup = await supabase
           .from('unit_allocations')
           .select('id')
-          .eq('project_id', application.project_id)
           .eq('participant_id', application.participant_id)
           .limit(1)
           .maybeSingle();
@@ -2158,6 +2156,363 @@ const rejectProductApplication = async (req, res, next) => {
       entityId: id,
       message: `Product application ${id} rejected`
     });
+  } catch (err) {
+    next(err);
+  }
+};
+
+const bulkDecideApplications = async (req, res, next) => {
+  try {
+    const rawDecisions = Array.isArray(req.body?.decisions) ? req.body.decisions : [];
+    if (!rawDecisions.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'decisions array is required'
+      });
+    }
+
+    const normalizedDecisions = rawDecisions
+      .map((decision) => ({
+        applicationId: String(decision?.applicationId || '').trim(),
+        action: String(decision?.action || '').trim().toUpperCase()
+      }))
+      .filter((decision) => decision.applicationId);
+
+    if (!normalizedDecisions.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid decisions were provided'
+      });
+    }
+
+    const validActions = new Set(['APPROVE', 'REJECT']);
+    const malformed = normalizedDecisions.filter((d) => !validActions.has(d.action));
+    if (malformed.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'Each decision must include action: APPROVE or REJECT'
+      });
+    }
+
+    const dedupedMap = new Map();
+    normalizedDecisions.forEach((decision) => dedupedMap.set(decision.applicationId, decision));
+    const decisions = Array.from(dedupedMap.values());
+    const applicationIds = decisions.map((d) => d.applicationId);
+
+    const { data: applications, error: applicationsError } = await supabase
+      .from('project_applications')
+      .select('id, participant_id, project_id, product_id, status')
+      .in('id', applicationIds);
+    if (applicationsError) throw applicationsError;
+
+    const appMap = new Map((applications || []).map((row) => [row.id, row]));
+    const productIds = [
+      ...new Set(
+        (applications || [])
+          .map((row) => row.product_id)
+          .filter(Boolean)
+      )
+    ];
+
+    const productMap = new Map();
+    if (productIds.length) {
+      const { data: productRows, error: productError } = await supabase
+        .from('project_products')
+        .select('id, product_value')
+        .in('id', productIds);
+      if (productError && !isMissingSchemaObjectError(productError)) throw productError;
+      (productRows || []).forEach((row) => productMap.set(row.id, row));
+    }
+
+    const successes = [];
+    const failures = [];
+
+    await Promise.all(decisions.map(async (decision) => {
+      const app = appMap.get(decision.applicationId);
+      if (!app) {
+        failures.push({
+          applicationId: decision.applicationId,
+          action: decision.action,
+          reason: 'Application not found'
+        });
+        return;
+      }
+
+      if (String(app.status || '').toUpperCase() !== 'PENDING') {
+        failures.push({
+          applicationId: decision.applicationId,
+          action: decision.action,
+          reason: `Application already processed (${app.status})`
+        });
+        return;
+      }
+
+      const reviewedAt = new Date().toISOString();
+      if (decision.action === 'APPROVE') {
+        const productValue = toAmount(productMap.get(app.product_id)?.product_value);
+        const { data: updated, error: updateError } = await supabase
+          .from('project_applications')
+          .update({
+            status: 'APPROVED',
+            allocated_budget: productValue,
+            reviewed_by: req.user?.id || null,
+            reviewed_at: reviewedAt
+          })
+          .eq('id', app.id)
+          .eq('status', 'PENDING')
+          .select('id, participant_id, project_id, product_id, status')
+          .maybeSingle();
+
+        if (updateError || !updated) {
+          failures.push({
+            applicationId: decision.applicationId,
+            action: decision.action,
+            reason: updateError?.message || 'Failed to approve application'
+          });
+          return;
+        }
+
+        successes.push({
+          applicationId: updated.id,
+          participantId: updated.participant_id,
+          projectId: updated.project_id,
+          productId: updated.product_id,
+          action: decision.action
+        });
+        return;
+      }
+
+      const { data: updated, error: updateError } = await supabase
+        .from('project_applications')
+        .update({
+          status: 'REJECTED',
+          reviewed_by: req.user?.id || null,
+          reviewed_at: reviewedAt
+        })
+        .eq('id', app.id)
+        .eq('status', 'PENDING')
+        .select('id, participant_id, project_id, product_id, status')
+        .maybeSingle();
+
+      if (updateError || !updated) {
+        failures.push({
+          applicationId: decision.applicationId,
+          action: decision.action,
+          reason: updateError?.message || 'Failed to reject application'
+        });
+        return;
+      }
+
+      successes.push({
+        applicationId: updated.id,
+        participantId: updated.participant_id,
+        projectId: updated.project_id,
+        productId: updated.product_id,
+        action: decision.action
+      });
+    }));
+
+    const successfulIds = successes.map((row) => row.applicationId);
+    const successMetaMap = new Map();
+
+    if (successfulIds.length) {
+      const { data: successRows, error: successRowsError } = await supabase
+        .from('project_applications')
+        .select(`
+          id,
+          participant_id,
+          project_id,
+          product_id,
+          status,
+          project_products:project_products(id, name, product_url, product_value, image_url),
+          projects:projects(id, title)
+        `)
+        .in('id', successfulIds);
+      if (successRowsError) throw successRowsError;
+      (successRows || []).forEach((row) => successMetaMap.set(row.id, row));
+    }
+
+    const participantDecisionMap = new Map();
+    for (const item of successes) {
+      const participantId = item.participantId;
+      if (!participantDecisionMap.has(participantId)) {
+        participantDecisionMap.set(participantId, { approved: [], rejected: [] });
+      }
+      const bucket = participantDecisionMap.get(participantId);
+      const meta = successMetaMap.get(item.applicationId) || null;
+      if (item.action === 'APPROVE') bucket.approved.push(meta);
+      if (item.action === 'REJECT') bucket.rejected.push(meta);
+    }
+
+    const participantIds = [...participantDecisionMap.keys()];
+    const participantProfileMap = new Map();
+    if (participantIds.length) {
+      const { data: profiles, error: profilesError } = await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', participantIds);
+      if (profilesError) throw profilesError;
+      (profiles || []).forEach((row) => participantProfileMap.set(row.id, row));
+    }
+
+    const participantErrors = [];
+    const participantAllocationMap = new Map();
+    for (const participantId of participantIds) {
+      const decisionsForParticipant = participantDecisionMap.get(participantId);
+      const approved = decisionsForParticipant?.approved || [];
+      const rejected = decisionsForParticipant?.rejected || [];
+
+      try {
+        let allocationId = null;
+        if (approved.length > 0) {
+          let allocationLookup = await supabase
+            .from('unit_allocations')
+            .select('id')
+            .eq('participant_id', participantId)
+            .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
+            .is('completed_at', null)
+            .limit(1)
+            .maybeSingle();
+
+          if (allocationLookup.error && /completed_at/i.test(String(allocationLookup.error.message || ''))) {
+            allocationLookup = await supabase
+              .from('unit_allocations')
+              .select('id')
+              .eq('participant_id', participantId)
+              .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
+              .limit(1)
+              .maybeSingle();
+          }
+
+          if (allocationLookup.error && /status/i.test(String(allocationLookup.error.message || ''))) {
+            allocationLookup = await supabase
+              .from('unit_allocations')
+              .select('id')
+              .eq('participant_id', participantId)
+              .limit(1)
+              .maybeSingle();
+          }
+
+          if (allocationLookup.error && !isMissingSchemaObjectError(allocationLookup.error)) {
+            throw allocationLookup.error;
+          }
+
+          allocationId = allocationLookup?.data?.id || null;
+          if (!allocationId) {
+            const firstApproved = approved.find(Boolean);
+            const reservedUntil = new Date();
+            reservedUntil.setDate(reservedUntil.getDate() + 20);
+            const { data: createdAllocation, error: createAllocationError } = await supabase
+              .from('unit_allocations')
+              .insert({
+                participant_id: participantId,
+                project_id: firstApproved?.project_id || null,
+                status: ALLOCATION_STATUS.RESERVED,
+                reserved_until: reservedUntil.toISOString()
+              })
+              .select('id')
+              .maybeSingle();
+            if (createAllocationError) throw createAllocationError;
+            allocationId = createdAllocation?.id || null;
+          }
+        }
+
+        participantAllocationMap.set(participantId, allocationId);
+
+        const approvedCount = approved.length;
+        await supabase
+          .from('notifications')
+          .insert({
+            user_id: participantId,
+            type: 'PRODUCT_APPLICATION_APPROVED',
+            title: approvedCount > 0 ? `${approvedCount} product(s) approved!` : 'Product request update',
+            message: approvedCount > 0
+              ? `${approvedCount} product(s) approved. Go to My Tasks to upload your invoice and review.`
+              : `Your product requests have been reviewed. Check your dashboard for details.`
+          });
+
+        const participant = participantProfileMap.get(participantId);
+        if (!participant?.email) continue;
+
+        const approvedProducts = approved
+          .filter(Boolean)
+          .map((app) => ({
+            name: app?.project_products?.name || 'Product',
+            image_url: app?.project_products?.image_url || null,
+            product_url: app?.project_products?.product_url || null,
+            product_value: app?.project_products?.product_value || null,
+            brand: app?.projects?.title || null
+          }));
+
+        const rejectedProducts = rejected
+          .filter(Boolean)
+          .map((app) => ({
+            name: app?.project_products?.name || 'Product',
+            image_url: app?.project_products?.image_url || null,
+            brand: app?.projects?.title || null
+          }));
+
+        const uniqueBrands = new Set(
+          [...approvedProducts, ...rejectedProducts]
+            .map((row) => String(row.brand || '').trim())
+            .filter(Boolean)
+        );
+        const emailProjectTitle = approvedProducts.length > 0 && rejectedProducts.length > 0
+          ? 'Your Product Requests'
+          : uniqueBrands.size > 1
+            ? 'Your Product Requests'
+            : (approvedProducts[0]?.brand || rejectedProducts[0]?.brand || 'Nitro');
+
+        const dashboardUrl = `https://nitro.com/participant/${participantId}/allocation/active`;
+        setImmediate(() => {
+          sendEmail({
+            to: participant.email,
+            subject: approvedProducts.length > 0
+              ? '🎉 Products Approved — Upload Your Invoice Now'
+              : 'Update on Your Product Requests',
+            html: productDecisionEmail(
+              participant.full_name,
+              emailProjectTitle,
+              approvedProducts,
+              rejectedProducts,
+              dashboardUrl
+            )
+          }).catch(() => {});
+        });
+      } catch (participantError) {
+        participantErrors.push({
+          participantId,
+          reason: participantError?.message || 'Failed while processing participant summary'
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Bulk decisions processed',
+      data: {
+        requested: decisions.length,
+        succeeded: successes.length,
+        failed: failures.length,
+        failures,
+        participant_errors: participantErrors,
+        allocations: Array.from(participantAllocationMap.entries()).map(([participantId, allocationId]) => ({
+          participantId,
+          allocationId
+        }))
+      }
+    });
+
+    if (successes.length) {
+      await logActivity({
+        actorId: req.user?.id,
+        actorRole: req.user?.role,
+        action: 'PRODUCT_APPLICATIONS_BULK_DECIDED',
+        entityType: 'PROJECT_APPLICATION',
+        entityId: `bulk:${successes.length}`,
+        message: `Bulk-decided ${successes.length} application(s); ${failures.length} failed`
+      });
+    }
   } catch (err) {
     next(err);
   }
@@ -4398,6 +4753,7 @@ module.exports = {
   getPendingProductApplications,
   approveProductApplication,
   rejectProductApplication,
+  bulkDecideApplications,
   approvePurchaseProof,
   generatePayoutBatch,
   getEligiblePayouts,

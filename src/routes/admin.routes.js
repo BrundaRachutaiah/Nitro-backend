@@ -148,6 +148,13 @@ router.patch(
   adminController.rejectProductApplication
 );
 
+router.post(
+  '/applications/bulk-decide',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  adminController.bulkDecideApplications
+);
+
 router.get(
   '/search',
   authMiddleware,

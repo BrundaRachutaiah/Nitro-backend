@@ -886,6 +886,7 @@ const productDecisionEmail = (
                            background:#27ae60;flex-shrink:0;"></span>
               <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">${p.name}</p>
             </div>
+            <p style="margin:0 0 4px;font-size:12px;color:#6c8f72;">${p.brand || ''}</p>
             ${p.product_value
               ? `<p style="margin:0 0 10px 16px;font-size:13px;color:#6c8f72;">
                    Value: <strong>₹${Number(p.product_value).toLocaleString('en-IN')}</strong>
@@ -934,6 +935,7 @@ const productDecisionEmail = (
                            background:#e74c3c;flex-shrink:0;"></span>
               <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">${p.name}</p>
             </div>
+            <p style="margin:0 0 4px;font-size:12px;color:#6c8f72;">${p.brand || ''}</p>
             <div style="margin-left:16px;">
               <span style="display:inline-block;padding:4px 12px;border-radius:20px;
                            font-size:11px;font-weight:700;letter-spacing:0.5px;
