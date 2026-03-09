@@ -2056,7 +2056,7 @@ const approveProductApplication = async (req, res, next) => {
 
     if (!existingAllocation) {
       const reservedUntil = new Date();
-      reservedUntil.setDate(reservedUntil.getDate() + 5);
+      reservedUntil.setDate(reservedUntil.getDate() + 20);
 
       const { error: allocationError } = await supabase
         .from('unit_allocations')

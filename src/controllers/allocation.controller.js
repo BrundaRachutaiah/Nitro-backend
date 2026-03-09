@@ -373,29 +373,33 @@ const getMyAllocationTracking = async (req, res, next) => {
             .in('project_id', projectIds)
             .order('created_at', { ascending: false })
         : Promise.resolve({ data: [], error: null }),
-      projectIds.length
-        ? supabase
-            .from('project_applications')
-            .select(
-              `
-              id,
-              project_id,
-              product_id,
-              allocated_budget,
-              status,
-              project_products (
-                id,
-                name,
-                product_value,
-                product_url
-              )
-            `
-            )
-            .eq('participant_id', participantId)
-            .in('project_id', projectIds)
-            .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
-            .order('created_at', { ascending: false })
-        : Promise.resolve({ data: [], error: null })
+      // FIX: Fetch ALL approved applications for this participant across ALL brands/projects.
+      // Do NOT filter by project_id — one allocation now covers products from multiple brands.
+      supabase
+        .from('project_applications')
+        .select(
+          `
+          id,
+          project_id,
+          product_id,
+          allocated_budget,
+          status,
+          projects (
+            id,
+            title,
+            name
+          ),
+          project_products (
+            id,
+            name,
+            product_value,
+            product_url
+          )
+        `
+        )
+        .eq('participant_id', participantId)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('created_at', { ascending: false })
     ]);
 
     let proofRows = (proofsRes.data || []).map((item) => ({
@@ -487,15 +491,13 @@ const getMyAllocationTracking = async (req, res, next) => {
     if (applicationsRes.error) {
       if (!isMissingSchemaObjectError(applicationsRes.error)) throw applicationsRes.error;
 
-      const fallbackApps = projectIds.length
-        ? await supabase
-            .from('project_applications')
-            .select('id, project_id, product_id, allocated_budget, status')
-            .eq('participant_id', participantId)
-            .in('project_id', projectIds)
-            .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
-            .order('created_at', { ascending: false })
-        : { data: [], error: null };
+      // FIX: No project_id filter — get ALL approved apps for participant across all brands
+      const fallbackApps = await supabase
+        .from('project_applications')
+        .select('id, project_id, product_id, allocated_budget, status')
+        .eq('participant_id', participantId)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('created_at', { ascending: false });
 
       if (fallbackApps.error && !isMissingSchemaObjectError(fallbackApps.error)) {
         throw fallbackApps.error;
@@ -583,14 +585,19 @@ const getMyAllocationTracking = async (req, res, next) => {
       }
     }
 
-    const applicationsByProjectId = new Map();
+    // FIX: ONE allocation covers ALL approved products across ALL brands.
+    // Deduplicate by product_id (keep latest per product), then attach ALL to the single allocation.
+    const deduplicatedByProduct = new Map();
     for (const item of approvedApplications) {
-      if (!item?.project_id) continue;
-      if (!applicationsByProjectId.has(item.project_id)) {
-        applicationsByProjectId.set(item.project_id, []);
+      const productKey = String(item?.product_id || '');
+      if (!productKey) continue;
+      if (!deduplicatedByProduct.has(productKey)) {
+        deduplicatedByProduct.set(productKey, item);
       }
-      applicationsByProjectId.get(item.project_id).push(item);
     }
+    const allApprovedProducts = deduplicatedByProduct.size
+      ? Array.from(deduplicatedByProduct.values())
+      : approvedApplications;
 
     const rows = allocations.map((allocation) => {
       const proof = proofsByAllocation.get(allocation.id) || null;
@@ -599,27 +606,15 @@ const getMyAllocationTracking = async (req, res, next) => {
       const payout = (proof?.id && payoutsByProofId.get(proof.id))
         || payoutsByProjectId.get(allocation.project_id)
         || null;
-      const projectApplications = applicationsByProjectId.get(allocation.project_id) || [];
-      const primaryApplication = projectApplications[0] || null;
-      const latestApplicationByProduct = new Map();
-      for (const item of projectApplications) {
-        const productKey = String(item?.product_id || '');
-        if (!productKey) continue;
-        if (!latestApplicationByProduct.has(productKey)) {
-          latestApplicationByProduct.set(productKey, item);
-        }
-      }
-      const normalizedProjectApplications = latestApplicationByProduct.size
-        ? Array.from(latestApplicationByProduct.values())
-        : projectApplications;
 
-      const selectedProducts = normalizedProjectApplications.map((item) => ({
+      const selectedProducts = allApprovedProducts.map((item) => ({
         ...(item || {}),
         application_id: item?.id || null,
         product_id: item?.product_id || null,
         product_name: item?.project_products?.name || null,
         product_url: item?.project_products?.product_url || null,
         product_value: Number(item?.project_products?.product_value || 0),
+        project_title: item?.projects?.title || item?.projects?.name || null,
         application_status: String(item?.status || '').toUpperCase(),
         purchase_proof: proofsByAllocationProduct.get(
           buildAllocationProductKey(allocation.id, item?.product_id)
@@ -642,7 +637,7 @@ const getMyAllocationTracking = async (req, res, next) => {
 
       return {
         ...allocation,
-        selected_product: primaryApplication?.project_products || null,
+        selected_product: allApprovedProducts[0]?.project_products || null,
         selected_products: selectedProducts,
         purchase_proof: proof,
         review_submission: review,
@@ -945,7 +940,9 @@ const cancelAllocation = async (req, res, next) => {
     try {
       const nowIso = new Date().toISOString();
 
-      // Try with eligibility_notes; fall back without it if column missing
+      // FIX: ONE allocation covers products from ALL brands/projects.
+      // Reject ALL approved applications for this participant across ALL project_ids,
+      // not just allocation.project_id (which was only one brand).
       let rejectedApps = null;
       let appRes = await supabase
         .from('project_applications')
@@ -955,7 +952,6 @@ const cancelAllocation = async (req, res, next) => {
           eligibility_notes: 'Automatically rejected — participant cancelled their reservation.'
         })
         .eq('participant_id', participantId)
-        .eq('project_id',     allocation.project_id)
         .in('status',         ['APPROVED', 'PURCHASED'])
         .select('id, product_id, allocated_budget');
 
@@ -964,7 +960,6 @@ const cancelAllocation = async (req, res, next) => {
           .from('project_applications')
           .update({ status: 'REJECTED', reviewed_at: nowIso })
           .eq('participant_id', participantId)
-          .eq('project_id',     allocation.project_id)
           .in('status',         ['APPROVED', 'PURCHASED'])
           .select('id, product_id, allocated_budget');
       }

@@ -14,13 +14,15 @@ const isMissingSchemaObjectError = (error) => {
   );
 };
 
-const productBelongsToParticipantAllocation = async ({ participantId, projectId, productId }) => {
-  if (!projectId || !productId) return false;
+const productBelongsToParticipantAllocation = async ({ participantId, productId }) => {
+  // FIX: ONE allocation covers products from ALL brands/projects.
+  // Do NOT filter by project_id — a Veda & Co product belongs to the same
+  // participant allocation even though its project_id differs from the allocation's project_id.
+  if (!productId) return false;
   const { data, error } = await supabase
     .from('project_applications')
     .select('id')
     .eq('participant_id', participantId)
-    .eq('project_id', projectId)
     .eq('product_id', productId)
     .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
     .limit(1)
@@ -69,7 +71,6 @@ const uploadPurchaseProof = async (req, res, next) => {
     if (productId) {
       const belongs = await productBelongsToParticipantAllocation({
         participantId,
-        projectId: allocation.project_id,
         productId
       });
       if (!belongs) {

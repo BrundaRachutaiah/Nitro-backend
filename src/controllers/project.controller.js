@@ -503,33 +503,27 @@ const getAppliedProjects = async (req, res, next) => {
     const rows = data || [];
     const projectIds = [...new Set(rows.map((row) => row?.project_id).filter(Boolean))];
 
+    // FIX: ONE allocation per participant covers ALL brands/projects.
+    // Fetch by participant_id only — ALWAYS prefer RESERVED/PURCHASED over CANCELLED.
+    // NOTE: unit_allocations does NOT have a created_at column — order by reserved_until.
     let allocationRows = [];
-    if (projectIds.length > 0) {
+    {
+      // Step 1: Look for an active (RESERVED or PURCHASED) allocation first
       let allocationRes = await supabase
         .from('unit_allocations')
-        .select('id, project_id, status, reserved_until, created_at')
+        .select('id, project_id, status, reserved_until')
         .eq('participant_id', participantId)
-        .in('project_id', projectIds)
-        .is('completed_at', null)
-        .order('created_at', { ascending: false });
-
-      if (allocationRes.error && /completed_at/i.test(String(allocationRes.error.message || ''))) {
-        allocationRes = await supabase
-          .from('unit_allocations')
-          .select('id, project_id, status, reserved_until, created_at')
-          .eq('participant_id', participantId)
-          .in('project_id', projectIds)
-          .neq('status', 'COMPLETED')
-          .order('reserved_until', { ascending: false });
-      }
+        .in('status', ['RESERVED', 'PURCHASED'])
+        .order('reserved_until', { ascending: false })
+        .limit(1);
 
       if (allocationRes.error && /status/i.test(String(allocationRes.error.message || ''))) {
         allocationRes = await supabase
           .from('unit_allocations')
-          .select('id, project_id, status, reserved_until, created_at')
+          .select('id, project_id, status, reserved_until')
           .eq('participant_id', participantId)
-          .in('project_id', projectIds)
-          .order('created_at', { ascending: false });
+          .order('reserved_until', { ascending: false })
+          .limit(1);
       }
 
       if (allocationRes.error && isMissingTableOrColumn(allocationRes.error)) {
@@ -537,48 +531,46 @@ const getAppliedProjects = async (req, res, next) => {
           .from('unit_allocations')
           .select('id, project_id, status, reserved_until')
           .eq('participant_id', participantId)
-          .in('project_id', projectIds)
-          .order('reserved_until', { ascending: false });
+          .limit(1);
       }
 
       if (allocationRes.error && !isMissingTableOrColumn(allocationRes.error)) {
         throw allocationRes.error;
       }
 
-      allocationRows = (allocationRes.data || []).map((row) => ({
-        ...row,
-        created_at: row.created_at || null
-      }));
+      allocationRows = allocationRes.data || [];
+
+      // Step 2: If no active allocation found, check for a CANCELLED one
+      // so the frontend knows the allocation was cancelled (not missing)
+      if (!allocationRows.length) {
+        try {
+          const cancelledRes = await supabase
+            .from('unit_allocations')
+            .select('id, project_id, status, reserved_until')
+            .eq('participant_id', participantId)
+            .eq('status', 'CANCELLED')
+            .order('reserved_until', { ascending: false })
+            .limit(1);
+
+          if (!cancelledRes.error && cancelledRes.data?.length) {
+            allocationRows = cancelledRes.data;
+          }
+        } catch { /* non-critical fallback */ }
+      }
     }
 
-    const latestAllocationByProject = new Map();
-    const latestActiveAllocationByProject = new Map();
-    for (const allocation of allocationRows) {
-      if (!latestAllocationByProject.has(allocation.project_id)) {
-        latestAllocationByProject.set(allocation.project_id, allocation);
-      }
-      const allocationStatus = String(allocation?.status || '').toUpperCase();
-      if (
-        ['RESERVED', 'PURCHASED'].includes(allocationStatus)
-        && !latestActiveAllocationByProject.has(allocation.project_id)
-      ) {
-        latestActiveAllocationByProject.set(allocation.project_id, allocation);
-      }
-    }
+    // Single allocation for all products — attach to every row
+    const singleAllocation = allocationRows[0] || null;
 
+    // FIX: Same single allocation attached to every approved product row regardless of project_id
     const enriched = rows.map((row) => {
-      const appStatus = String(row?.status || '').toUpperCase();
-      const prefersActive = ['APPROVED', 'PURCHASED'].includes(appStatus);
-      const allocation = prefersActive
-        ? (latestActiveAllocationByProject.get(row.project_id) || latestAllocationByProject.get(row.project_id) || null)
-        : (latestAllocationByProject.get(row.project_id) || null);
       return {
         ...row,
-        allocation: allocation
+        allocation: singleAllocation
           ? {
-              id: allocation.id,
-              status: allocation.status || null,
-              reserved_until: allocation.reserved_until || null
+              id: singleAllocation.id,
+              status: singleAllocation.status || null,
+              reserved_until: singleAllocation.reserved_until || null
             }
           : null
       };
