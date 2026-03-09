@@ -552,14 +552,26 @@ const getAppliedProjects = async (req, res, next) => {
     }
 
     const latestAllocationByProject = new Map();
+    const latestActiveAllocationByProject = new Map();
     for (const allocation of allocationRows) {
       if (!latestAllocationByProject.has(allocation.project_id)) {
         latestAllocationByProject.set(allocation.project_id, allocation);
       }
+      const allocationStatus = String(allocation?.status || '').toUpperCase();
+      if (
+        ['RESERVED', 'PURCHASED'].includes(allocationStatus)
+        && !latestActiveAllocationByProject.has(allocation.project_id)
+      ) {
+        latestActiveAllocationByProject.set(allocation.project_id, allocation);
+      }
     }
 
     const enriched = rows.map((row) => {
-      const allocation = latestAllocationByProject.get(row.project_id) || null;
+      const appStatus = String(row?.status || '').toUpperCase();
+      const prefersActive = ['APPROVED', 'PURCHASED'].includes(appStatus);
+      const allocation = prefersActive
+        ? (latestActiveAllocationByProject.get(row.project_id) || latestAllocationByProject.get(row.project_id) || null)
+        : (latestAllocationByProject.get(row.project_id) || null);
       return {
         ...row,
         allocation: allocation

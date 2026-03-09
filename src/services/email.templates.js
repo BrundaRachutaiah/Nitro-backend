@@ -440,69 +440,314 @@ const reviewRejectedEmail = (name, projectName, reason = '', resubmitUrl = 'http
 // ─────────────────────────────────────────────
 // 8. ALLOCATION REMINDER — Expiry approaching
 // ─────────────────────────────────────────────
-const allocationReminderEmail = ({ name, projectName, hoursLeft, expiryDate, dashboardUrl = 'https://nitro.com/dashboard' }) =>
-  wrap(`
-    ${heading(`Reminder: ${hoursLeft} Hours Left ⏰`)}
-    ${subheading('Your product reservation is about to expire — act now!')}
+/**
+ * @param {string}  name          - Participant name
+ * @param {string}  projectName   - Project / brand name
+ * @param {number}  dayNumber     - Which reminder day (10, 15, 18, 19)
+ * @param {number}  daysLeft      - Days remaining until expiry
+ * @param {string}  expiryDate    - ISO expiry timestamp
+ * @param {Array}   products      - [{ name, image_url, product_url, product_value }]
+ * @param {string}  dashboardUrl  - CTA link
+ */
+const allocationReminderEmail = ({
+  name,
+  projectName,
+  dayNumber,
+  daysLeft,
+  expiryDate,
+  products = [],
+  dashboardUrl = 'https://nitro.com/dashboard'
+}) => {
+  // ── Urgency config per reminder day ──────────────────────────────────────
+  const isLastWarning = dayNumber === 19;
+  const isCritical    = dayNumber === 18 || dayNumber === 19;
+
+  const headingText = isLastWarning
+    ? '🚨 Final Warning: 1 Day Left!'
+    : isCritical
+    ? `⚠️ ${daysLeft} Day${daysLeft === 1 ? '' : 's'} Left — Action Required`
+    : `⏰ Reminder: ${daysLeft} Days Remaining`;
+
+  const subText = isLastWarning
+    ? `Your reservation will be <strong>cancelled tomorrow</strong> if no invoice is submitted`
+    : isCritical
+    ? `Critical deadline approaching for <strong>${projectName}</strong>`
+    : `Your product reservation for <strong>${projectName}</strong> needs attention`;
+
+  const urgencyMessage = isLastWarning
+    ? `<strong style="color:#c0392b;">This is your final notice.</strong> Your reservation for <strong>${projectName}</strong> expires in less than 24 hours. If a valid purchase invoice is not uploaded by the deadline, your slot will be <strong>permanently cancelled</strong> and the budget will be reallocated to another participant. This action cannot be undone.`
+    : isCritical
+    ? `Your time is running short. Your reserved slot for <strong>${projectName}</strong> expires in just <strong>${daysLeft} day${daysLeft === 1 ? '' : 's'}</strong>. Please upload your purchase invoice immediately to secure your participation and avoid losing this opportunity.`
+    : `This is a scheduled reminder that your reserved product slot for <strong>${projectName}</strong> will expire in <strong>${daysLeft} day${daysLeft === 1 ? '' : 's'}</strong>. To keep your allocation active, please purchase your assigned product and upload the invoice before the deadline shown below.`;
+
+  // ── Progress bar (visual day indicator out of 20) ─────────────────────────
+  const progressPct   = Math.round((dayNumber / 20) * 100);
+  const barColor      = dayNumber >= 19 ? '#c0392b' : dayNumber >= 18 ? '#e74c3c' : dayNumber >= 15 ? '#e67e22' : '#f39c12';
+  const progressBar   = `
+    <div style="margin:20px 0;">
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+        <span style="font-size:12px;color:#9aa3b2;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">
+          Day ${dayNumber} of 20
+        </span>
+        <span style="font-size:12px;font-weight:700;color:${barColor};">
+          ${daysLeft} day${daysLeft === 1 ? '' : 's'} left
+        </span>
+      </div>
+      <div style="background:#edf0f7;border-radius:20px;height:8px;overflow:hidden;">
+        <div style="background:${barColor};height:8px;border-radius:20px;width:${progressPct}%;
+                    transition:width 0.3s ease;"></div>
+      </div>
+    </div>`;
+
+  // ── Product cards with purchase links ─────────────────────────────────────
+  const productCards = products.length ? `
+    <p style="margin:28px 0 12px;font-size:15px;font-weight:700;color:#1a1a2e;">
+      Your Reserved Product${products.length > 1 ? 's' : ''}:
+    </p>
+    ${products.map((p) => `
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="border:1.5px solid #edf0f7;border-radius:12px;overflow:hidden;
+                    margin-bottom:14px;background:#ffffff;">
+        <tr>
+          ${p.image_url
+            ? `<td width="110" style="padding:16px 12px 16px 16px;vertical-align:middle;">
+                 <img src="${p.image_url}" width="82" height="82" alt="${p.name}"
+                      style="border-radius:8px;object-fit:cover;display:block;border:1px solid #edf0f7;" />
+               </td>`
+            : ''}
+          <td style="padding:16px;vertical-align:middle;">
+            <p style="margin:0 0 4px;font-size:15px;font-weight:700;color:#1a1a2e;">${p.name}</p>
+            ${p.product_value
+              ? `<p style="margin:0 0 10px;font-size:13px;color:#9aa3b2;">
+                   Value: <strong style="color:#1a1a2e;">₹${Number(p.product_value).toLocaleString('en-IN')}</strong>
+                 </p>`
+              : ''}
+            ${p.product_url
+              ? `<a href="${p.product_url}" target="_blank"
+                    style="display:inline-block;padding:8px 20px;font-size:13px;font-weight:700;
+                           color:#ffffff;background:linear-gradient(135deg,#e94560,#c0392b);
+                           border-radius:6px;text-decoration:none;letter-spacing:0.3px;">
+                   🛒 Purchase Now →
+                 </a>`
+              : ''}
+          </td>
+        </tr>
+      </table>`).join('')}` : '';
+
+  // ── What happens if you miss the deadline ─────────────────────────────────
+  const consequenceBox = isLastWarning ? `
+    <div style="background:#fff0f0;border:1.5px solid #e74c3c;border-radius:10px;
+                padding:18px 20px;margin:24px 0;">
+      <p style="margin:0 0 8px;font-size:14px;font-weight:700;color:#c0392b;">
+        ⛔ What happens if you miss the deadline:
+      </p>
+      <ul style="margin:0;padding-left:18px;">
+        <li style="font-size:14px;line-height:1.8;color:#922b21;">Your reservation will be permanently cancelled</li>
+        <li style="font-size:14px;line-height:1.8;color:#922b21;">The reserved budget will be released back to the project pool</li>
+        <li style="font-size:14px;line-height:1.8;color:#922b21;">Another participant may be approved in your place</li>
+      </ul>
+    </div>` : '';
+
+  return wrap(`
+    ${heading(headingText)}
+    <p style="margin:0 0 24px;font-size:15px;color:#9aa3b2;font-weight:400;">${subText}</p>
     ${divider()}
     ${greeting(name)}
-    ${bodyText(
-      `This is a friendly reminder that your reserved slot for <strong>${projectName}</strong> 
-       will <strong>expire in ${hoursLeft} hours</strong>. To keep your allocation active, 
-       please upload your purchase proof before the deadline below.`
-    )}
+    ${bodyText(urgencyMessage)}
+    ${progressBar}
     ${infoBox([
-      { label: 'Project', value: projectName },
-      { label: 'Expires At', value: new Date(expiryDate).toLocaleString('en-IN', { dateStyle: 'long', timeStyle: 'short' }) },
-      { label: 'Time Remaining', value: `⚠️ ${hoursLeft} hours` }
+      { label: 'Project',     value: projectName },
+      { label: 'Deadline',    value: new Date(expiryDate).toLocaleString('en-IN', { dateStyle: 'long', timeStyle: 'short' }) },
+      { label: 'Days Left',   value: `${isLastWarning ? '🚨' : isCritical ? '⚠️' : '📅'} ${daysLeft} day${daysLeft === 1 ? '' : 's'} remaining` }
     ])}
-    ${bodyText(
-      `Once the deadline passes, your slot will be automatically released and made available 
-       to other participants. Don't miss out — upload your proof right away!`
-    )}
+    ${productCards}
+    ${consequenceBox}
     ${ctaButton('Upload Invoice Now', dashboardUrl)}
     ${divider()}
     ${bodyText(
-      `If you've already uploaded your proof, you can safely ignore this reminder. 
-       For any concerns, please contact our support team immediately.`
+      `If you have already uploaded your purchase proof, kindly disregard this reminder — your submission is being reviewed. For any concerns or technical difficulties, please reach out to our support team at your earliest convenience.`
     )}
-    <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">Urgently yours,<br/>
+    <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">
+      ${isLastWarning ? 'Time is critical,' : 'Warm regards,'}<br/>
       <strong style="color:#1a1a2e;">The Nitro Team</strong>
     </p>
   `);
+};
 
 // ─────────────────────────────────────────────
 // 9. ALLOCATION EXPIRED
 // ─────────────────────────────────────────────
-const allocationExpiredEmail = ({ name, projectName, reapplyUrl = 'https://nitro.com/projects' }) =>
-  wrap(`
-    ${heading('Reservation Expired')}
-    ${subheading(`Your slot for ${projectName} has been released`)}
+/**
+ * @param {string} name         - Participant name
+ * @param {string} projectName  - Project / brand name
+ * @param {Array}  products     - [{ name, image_url, product_value }]
+ * @param {string} reapplyUrl   - Explore projects CTA
+ */
+const allocationExpiredEmail = ({ name, projectName, products = [], reapplyUrl = 'https://nitro.com/projects' }) => {
+  const productList = products.length ? `
+    <p style="margin:24px 0 12px;font-size:15px;font-weight:700;color:#1a1a2e;">
+      Cancelled Product${products.length > 1 ? 's' : ''}:
+    </p>
+    ${products.map((p) => `
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="border:1.5px solid #f5c6cb;border-radius:10px;overflow:hidden;
+                    margin-bottom:12px;background:#fff5f6;opacity:0.9;">
+        <tr>
+          ${p.image_url
+            ? `<td width="90" style="padding:14px 10px 14px 14px;vertical-align:middle;">
+                 <img src="${p.image_url}" width="62" height="62" alt="${p.name}"
+                      style="border-radius:6px;object-fit:cover;display:block;
+                             filter:grayscale(40%);border:1px solid #f5c6cb;" />
+               </td>`
+            : ''}
+          <td style="padding:14px;vertical-align:middle;">
+            <p style="margin:0 0 6px;font-size:14px;font-weight:700;color:#1a1a2e;">${p.name}</p>
+            ${p.product_value
+              ? `<p style="margin:0 0 8px;font-size:12px;color:#9aa3b2;">
+                   Value: ₹${Number(p.product_value).toLocaleString('en-IN')}
+                 </p>`
+              : ''}
+            <span style="display:inline-block;padding:3px 12px;border-radius:20px;
+                         font-size:11px;font-weight:700;letter-spacing:0.5px;
+                         text-transform:uppercase;background:#f8d7da;color:#c0392b;">
+              ✕ Reservation Cancelled
+            </span>
+          </td>
+        </tr>
+      </table>`).join('')}` : '';
+
+  return wrap(`
+    ${heading('Reservation Cancelled ❌')}
+    ${subheading(`Your product slot for ${projectName} has been released`)}
     ${divider()}
     ${greeting(name)}
     ${bodyText(
-      `Unfortunately, the purchase proof deadline for your reservation on <strong>${projectName}</strong> 
-       has passed without a submission. As a result, your allocated slot has been <strong>released</strong> 
-       back to the participant pool.`
+      `We regret to inform you that your product reservation for <strong>${projectName}</strong> has been 
+       <strong>automatically cancelled</strong> because the 20-day invoice submission window has elapsed 
+       without a valid purchase proof being uploaded. Your allocated slot has been released back to the 
+       project pool.`
     )}
     ${infoBox([
       { label: 'Project', value: projectName },
-      { label: 'Status', value: '❌ Reservation Expired' }
+      { label: 'Status',  value: '❌ Reservation Cancelled' },
+      { label: 'Reason',  value: 'Invoice not submitted within the 20-day deadline' }
     ])}
+    ${productList}
     ${bodyText(
-      `Not all hope is lost! If you're still interested in participating, you're welcome to 
-       re-apply for this project or explore other available opportunities on the platform.`
+      `While we understand this may be disappointing, the deadline policy ensures fair access for all 
+       participants. If you experienced a technical issue that prevented your submission, please reach 
+       out to our support team and we will review your case personally.`
     )}
     ${ctaButton('Explore Open Projects', reapplyUrl)}
     ${divider()}
     ${bodyText(
-      `We hope to see you back soon. If you had trouble uploading your proof due to a technical issue, 
-       please reach out to our support team and we'll do our best to assist you.`
+      `We hope to see you participate in future projects. There are always new opportunities available 
+       on the platform — keep an eye on your dashboard for upcoming campaigns.`
     )}
     <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">Regards,<br/>
       <strong style="color:#1a1a2e;">The Nitro Team</strong>
     </p>
   `);
+};
+
+// ─────────────────────────────────────────────
+// 9b. ADMIN — Budget Restored Notification
+// ─────────────────────────────────────────────
+/**
+ * @param {string} adminName      - Admin's name
+ * @param {string} projectName    - Project / brand name
+ * @param {string} projectId      - Project ID
+ * @param {Array}  expiredSlots   - [{ participantName, participantEmail, products: [{ name, product_value }] }]
+ * @param {number} restoredAmount - Total INR restored to the project budget
+ * @param {string} dashboardUrl   - Admin approvals page link
+ */
+const adminBudgetRestoredEmail = ({
+  adminName,
+  projectName,
+  projectId,
+  expiredSlots = [],
+  restoredAmount = 0,
+  dashboardUrl = 'https://nitro.com/admin/product-applications'
+}) => {
+  const fmt = (n) =>
+    new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(Number(n || 0));
+
+  const slotRows = expiredSlots.map((slot) => {
+    const productLines = (slot.products || []).map((p) => `
+      <div style="padding:6px 0;border-bottom:1px solid #edf0f7;">
+        <span style="font-size:13px;color:#1a1a2e;font-weight:600;">${p.name}</span>
+        ${p.product_value
+          ? `<span style="font-size:12px;color:#9aa3b2;margin-left:8px;">₹${Number(p.product_value).toLocaleString('en-IN')}</span>`
+          : ''}
+      </div>`).join('');
+
+    return `
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="border:1px solid #edf0f7;border-radius:10px;overflow:hidden;
+                    margin-bottom:14px;background:#f8f9fc;">
+        <tr>
+          <td style="padding:14px 16px;">
+            <p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#1a1a2e;">
+              ${slot.participantName || 'Participant'}
+            </p>
+            <p style="margin:0 0 10px;font-size:12px;color:#9aa3b2;">${slot.participantEmail || ''}</p>
+            ${productLines}
+            <div style="margin-top:10px;">
+              <span style="display:inline-block;padding:3px 12px;border-radius:20px;
+                           font-size:11px;font-weight:700;letter-spacing:0.5px;
+                           text-transform:uppercase;background:#fdecea;color:#c0392b;">
+                ✕ Slot Released
+              </span>
+              ${slot.slotAmount
+                ? `<span style="display:inline-block;margin-left:8px;padding:3px 12px;border-radius:20px;
+                               font-size:11px;font-weight:700;background:#eafaf1;color:#27ae60;">
+                     +${fmt(slot.slotAmount)} restored
+                   </span>`
+                : ''}
+            </div>
+          </td>
+        </tr>
+      </table>`;
+  }).join('');
+
+  return wrap(`
+    ${heading('Budget Restored — New Slots Available 💰')}
+    ${subheading(`Project: ${projectName}`)}
+    ${divider()}
+    ${greeting(adminName)}
+    ${bodyText(
+      `This is an automated notification to inform you that <strong>${expiredSlots.length} participant reservation${expiredSlots.length > 1 ? 's' : ''}</strong> 
+       for the <strong>${projectName}</strong> project have expired due to non-submission of purchase invoices within the 20-day deadline.`
+    )}
+    ${bodyText(
+      `As a result, the associated product budget has been <strong>automatically released back</strong> to the project pool. 
+       You may now review pending applications and approve new participants to fill these vacated slots.`
+    )}
+    ${infoBox([
+      { label: 'Project',          value: projectName },
+      { label: 'Expired Slots',    value: `${expiredSlots.length} reservation${expiredSlots.length > 1 ? 's' : ''}` },
+      { label: 'Budget Restored',  value: `✅ ${fmt(restoredAmount)} released` }
+    ])}
+    <p style="margin:28px 0 12px;font-size:15px;font-weight:700;color:#1a1a2e;">
+      Released Participant Slots:
+    </p>
+    ${slotRows}
+    ${bodyText(
+      `The freed-up budget is now available for new allocations. Head to the approvals dashboard to review 
+       any pending product applications and assign these slots to eligible participants.`
+    )}
+    ${ctaButton('Review Pending Applications', dashboardUrl)}
+    ${divider()}
+    ${bodyText(
+      `This message was generated automatically by the Nitro allocation system. No action is required unless 
+       you wish to reassign the released budget to new participants.`
+    )}
+    <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">
+      Nitro Allocation System<br/>
+      <strong style="color:#1a1a2e;">The Nitro Team</strong>
+    </p>
+  `);
+};
 
 // ─────────────────────────────────────────────
 // 10. PAYOUT PAID — Reimbursement transferred
@@ -602,6 +847,340 @@ const payoutPaidEmail = (
 };
 
 // ─────────────────────────────────────────────
+// 11. PRODUCT APPLICATION DECISION — Grouped approved + rejected
+// ─────────────────────────────────────────────
+/**
+ * @param {string} name          - Participant's full name
+ * @param {string} projectTitle  - Project/brand name
+ * @param {Array}  approved      - [{ name, image_url, product_url, product_value }]
+ * @param {Array}  rejected      - [{ name, image_url }]
+ * @param {string} dashboardUrl  - CTA link
+ */
+const productDecisionEmail = (
+  name,
+  projectTitle = 'Project',
+  approved = [],
+  rejected = [],
+  dashboardUrl = 'https://nitro.com/dashboard'
+) => {
+  const hasApproved = approved.length > 0;
+  const hasRejected = rejected.length > 0;
+
+  // ── Approved product cards ──────────────────────────────────────────────
+  const approvedCards = approved
+    .map((p) => `
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="border:1.5px solid #d4edda;border-radius:12px;overflow:hidden;
+                    margin-bottom:14px;background:#f6fff8;">
+        <tr>
+          ${p.image_url
+            ? `<td width="110" style="padding:16px 12px 16px 16px;vertical-align:middle;">
+                 <img src="${p.image_url}" width="80" height="80" alt="${p.name}"
+                      style="border-radius:8px;object-fit:cover;display:block;
+                             border:1px solid #c3e6cb;" />
+               </td>`
+            : ''}
+          <td style="padding:16px;vertical-align:middle;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;
+                           background:#27ae60;flex-shrink:0;"></span>
+              <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">${p.name}</p>
+            </div>
+            ${p.product_value
+              ? `<p style="margin:0 0 10px 16px;font-size:13px;color:#6c8f72;">
+                   Value: <strong>₹${Number(p.product_value).toLocaleString('en-IN')}</strong>
+                 </p>`
+              : ''}
+            <div style="margin-left:16px;">
+              <span style="display:inline-block;padding:4px 12px;border-radius:20px;
+                           font-size:11px;font-weight:700;letter-spacing:0.5px;
+                           text-transform:uppercase;background:#d4edda;color:#27ae60;
+                           margin-bottom:${p.product_url ? '10px' : '0'};">
+                ✓ Approved
+              </span>
+              ${p.product_url
+                ? `<br/>
+                   <a href="${p.product_url}" target="_blank"
+                      style="display:inline-block;margin-top:8px;padding:8px 20px;
+                             font-size:13px;font-weight:700;color:#ffffff;
+                             background:linear-gradient(135deg,#27ae60,#1e8449);
+                             border-radius:6px;text-decoration:none;letter-spacing:0.3px;">
+                     🛒 Purchase Now →
+                   </a>`
+                : ''}
+            </div>
+          </td>
+        </tr>
+      </table>`)
+    .join('');
+
+  // ── Rejected product cards ──────────────────────────────────────────────
+  const rejectedCards = rejected
+    .map((p) => `
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="border:1.5px solid #f5c6cb;border-radius:12px;overflow:hidden;
+                    margin-bottom:14px;background:#fff5f6;">
+        <tr>
+          ${p.image_url
+            ? `<td width="110" style="padding:16px 12px 16px 16px;vertical-align:middle;opacity:0.7;">
+                 <img src="${p.image_url}" width="80" height="80" alt="${p.name}"
+                      style="border-radius:8px;object-fit:cover;display:block;
+                             border:1px solid #f5c6cb;filter:grayscale(30%);" />
+               </td>`
+            : ''}
+          <td style="padding:16px;vertical-align:middle;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;
+                           background:#e74c3c;flex-shrink:0;"></span>
+              <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">${p.name}</p>
+            </div>
+            <div style="margin-left:16px;">
+              <span style="display:inline-block;padding:4px 12px;border-radius:20px;
+                           font-size:11px;font-weight:700;letter-spacing:0.5px;
+                           text-transform:uppercase;background:#f8d7da;color:#c0392b;">
+                ✕ Not Selected
+              </span>
+            </div>
+          </td>
+        </tr>
+      </table>`)
+    .join('');
+
+  // ── Section builder ─────────────────────────────────────────────────────
+  const approvedSection = hasApproved ? `
+    <div style="margin:28px 0 0;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+        <div style="width:4px;height:20px;background:#27ae60;border-radius:2px;flex-shrink:0;"></div>
+        <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">
+          Approved Product${approved.length > 1 ? 's' : ''}
+          <span style="font-size:13px;font-weight:400;color:#27ae60;margin-left:6px;">
+            (${approved.length} item${approved.length > 1 ? 's' : ''})
+          </span>
+        </p>
+      </div>
+      ${approvedCards}
+      <div style="background:#eafaf1;border-left:3px solid #27ae60;border-radius:0 6px 6px 0;
+                  padding:12px 16px;margin-top:8px;">
+        <p style="margin:0;font-size:14px;color:#1e8449;line-height:1.6;">
+          <strong>Next step:</strong> Purchase the approved product${approved.length > 1 ? 's' : ''} and upload your invoice on the Nitro dashboard to proceed.
+        </p>
+      </div>
+    </div>` : '';
+
+  const rejectedSection = hasRejected ? `
+    <div style="margin:28px 0 0;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+        <div style="width:4px;height:20px;background:#e74c3c;border-radius:2px;flex-shrink:0;"></div>
+        <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">
+          Not Selected
+          <span style="font-size:13px;font-weight:400;color:#e74c3c;margin-left:6px;">
+            (${rejected.length} item${rejected.length > 1 ? 's' : ''})
+          </span>
+        </p>
+      </div>
+      ${rejectedCards}
+      <div style="background:#fdf3f4;border-left:3px solid #e74c3c;border-radius:0 6px 6px 0;
+                  padding:12px 16px;margin-top:8px;">
+        <p style="margin:0;font-size:14px;color:#922b21;line-height:1.6;">
+          These products were not selected this time. You're welcome to explore other available projects on the platform.
+        </p>
+      </div>
+    </div>` : '';
+
+  // ── Summary header config ────────────────────────────────────────────────
+  const headingText = hasApproved && hasRejected
+    ? 'Your Product Request Update 📋'
+    : hasApproved
+    ? `Congratulations — You're Approved! 🎉`
+    : 'Product Request Update';
+
+  const subText = hasApproved && hasRejected
+    ? `Mixed results for your application to <strong>${projectTitle}</strong>`
+    : hasApproved
+    ? `Your product request for <strong>${projectTitle}</strong> has been approved`
+    : `Regarding your product request for <strong>${projectTitle}</strong>`;
+
+  const summaryLine = hasApproved && hasRejected
+    ? `We've reviewed all your product requests for the <strong>${projectTitle}</strong> project. Here's a detailed breakdown of each decision:`
+    : hasApproved
+    ? `Fantastic news! Your product request${approved.length > 1 ? 's' : ''} for <strong>${projectTitle}</strong> ha${approved.length > 1 ? 've' : 's'} been carefully reviewed and <strong>officially approved</strong>. You're all set to move forward — please proceed with the purchase at your earliest convenience.`
+    : `Thank you for your interest in the <strong>${projectTitle}</strong> project. After a thorough review, we were unable to approve your product request${rejected.length > 1 ? 's' : ''} at this time. We encourage you to keep an eye out for future opportunities.`;
+
+  return wrap(`
+    ${heading(headingText)}
+    <p style="margin:0 0 24px;font-size:15px;color:#9aa3b2;font-weight:400;">${subText}</p>
+    ${divider()}
+    ${greeting(name)}
+    ${bodyText(summaryLine)}
+    ${approvedSection}
+    ${rejectedSection}
+    ${divider()}
+    ${ctaButton('View My Dashboard', dashboardUrl)}
+    ${bodyText(
+      `If you have any questions about these decisions or need assistance with the next steps, our support team is always here to help.`
+    )}
+    <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">Warm regards,<br/>
+      <strong style="color:#1a1a2e;">The Nitro Team</strong>
+    </p>
+  `);
+};
+
+
+// ─────────────────────────────────────────────
+// 12. ALLOCATION CANCELLED — Participant confirmation
+// ─────────────────────────────────────────────
+/**
+ * @param {string} name         - Participant name
+ * @param {string} projectName  - Project / brand name
+ * @param {Array}  products     - [{ name, image_url, product_value }]
+ * @param {string} browseUrl    - Link to explore other projects
+ */
+const allocationCancelledParticipantEmail = ({
+  name,
+  projectName,
+  products = [],
+  browseUrl = 'https://nitro.com/projects'
+}) => {
+  const productList = products.length ? `
+    <p style="margin:24px 0 12px;font-size:15px;font-weight:700;color:#1a1a2e;">
+      Cancelled Product${products.length > 1 ? 's' : ''}:
+    </p>
+    ${products.map((p) => `
+      <table cellpadding="0" cellspacing="0" border="0" width="100%"
+             style="border:1.5px solid #edf0f7;border-radius:10px;overflow:hidden;
+                    margin-bottom:12px;background:#f8f9fc;">
+        <tr>
+          ${p.image_url
+            ? `<td width="90" style="padding:14px 10px 14px 14px;vertical-align:middle;">
+                 <img src="${p.image_url}" width="62" height="62" alt="${p.name}"
+                      style="border-radius:6px;object-fit:cover;display:block;
+                             filter:grayscale(30%);border:1px solid #edf0f7;" />
+               </td>`
+            : ''}
+          <td style="padding:14px 16px;vertical-align:middle;">
+            <p style="margin:0 0 4px;font-size:14px;font-weight:700;color:#1a1a2e;">${p.name}</p>
+            ${p.product_value
+              ? `<p style="margin:0 0 8px;font-size:12px;color:#9aa3b2;">
+                   Value: ₹${Number(p.product_value).toLocaleString('en-IN')}
+                 </p>`
+              : ''}
+            <span style="display:inline-block;padding:3px 12px;border-radius:20px;
+                         font-size:11px;font-weight:700;letter-spacing:0.5px;
+                         text-transform:uppercase;background:#fdecea;color:#c0392b;">
+              ✕ Reservation Cancelled
+            </span>
+          </td>
+        </tr>
+      </table>`).join('')}` : '';
+
+  return wrap(`
+    ${heading('Reservation Cancelled')}
+    ${subheading(`Your slot for <strong>${projectName}</strong> has been released`)}
+    ${divider()}
+    ${greeting(name)}
+    ${bodyText(
+      `We have successfully processed your cancellation request for <strong>${projectName}</strong>. 
+       Your reserved product slot has been released and your allocated budget has been returned to the project pool.`
+    )}
+    ${infoBox([
+      { label: 'Project',  value: projectName },
+      { label: 'Status',   value: '✕ Cancelled by participant' },
+      { label: 'Budget',   value: '✅ Returned to project pool' }
+    ])}
+    ${productList}
+    ${bodyText(
+      `There are always fresh opportunities on the platform. Head over to the projects page to 
+       browse available campaigns and apply for ones that suit you.`
+    )}
+    ${ctaButton('Browse Open Projects', browseUrl)}
+    ${divider()}
+    ${bodyText(
+      `If you cancelled by mistake or have any concerns, please reach out to our support team 
+       as soon as possible and we will do our best to assist you.`
+    )}
+    <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">Regards,<br/>
+      <strong style="color:#1a1a2e;">The Nitro Team</strong>
+    </p>
+  `);
+};
+
+// ─────────────────────────────────────────────
+// 13. ADMIN — Participant Cancelled Allocation
+// ─────────────────────────────────────────────
+/**
+ * @param {string} adminName           - Admin name
+ * @param {string} participantName     - Participant who cancelled
+ * @param {string} participantEmail    - Participant email
+ * @param {string} projectName         - Project name
+ * @param {string} projectId           - Project ID
+ * @param {Array}  products            - [{ name, image_url, product_value }]
+ * @param {number} restoredAmount      - Total INR restored to budget
+ * @param {string} dashboardUrl        - Admin approvals page
+ */
+const adminAllocationCancelledEmail = ({
+  adminName,
+  participantName,
+  participantEmail,
+  projectName,
+  projectId,
+  products = [],
+  restoredAmount = 0,
+  dashboardUrl = 'https://nitro.com/admin/product-applications'
+}) => {
+  const fmt = (n) =>
+    new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(Number(n || 0));
+
+  const productRows = products.map((p) => `
+    <div style="padding:8px 0;border-bottom:1px solid #edf0f7;">
+      <span style="font-size:13px;color:#1a1a2e;font-weight:600;">${p.name}</span>
+      ${p.product_value
+        ? `<span style="font-size:12px;color:#9aa3b2;margin-left:8px;">
+             ₹${Number(p.product_value).toLocaleString('en-IN')}
+           </span>`
+        : ''}
+    </div>`).join('');
+
+  return wrap(`
+    ${heading('Allocation Cancelled by Participant 🔔')}
+    ${subheading(`Project: ${projectName}`)}
+    ${divider()}
+    ${greeting(adminName)}
+    ${bodyText(
+      `A participant has voluntarily cancelled their product reservation for <strong>${projectName}</strong>. 
+       Their allocated slot has been released and the associated budget has been automatically 
+       restored to the project pool.`
+    )}
+    ${infoBox([
+      { label: 'Participant',      value: `${participantName} (${participantEmail})` },
+      { label: 'Project',          value: projectName },
+      { label: 'Budget Restored',  value: `✅ ${fmt(restoredAmount)} returned to pool` }
+    ])}
+    ${products.length ? `
+    <div style="border:1px solid #edf0f7;border-radius:10px;padding:16px 20px;
+                margin:20px 0;background:#f8f9fc;">
+      <p style="margin:0 0 10px;font-size:14px;font-weight:700;color:#1a1a2e;">
+        Released Product${products.length > 1 ? 's' : ''}:
+      </p>
+      ${productRows}
+    </div>` : ''}
+    ${bodyText(
+      `The freed-up budget is now available for new allocations. You may review pending 
+       product applications and assign this slot to another eligible participant.`
+    )}
+    ${ctaButton('Review Pending Applications', dashboardUrl)}
+    ${divider()}
+    ${bodyText(
+      `This notification was generated automatically by the Nitro platform. No further action is 
+       required unless you wish to reassign the released slot.`
+    )}
+    <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">
+      Nitro Allocation System<br/>
+      <strong style="color:#1a1a2e;">The Nitro Team</strong>
+    </p>
+  `);
+};
+
+// ─────────────────────────────────────────────
 // Exports
 // ─────────────────────────────────────────────
 module.exports = {
@@ -615,4 +1194,8 @@ module.exports = {
   allocationReminderEmail,
   allocationExpiredEmail,
   payoutPaidEmail,
+  productDecisionEmail,
+  adminBudgetRestoredEmail,
+  allocationCancelledParticipantEmail,
+  adminAllocationCancelledEmail,
 };

@@ -1,9 +1,9 @@
 const supabase = require('../config/supabaseClient');
 const { ALLOCATION_STATUS, PROOF_STATUS } = require('../utils/constants');
 const { sendEmail } = require('../services/email.service');
-const { allocationEmail } = require('../services/email.templates');
+const { allocationEmail, allocationCancelledParticipantEmail, adminAllocationCancelledEmail } = require('../services/email.templates');
 
-const RESERVATION_DAYS = 5;
+const RESERVATION_DAYS = 20;
 
 const isMissingSchemaObjectError = (error) => {
   const text = String(error?.message || '').toLowerCase();
@@ -107,7 +107,7 @@ const allocateUnit = async (req, res, next) => {
 
     res.status(201).json({
       success: true,
-      message: 'Unit allocated and reserved for 5 days',
+      message: 'Unit allocated and reserved for 20 days',
       data
     });
 
@@ -241,6 +241,104 @@ const getMyAllocationTracking = async (req, res, next) => {
 
     if (allocationError) throw allocationError;
 
+    // Self-heal legacy state: if participant has APPROVED products but no active
+    // allocation (often after older cancellation flows), create one RESERVED slot
+    // per project so My Tasks can show all approved products in one flow.
+    if (!allocations || allocations.length === 0) {
+      const approvedAppsRes = await supabase
+        .from('project_applications')
+        .select('id, project_id, participant_id, status')
+        .eq('participant_id', participantId)
+        .in('status', ['APPROVED', 'PURCHASED']);
+
+      if (approvedAppsRes.error && !isMissingSchemaObjectError(approvedAppsRes.error)) {
+        throw approvedAppsRes.error;
+      }
+
+      const approvedApps = approvedAppsRes.data || [];
+      const approvedProjectIds = [...new Set(approvedApps.map((row) => row.project_id).filter(Boolean))];
+
+      if (approvedProjectIds.length) {
+        const existingActiveAllocRes = await supabase
+          .from('unit_allocations')
+          .select('id, project_id, status')
+          .eq('participant_id', participantId)
+          .in('project_id', approvedProjectIds)
+          .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED]);
+
+        if (existingActiveAllocRes.error && !isMissingSchemaObjectError(existingActiveAllocRes.error)) {
+          throw existingActiveAllocRes.error;
+        }
+
+        const activeProjectIds = new Set((existingActiveAllocRes.data || []).map((row) => row.project_id));
+        const toCreateProjectIds = approvedProjectIds.filter((projectId) => !activeProjectIds.has(projectId));
+
+        if (toCreateProjectIds.length) {
+          const reservedUntil = new Date();
+          reservedUntil.setDate(reservedUntil.getDate() + RESERVATION_DAYS);
+          const rowsToInsert = toCreateProjectIds.map((projectId) => ({
+            project_id: projectId,
+            participant_id: participantId,
+            reserved_until: reservedUntil.toISOString(),
+            status: ALLOCATION_STATUS.RESERVED
+          }));
+          const { error: createAllocError } = await supabase
+            .from('unit_allocations')
+            .insert(rowsToInsert);
+          if (createAllocError && !isMissingSchemaObjectError(createAllocError)) {
+            throw createAllocError;
+          }
+        }
+
+        // Re-fetch allocations after self-heal insert.
+        let refreshedAllocationsRes = await supabase
+          .from('unit_allocations')
+          .select(
+            `
+            id,
+            project_id,
+            status,
+            reserved_until,
+            created_at,
+            projects (
+              id,
+              title,
+              name,
+              mode,
+              reward
+            )
+          `
+          )
+          .eq('participant_id', participantId)
+          .order('created_at', { ascending: false });
+
+        if (refreshedAllocationsRes.error && /unit_allocations\.created_at/i.test(String(refreshedAllocationsRes.error.message || ''))) {
+          refreshedAllocationsRes = await supabase
+            .from('unit_allocations')
+            .select(
+              `
+              id,
+              project_id,
+              status,
+              reserved_until,
+              projects (
+                id,
+                title,
+                name,
+                mode,
+                reward
+              )
+            `
+            )
+            .eq('participant_id', participantId)
+            .order('reserved_until', { ascending: false });
+        }
+
+        if (refreshedAllocationsRes.error) throw refreshedAllocationsRes.error;
+        allocations = refreshedAllocationsRes.data || [];
+      }
+    }
+
     if (!allocations || allocations.length === 0) {
       return res.json({ success: true, data: [] });
     }
@@ -251,10 +349,10 @@ const getMyAllocationTracking = async (req, res, next) => {
     const [proofsRes, reviewsRes, feedbacksRes, payoutsRes, applicationsRes] = await Promise.all([
       supabase
         .from('purchase_proofs')
-        .select('id, allocation_id, participant_id, product_id, status, file_url, created_at')
+        .select('id, allocation_id, participant_id, product_id, status, file_url, uploaded_at')
         .eq('participant_id', participantId)
         .in('allocation_id', allocationIds)
-        .order('created_at', { ascending: false }),
+        .order('uploaded_at', { ascending: false }),
       supabase
         .from('participant_reviews')
         .select('id, allocation_id, participant_id, product_id, review_text, review_url, status, created_at')
@@ -300,14 +398,17 @@ const getMyAllocationTracking = async (req, res, next) => {
         : Promise.resolve({ data: [], error: null })
     ]);
 
-    let proofRows = proofsRes.data || [];
+    let proofRows = (proofsRes.data || []).map((item) => ({
+      ...item,
+      created_at: item.created_at || item.uploaded_at || null
+    }));
     if (proofsRes.error) {
       if (!isMissingSchemaObjectError(proofsRes.error)) throw proofsRes.error;
 
-      // Some DBs use uploaded_at instead of created_at for purchase proofs.
+      // Fallback: try with product_id explicitly, then without
       let fallbackProofs = await supabase
         .from('purchase_proofs')
-        .select('id, allocation_id, participant_id, status, file_url, uploaded_at')
+        .select('id, allocation_id, participant_id, product_id, status, file_url, uploaded_at')
         .eq('participant_id', participantId)
         .in('allocation_id', allocationIds)
         .order('uploaded_at', { ascending: false });
@@ -315,7 +416,7 @@ const getMyAllocationTracking = async (req, res, next) => {
       if (fallbackProofs.error && isMissingSchemaObjectError(fallbackProofs.error)) {
         fallbackProofs = await supabase
           .from('purchase_proofs')
-          .select('id, allocation_id, participant_id, status, uploaded_at')
+          .select('id, allocation_id, participant_id, status, file_url, uploaded_at')
           .eq('participant_id', participantId)
           .in('allocation_id', allocationIds)
           .order('uploaded_at', { ascending: false });
@@ -500,7 +601,19 @@ const getMyAllocationTracking = async (req, res, next) => {
         || null;
       const projectApplications = applicationsByProjectId.get(allocation.project_id) || [];
       const primaryApplication = projectApplications[0] || null;
-      const selectedProducts = projectApplications.map((item) => ({
+      const latestApplicationByProduct = new Map();
+      for (const item of projectApplications) {
+        const productKey = String(item?.product_id || '');
+        if (!productKey) continue;
+        if (!latestApplicationByProduct.has(productKey)) {
+          latestApplicationByProduct.set(productKey, item);
+        }
+      }
+      const normalizedProjectApplications = latestApplicationByProduct.size
+        ? Array.from(latestApplicationByProduct.values())
+        : projectApplications;
+
+      const selectedProducts = normalizedProjectApplications.map((item) => ({
         ...(item || {}),
         application_id: item?.id || null,
         product_id: item?.product_id || null,
@@ -510,19 +623,13 @@ const getMyAllocationTracking = async (req, res, next) => {
         application_status: String(item?.status || '').toUpperCase(),
         purchase_proof: proofsByAllocationProduct.get(
           buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || proofsByAllocationProduct.get(
-          buildAllocationProductKey(allocation.id, null)
-        ) || proofsByAllocation.get(allocation.id) || null,
+        ) || null,
         review_submission: reviewsByAllocationProduct.get(
           buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || reviewsByAllocationProduct.get(
-          buildAllocationProductKey(allocation.id, null)
-        ) || reviewsByAllocation.get(allocation.id) || null,
+        ) || null,
         feedback_submission: feedbacksByAllocationProduct.get(
           buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || feedbacksByAllocationProduct.get(
-          buildAllocationProductKey(allocation.id, null)
-        ) || feedbacksByAllocation.get(allocation.id) || null
+        ) || null
       }));
 
       // Compatibility fallback: if DB stores proof/review at allocation-level (no product_id),
@@ -777,11 +884,206 @@ const updateAllocationStatus = async (req, res, next) => {
   }
 };
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cancelAllocation — participant voluntarily cancels a RESERVED or PURCHASED slot
+//   1. Validates the allocation belongs to this participant and is cancellable
+//   2. Sets allocation status → CANCELLED
+//   3. Rejects the matching project_applications (restores allocated_budget to pool)
+//   4. Sends confirmation email to participant
+//   5. Fetches all admins and notifies them with budget-restored summary
+// ─────────────────────────────────────────────────────────────────────────────
+const cancelAllocation = async (req, res, next) => {
+  try {
+    const participantId = req.user.id;
+    const { id: allocationId } = req.params;
+
+    // ── 1. Fetch allocation — verify ownership and cancellable status ─────────
+    const { data: allocation, error: allocError } = await supabase
+      .from('unit_allocations')
+      .select('id, project_id, status, participant_id')
+      .eq('id', allocationId)
+      .eq('participant_id', participantId)
+      .maybeSingle();
+
+    if (allocError || !allocation) {
+      return res.status(404).json({ success: false, message: 'Allocation not found.' });
+    }
+
+    const currentStatus = String(allocation.status || '').toUpperCase();
+    if (!['RESERVED', 'PURCHASED'].includes(currentStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: `This allocation cannot be cancelled — current status is ${currentStatus}.`
+      });
+    }
+
+    // ── 2. Mark allocation as CANCELLED ───────────────────────────────────────
+    const { error: cancelError } = await supabase
+      .from('unit_allocations')
+      .update({ status: 'CANCELLED' })
+      .eq('id', allocationId)
+      .eq('participant_id', participantId);
+
+    if (cancelError) throw cancelError;
+
+    // ── RESPOND IMMEDIATELY so the frontend never hangs ──────────────────────
+    // All remaining work (budget restore, notifications, emails) runs after
+    // the response is sent and cannot block or error out the cancel action.
+    res.json({
+      success: true,
+      message: 'Allocation cancelled successfully. Your reserved slot has been released.',
+      data: { allocationId }
+    });
+
+    // ── 3. Reject project_applications → restore budget (fire-and-forget) ─────
+    let restoredAmt = 0;
+    let products    = [];
+    let projectName = 'your project';
+    let participantProfile = null;
+
+    try {
+      const nowIso = new Date().toISOString();
+
+      // Try with eligibility_notes; fall back without it if column missing
+      let rejectedApps = null;
+      let appRes = await supabase
+        .from('project_applications')
+        .update({
+          status:            'REJECTED',
+          reviewed_at:       nowIso,
+          eligibility_notes: 'Automatically rejected — participant cancelled their reservation.'
+        })
+        .eq('participant_id', participantId)
+        .eq('project_id',     allocation.project_id)
+        .in('status',         ['APPROVED', 'PURCHASED'])
+        .select('id, product_id, allocated_budget');
+
+      if (appRes.error && isMissingSchemaObjectError(appRes.error)) {
+        appRes = await supabase
+          .from('project_applications')
+          .update({ status: 'REJECTED', reviewed_at: nowIso })
+          .eq('participant_id', participantId)
+          .eq('project_id',     allocation.project_id)
+          .in('status',         ['APPROVED', 'PURCHASED'])
+          .select('id, product_id, allocated_budget');
+      }
+
+      rejectedApps = appRes.data || [];
+      restoredAmt  = rejectedApps.reduce((s, a) => s + Number(a.allocated_budget || 0), 0);
+      const productIds = [...new Set(rejectedApps.map((a) => a.product_id).filter(Boolean))];
+
+      if (productIds.length) {
+        const { data: productRows } = await supabase
+          .from('project_products')
+          .select('id, name, image_url, product_value')
+          .in('id', productIds);
+
+        const budgetMap = new Map(rejectedApps.map((a) => [a.product_id, a.allocated_budget]));
+        products = (productRows || []).map((p) => ({
+          name:          p.name,
+          image_url:     p.image_url || null,
+          product_value: budgetMap.get(p.id) ?? p.product_value ?? null
+        }));
+      }
+    } catch (err) {
+      console.error('[cancelAllocation] Budget restore failed (non-fatal):', err);
+    }
+
+    // ── 4. Fetch supporting data for notifications ────────────────────────────
+    try {
+      const [projectRes, profileRes] = await Promise.all([
+        supabase.from('projects').select('id, title, name').eq('id', allocation.project_id).maybeSingle(),
+        supabase.from('profiles').select('id, full_name, email').eq('id', participantId).maybeSingle()
+      ]);
+      projectName        = projectRes.data?.title || projectRes.data?.name || 'your project';
+      participantProfile = profileRes.data || null;
+    } catch (err) {
+      console.error('[cancelAllocation] Profile/project fetch failed (non-fatal):', err);
+    }
+
+    // ── 5. In-app notification for participant ────────────────────────────────
+    try {
+      await supabase.from('notifications').insert({
+        user_id: participantId,
+        type:    'PRODUCT_APPLICATION',   // use a known-safe type value
+        title:   'Reservation cancelled',
+        message: `Your reservation for ${projectName} has been cancelled and your slot released.`
+      });
+    } catch (err) {
+      console.error('[cancelAllocation] Participant notification failed (non-fatal):', err);
+    }
+
+    // ── 6. Participant confirmation email ─────────────────────────────────────
+    try {
+      if (participantProfile?.email) {
+        sendEmail({
+          to:      participantProfile.email,
+          subject: `Reservation Cancelled — ${projectName}`,
+          html:    allocationCancelledParticipantEmail({
+            name:        participantProfile.full_name || 'Participant',
+            projectName,
+            products,
+            browseUrl:   'https://nitro.com/projects'
+          })
+        });
+      }
+    } catch (err) {
+      console.error('[cancelAllocation] Participant email failed (non-fatal):', err);
+    }
+
+    // ── 7. Admin notifications ────────────────────────────────────────────────
+    try {
+      const { data: adminProfiles } = await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('role', ['ADMIN', 'SUPER_ADMIN'])
+        .eq('status', 'APPROVED');
+
+      for (const admin of (adminProfiles || [])) {
+        try {
+          await supabase.from('notifications').insert({
+            user_id: admin.id,
+            type:    'PRODUCT_APPLICATION',
+            title:   'Participant cancelled reservation',
+            message: `${participantProfile?.full_name || 'A participant'} cancelled their slot for "${projectName}".${restoredAmt > 0 ? ` ₹${Number(restoredAmt).toLocaleString('en-IN')} restored.` : ''}`
+          });
+
+          if (admin.email) {
+            sendEmail({
+              to:      admin.email,
+              subject: `🔔 Reservation Cancelled — ${projectName}`,
+              html:    adminAllocationCancelledEmail({
+                adminName:        admin.full_name || 'Admin',
+                participantName:  participantProfile?.full_name || 'Participant',
+                participantEmail: participantProfile?.email     || '',
+                projectName,
+                projectId:        allocation.project_id,
+                products,
+                restoredAmount:   restoredAmt,
+                dashboardUrl:     'https://nitro.com/admin/product-applications'
+              })
+            });
+          }
+        } catch (err) {
+          console.error(`[cancelAllocation] Admin ${admin.id} notify failed (non-fatal):`, err);
+        }
+      }
+    } catch (err) {
+      console.error('[cancelAllocation] Admin notify block failed (non-fatal):', err);
+    }
+
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   allocateUnit,
   getMyAllocations,
   getMyAllocationTracking,
   getActiveAllocations,
   getAllocationById,
-  updateAllocationStatus
+  updateAllocationStatus,
+  cancelAllocation
 };

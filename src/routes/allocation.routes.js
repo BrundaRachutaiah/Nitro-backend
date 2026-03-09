@@ -49,4 +49,12 @@ router.patch(
   allocationController.updateAllocationStatus
 );
 
+// Cancel allocation (participant self-cancels a RESERVED or PURCHASED slot)
+router.patch(
+  '/allocations/:id/cancel',
+  authMiddleware,
+  roleMiddleware('PARTICIPANT'),
+  allocationController.cancelAllocation
+);
+
 module.exports = router;

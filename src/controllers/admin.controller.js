@@ -32,6 +32,7 @@ const toAmount = (value) => {
   return Number.isFinite(num) ? num : 0;
 };
 const APPROVED_APPLICATION_STATUSES = ['APPROVED', 'PURCHASED', 'COMPLETED'];
+const DECISION_SUMMARY_WINDOW_MS = 3 * 60 * 60 * 1000;
 const hasProvidedNumber = (value) =>
   value !== undefined
   && value !== null
@@ -129,10 +130,25 @@ const sendParticipantDecisionSummaryNotification = async ({
   participantId,
   projectId,
   projectTitle = null,
-  preferredType = 'PRODUCT_APPLICATION_APPROVED'
+  preferredType = 'PRODUCT_APPLICATION_APPROVED',
+  decisionAnchorAt = null
 } = {}) => {
   if (!participantId || !projectId) return;
 
+  // ── 1. Check for any still-PENDING applications for this participant+project ──
+  // We only send the summary email once ALL products have been reviewed (none left pending)
+  const { data: pendingApps } = await supabase
+    .from('project_applications')
+    .select('id')
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .eq('status', 'PENDING')
+    .limit(1);
+
+  // If there are still pending items, skip sending — wait for admin to finish all reviews
+  if (pendingApps && pendingApps.length > 0) return;
+
+  // ── 2. Fetch all decided applications ────────────────────────────────────
   let appRes = await supabase
     .from('project_applications')
     .select('id, status, product_id, reviewed_at, created_at')
@@ -155,44 +171,108 @@ const sendParticipantDecisionSummaryNotification = async ({
   const rows = appRes.data || [];
   if (!rows.length) return;
 
+  // Keep the summary scoped to the latest review session so old decisions
+  // from previous apply cycles are not included in the email.
+  const parseMs = (value) => {
+    if (!value) return null;
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : null;
+  };
+  const reviewedRows = rows.filter((row) => parseMs(row.reviewed_at) !== null);
+  const anchorCandidates = [
+    parseMs(decisionAnchorAt),
+    ...reviewedRows.map((row) => parseMs(row.reviewed_at))
+  ].filter((value) => value !== null);
+  const anchorMs = anchorCandidates.length ? Math.max(...anchorCandidates) : null;
+
+  let decisionRows = rows;
+  if (anchorMs !== null && reviewedRows.length) {
+    const cutoffMs = anchorMs - DECISION_SUMMARY_WINDOW_MS;
+    const filtered = rows.filter((row) => {
+      const reviewedAtMs = parseMs(row.reviewed_at);
+      return reviewedAtMs !== null && reviewedAtMs >= cutoffMs && reviewedAtMs <= anchorMs + 60 * 1000;
+    });
+    if (filtered.length) decisionRows = filtered;
+  }
+
+  // Keep only the latest decision per product
   const latestByProduct = new Map();
-  for (const row of rows) {
+  for (const row of decisionRows) {
     if (!row.product_id) continue;
     if (!latestByProduct.has(row.product_id)) {
       latestByProduct.set(row.product_id, row);
     }
   }
 
+  // ── 3. Fetch product details: name, image_url, product_url, product_value ──
   const productIds = [...latestByProduct.keys()];
-  let productNameMap = new Map();
+  let productMap = new Map();
   if (productIds.length) {
     const { data: products, error: productsError } = await supabase
       .from('project_products')
-      .select('id, name')
+      .select('id, name, image_url, product_url, product_value')
       .in('id', productIds);
     if (productsError && !isMissingSchemaObjectError(productsError)) throw productsError;
-    productNameMap = new Map((products || []).map((row) => [row.id, row.name || row.id]));
+    productMap = new Map((products || []).map((row) => [row.id, row]));
   }
 
-  const approved = [];
-  const rejected = [];
+  // ── 4. Group into approved / rejected with full product details ──────────
+  const approvedProducts = [];
+  const rejectedProducts = [];
+  const approvedNames = [];
+  const rejectedNames = [];
+
   for (const row of latestByProduct.values()) {
-    const name = productNameMap.get(row.product_id) || row.product_id;
+    const product = productMap.get(row.product_id) || {};
+    const name = product.name || row.product_id;
     const status = String(row.status || '').toUpperCase();
-    if (status === 'APPROVED') approved.push(name);
-    if (status === 'REJECTED') rejected.push(name);
+
+    if (status === 'APPROVED') {
+      approvedProducts.push({
+        name,
+        image_url: product.image_url || null,
+        product_url: product.product_url || null,
+        product_value: product.product_value || null
+      });
+      approvedNames.push(name);
+    } else if (status === 'REJECTED') {
+      rejectedProducts.push({
+        name,
+        image_url: product.image_url || null
+      });
+      rejectedNames.push(name);
+    }
   }
 
-  const approvedText = approved.length ? `Approved: ${approved.join(', ')}` : null;
-  const rejectedText = rejected.length ? `Rejected: ${rejected.join(', ')}` : null;
+  const approvedText = approvedNames.length ? `Approved: ${approvedNames.join(', ')}` : null;
+  const rejectedText = rejectedNames.length ? `Rejected: ${rejectedNames.join(', ')}` : null;
   const summaryText = [approvedText, rejectedText].filter(Boolean).join(' | ');
   if (!summaryText) return;
 
+  // ── 5. Fetch participant profile ─────────────────────────────────────────
   const { data: participantProfile } = await supabase
     .from('profiles')
     .select('id, full_name, email')
     .eq('id', participantId)
     .maybeSingle();
+
+  // ── 6. Insert notification ───────────────────────────────────────────────
+  const decisionDigest = Array.from(latestByProduct.values())
+    .sort((a, b) => String(a.product_id).localeCompare(String(b.product_id)))
+    .map((row) => `${row.product_id}:${normalizeStatus(row.status)}`)
+    .join('|');
+  const notificationMessage = `${projectTitle || 'Project'}: ${summaryText} [${decisionDigest}]`;
+
+  const { data: existingNotification } = await supabase
+    .from('notifications')
+    .select('id')
+    .eq('user_id', participantId)
+    .eq('title', 'Product request update')
+    .eq('message', notificationMessage)
+    .limit(1)
+    .maybeSingle();
+
+  if (existingNotification?.id) return;
 
   await supabase
     .from('notifications')
@@ -200,19 +280,29 @@ const sendParticipantDecisionSummaryNotification = async ({
       user_id: participantId,
       type: preferredType,
       title: 'Product request update',
-      message: `${projectTitle || 'Project'}: ${summaryText}`
+      message: notificationMessage
     });
 
+  // ── 7. Send beautifully designed grouped HTML email ──────────────────────
   if (participantProfile?.email) {
+    const { productDecisionEmail } = require('../services/email.templates');
+
+    const subjectLine = approvedProducts.length > 0 && rejectedProducts.length === 0
+      ? `🎉 Product Request Approved — ${projectTitle || 'Nitro'}`
+      : approvedProducts.length > 0
+      ? `📋 Your Product Request Update — ${projectTitle || 'Nitro'}`
+      : `📋 Product Request Update — ${projectTitle || 'Nitro'}`;
+
     await sendEmail({
       to: participantProfile.email,
-      subject: `Nitro product request update - ${projectTitle || 'Project'}`,
-      html: `
-        <p>Hi ${participantProfile.full_name || 'Participant'},</p>
-        <p>Your product request status was updated.</p>
-        <p><b>${projectTitle || 'Project'}</b>: ${summaryText}</p>
-        <p>You can log in to Nitro to view details.</p>
-      `
+      subject: subjectLine,
+      html: productDecisionEmail(
+        participantProfile.full_name,
+        projectTitle || 'Project',
+        approvedProducts,
+        rejectedProducts,
+        'https://nitro.com/dashboard'
+      )
     });
   }
 };
@@ -1918,7 +2008,7 @@ const approveProductApplication = async (req, res, next) => {
       })
       .eq('id', id)
       .eq('status', 'PENDING')
-      .select('id, project_id, participant_id')
+      .select('id, project_id, participant_id, reviewed_at')
       .maybeSingle();
 
     if (error) throw error;
@@ -1934,6 +2024,7 @@ const approveProductApplication = async (req, res, next) => {
       .select('id')
       .eq('project_id', application.project_id)
       .eq('participant_id', application.participant_id)
+      .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
       .is('completed_at', null)
       .limit(1)
       .maybeSingle();
@@ -1944,7 +2035,7 @@ const approveProductApplication = async (req, res, next) => {
         .select('id')
         .eq('project_id', application.project_id)
         .eq('participant_id', application.participant_id)
-        .neq('status', ALLOCATION_STATUS.COMPLETED)
+        .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
         .limit(1)
         .maybeSingle();
 
@@ -1985,7 +2076,8 @@ const approveProductApplication = async (req, res, next) => {
       participantId: application.participant_id,
       projectId: application.project_id,
       projectTitle: projectRow?.title || 'Project',
-      preferredType: 'PRODUCT_APPLICATION_APPROVED'
+      preferredType: 'PRODUCT_APPLICATION_APPROVED',
+      decisionAnchorAt: application.reviewed_at
     });
 
     res.json({
@@ -2026,7 +2118,7 @@ const rejectProductApplication = async (req, res, next) => {
       })
       .eq('id', id)
       .eq('status', 'PENDING')
-      .select('id, participant_id, project_id, product_id')
+      .select('id, participant_id, project_id, product_id, reviewed_at')
       .maybeSingle();
 
     if (error) throw error;
@@ -2049,7 +2141,8 @@ const rejectProductApplication = async (req, res, next) => {
       participantId: data.participant_id,
       projectId: data.project_id,
       projectTitle: projectRow?.title || 'Project',
-      preferredType: 'PRODUCT_APPLICATION_REJECTED'
+      preferredType: 'PRODUCT_APPLICATION_REJECTED',
+      decisionAnchorAt: data.reviewed_at
     });
 
     res.json({
