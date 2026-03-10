@@ -11,10 +11,13 @@ const isPaymentDetailsComplete = (details) => {
     'state',
     'pincode',
     'bank_account_number',
-    'bank_ifsc'
+    'bank_ifsc',
+    'pan_number'
   ];
   return required.every((field) => hasValue(details[field]));
 };
+
+const isValidPAN = (pan) => /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/.test(String(pan || '').trim().toUpperCase());
 
 const isMissingSchemaObjectError = (error) => {
   const text = String(error?.message || '').toLowerCase();
@@ -357,7 +360,7 @@ const getPaymentDetails = async (req, res, next) => {
 const savePaymentDetails = async (req, res, next) => {
   try {
     const participantId = req.user.id;
-    const { address = {}, bankDetails = {} } = req.body;
+    const { address = {}, bankDetails = {}, kycDetails = {} } = req.body;
 
     // Determine if address fields were actually provided (not just empty strings)
     const hasAddressData = hasValue(address?.address_line1) || hasValue(address?.city) ||
@@ -386,6 +389,22 @@ const savePaymentDetails = async (req, res, next) => {
       });
     }
 
+    // PAN is required
+    if (!hasValue(kycDetails?.pan_number)) {
+      return res.status(400).json({
+        success: false,
+        message: 'PAN card number is required'
+      });
+    }
+
+    const panUpper = String(kycDetails.pan_number).trim().toUpperCase();
+    if (!isValidPAN(panUpper)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid PAN format. Expected format: ABCDE1234F'
+      });
+    }
+
     // Build payload — only include address fields if they were provided
     const detailsPayload = {
       participant_id: participantId,
@@ -393,6 +412,7 @@ const savePaymentDetails = async (req, res, next) => {
       bank_account_number: String(bankDetails.bank_account_number || '').trim(),
       bank_ifsc: String(bankDetails.bank_ifsc || '').trim().toUpperCase(),
       bank_name: hasValue(bankDetails.bank_name) ? String(bankDetails.bank_name).trim() : null,
+      pan_number: panUpper,
       updated_at: new Date().toISOString()
     };
 

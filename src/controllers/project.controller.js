@@ -469,7 +469,10 @@ const getAppliedProjects = async (req, res, next) => {
   try {
     const participantId = req.user.id;
 
-    const { data, error } = await supabase
+    let data, error;
+
+    // Primary query — includes reviewed_at
+    ({ data, error } = await supabase
       .from('project_applications')
       .select(
         `
@@ -496,7 +499,38 @@ const getAppliedProjects = async (req, res, next) => {
       )
       .eq('participant_id', participantId)
       .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED, APPLICATION_STATUS.PURCHASED, APPLICATION_STATUS.REJECTED])
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false }));
+
+    // Fallback — if reviewed_at column doesn't exist yet, retry without it
+    if (error && /reviewed_at/i.test(String(error.message || ''))) {
+      ({ data, error } = await supabase
+        .from('project_applications')
+        .select(
+          `
+          id,
+          project_id,
+          product_id,
+          allocated_budget,
+          status,
+          created_at,
+          projects (
+            id,
+            title,
+            reward,
+            status
+          ),
+          project_products (
+            id,
+            name,
+            product_url,
+            product_value
+          )
+        `
+        )
+        .eq('participant_id', participantId)
+        .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED, APPLICATION_STATUS.PURCHASED, APPLICATION_STATUS.REJECTED])
+        .order('created_at', { ascending: false }));
+    }
 
     if (error) throw error;
 

@@ -861,152 +861,203 @@ const productDecisionEmail = (
   projectTitle = 'Project',
   approved = [],
   rejected = [],
-  dashboardUrl = 'https://nitro.com/dashboard'
+  dashboardUrl = 'https://nitro.com/dashboard',
+  invoiceUrl = null,   // direct link to participant's allocation/active page
+  reviewUrl = null     // direct link to review submission page (same page post-purchase)
 ) => {
   const hasApproved = approved.length > 0;
   const hasRejected = rejected.length > 0;
 
-  // ── Approved product cards ──────────────────────────────────────────────
-  const approvedCards = approved
-    .map((p) => `
+  // ── Use dashboardUrl as fallback for invoice/review links ────────────────
+  const invoiceLink = invoiceUrl || dashboardUrl;
+  const reviewLink  = reviewUrl  || dashboardUrl;
+
+  // ── Helper: group products by brand ─────────────────────────────────────
+  const groupByBrand = (products) => {
+    const map = new Map();
+    for (const p of products) {
+      const brand = String(p.brand || projectTitle || 'Campaign').trim();
+      if (!map.has(brand)) map.set(brand, []);
+      map.get(brand).push(p);
+    }
+    return map;
+  };
+
+  // ── Helper: initials avatar (replaces image) ─────────────────────────────
+  const productAvatar = (name) => {
+    const initials = String(name || 'P').trim().slice(0, 2).toUpperCase();
+    return `<td width="68" style="padding:14px 8px 14px 16px;vertical-align:middle;">
+               <div style="width:52px;height:52px;border-radius:12px;
+                           background:linear-gradient(135deg,#1a1a2e,#0f3460);
+                           border:1.5px solid #2d3561;
+                           display:flex;align-items:center;justify-content:center;
+                           font-size:1rem;font-weight:800;color:#fff;
+                           text-align:center;line-height:52px;">
+                 ${initials}
+               </div>
+             </td>`;
+  };
+
+  // ── Approved products — grouped by brand ────────────────────────────────
+  const approvedBrandMap = groupByBrand(approved);
+  const approvedBrandSections = Array.from(approvedBrandMap.entries()).map(([brand, products]) => `
+    <!-- Brand group header -->
+    <div style="display:flex;align-items:center;gap:8px;margin:20px 0 10px;">
+      <div style="width:3px;height:16px;background:#27ae60;border-radius:2px;flex-shrink:0;"></div>
+      <span style="font-size:12px;font-weight:700;color:#27ae60;text-transform:uppercase;
+                   letter-spacing:0.06em;">${brand}</span>
+    </div>
+    ${products.map((p) => `
       <table cellpadding="0" cellspacing="0" border="0" width="100%"
-             style="border:1.5px solid #d4edda;border-radius:12px;overflow:hidden;
-                    margin-bottom:14px;background:#f6fff8;">
+             style="border:1.5px solid #c3e6cb;border-radius:12px;overflow:hidden;
+                    margin-bottom:10px;background:#f6fff8;">
         <tr>
-          ${p.image_url
-            ? `<td width="110" style="padding:16px 12px 16px 16px;vertical-align:middle;">
-                 <img src="${p.image_url}" width="80" height="80" alt="${p.name}"
-                      style="border-radius:8px;object-fit:cover;display:block;
-                             border:1px solid #c3e6cb;" />
-               </td>`
-            : ''}
-          <td style="padding:16px;vertical-align:middle;">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;
-                           background:#27ae60;flex-shrink:0;"></span>
-              <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">${p.name}</p>
-            </div>
-            <p style="margin:0 0 4px;font-size:12px;color:#6c8f72;">${p.brand || ''}</p>
+          ${productAvatar(p.name)}
+          <td style="padding:14px 16px 14px 10px;vertical-align:middle;">
+            <p style="margin:0 0 3px;font-size:14px;font-weight:700;color:#1a1a2e;
+                       line-height:1.3;">${p.name}</p>
             ${p.product_value
-              ? `<p style="margin:0 0 10px 16px;font-size:13px;color:#6c8f72;">
-                   Value: <strong>₹${Number(p.product_value).toLocaleString('en-IN')}</strong>
+              ? `<p style="margin:0 0 8px;font-size:12px;color:#6c8f72;">
+                   Value: <strong style="color:#1e8449;">₹${Number(p.product_value).toLocaleString('en-IN')}</strong>
                  </p>`
-              : ''}
-            <div style="margin-left:16px;">
-              <span style="display:inline-block;padding:4px 12px;border-radius:20px;
-                           font-size:11px;font-weight:700;letter-spacing:0.5px;
-                           text-transform:uppercase;background:#d4edda;color:#27ae60;
-                           margin-bottom:${p.product_url ? '10px' : '0'};">
+              : '<div style="margin-bottom:8px;"></div>'}
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <span style="display:inline-block;padding:3px 10px;border-radius:20px;
+                           font-size:10px;font-weight:700;letter-spacing:0.5px;
+                           text-transform:uppercase;background:#d4edda;color:#27ae60;">
                 ✓ Approved
               </span>
               ${p.product_url
-                ? `<br/>
-                   <a href="${p.product_url}" target="_blank"
-                      style="display:inline-block;margin-top:8px;padding:8px 20px;
-                             font-size:13px;font-weight:700;color:#ffffff;
-                             background:linear-gradient(135deg,#27ae60,#1e8449);
-                             border-radius:6px;text-decoration:none;letter-spacing:0.3px;">
-                     🛒 Purchase Now →
+                ? `<a href="${p.product_url}" target="_blank"
+                      style="display:inline-block;padding:5px 14px;font-size:12px;font-weight:700;
+                             color:#ffffff;background:linear-gradient(135deg,#27ae60,#1e8449);
+                             border-radius:6px;text-decoration:none;white-space:nowrap;">
+                     🛒 Buy on Store →
                    </a>`
                 : ''}
             </div>
           </td>
         </tr>
-      </table>`)
-    .join('');
+      </table>`).join('')}
+  `).join('');
 
-  // ── Rejected product cards ──────────────────────────────────────────────
-  const rejectedCards = rejected
-    .map((p) => `
+  // ── Rejected products — grouped by brand ────────────────────────────────
+  const rejectedBrandMap = groupByBrand(rejected);
+  const rejectedBrandSections = Array.from(rejectedBrandMap.entries()).map(([brand, products]) => `
+    <div style="display:flex;align-items:center;gap:8px;margin:20px 0 10px;">
+      <div style="width:3px;height:16px;background:#e74c3c;border-radius:2px;flex-shrink:0;"></div>
+      <span style="font-size:12px;font-weight:700;color:#e74c3c;text-transform:uppercase;
+                   letter-spacing:0.06em;">${brand}</span>
+    </div>
+    ${products.map((p) => `
       <table cellpadding="0" cellspacing="0" border="0" width="100%"
              style="border:1.5px solid #f5c6cb;border-radius:12px;overflow:hidden;
-                    margin-bottom:14px;background:#fff5f6;">
+                    margin-bottom:10px;background:#fff5f6;">
         <tr>
-          ${p.image_url
-            ? `<td width="110" style="padding:16px 12px 16px 16px;vertical-align:middle;opacity:0.7;">
-                 <img src="${p.image_url}" width="80" height="80" alt="${p.name}"
-                      style="border-radius:8px;object-fit:cover;display:block;
-                             border:1px solid #f5c6cb;filter:grayscale(30%);" />
-               </td>`
-            : ''}
-          <td style="padding:16px;vertical-align:middle;">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-              <span style="display:inline-block;width:8px;height:8px;border-radius:50%;
-                           background:#e74c3c;flex-shrink:0;"></span>
-              <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">${p.name}</p>
-            </div>
-            <p style="margin:0 0 4px;font-size:12px;color:#6c8f72;">${p.brand || ''}</p>
-            <div style="margin-left:16px;">
-              <span style="display:inline-block;padding:4px 12px;border-radius:20px;
-                           font-size:11px;font-weight:700;letter-spacing:0.5px;
-                           text-transform:uppercase;background:#f8d7da;color:#c0392b;">
-                ✕ Not Selected
-              </span>
-            </div>
+          ${productAvatar(p.name)}
+          <td style="padding:14px 16px 14px 10px;vertical-align:middle;">
+            <p style="margin:0 0 8px;font-size:14px;font-weight:700;color:#1a1a2e;
+                       line-height:1.3;opacity:0.7;">${p.name}</p>
+            <span style="display:inline-block;padding:3px 10px;border-radius:20px;
+                         font-size:10px;font-weight:700;letter-spacing:0.5px;
+                         text-transform:uppercase;background:#f8d7da;color:#c0392b;">
+              ✕ Not Selected
+            </span>
           </td>
         </tr>
-      </table>`)
-    .join('');
+      </table>`).join('')}
+  `).join('');
 
-  // ── Section builder ─────────────────────────────────────────────────────
+  // ── Approved section ─────────────────────────────────────────────────────
   const approvedSection = hasApproved ? `
-    <div style="margin:28px 0 0;">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
-        <div style="width:4px;height:20px;background:#27ae60;border-radius:2px;flex-shrink:0;"></div>
-        <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">
-          Approved Product${approved.length > 1 ? 's' : ''}
-          <span style="font-size:13px;font-weight:400;color:#27ae60;margin-left:6px;">
-            (${approved.length} item${approved.length > 1 ? 's' : ''})
-          </span>
+    <div style="margin:24px 0 0;">
+      <p style="margin:0 0 4px;font-size:15px;font-weight:700;color:#1a1a2e;">
+        ✅ Approved (${approved.length} product${approved.length > 1 ? 's' : ''})
+      </p>
+      <p style="margin:0 0 14px;font-size:13px;color:#6c8f72;">
+        These products are ready for purchase. Click <strong>Buy on Store</strong> next to each product to purchase them.
+      </p>
+      ${approvedBrandSections}
+
+      <!-- Upload invoice instruction box -->
+      <div style="background:#eafaf1;border:1.5px solid #a9dfbf;border-radius:10px;
+                  padding:16px 20px;margin-top:16px;">
+        <p style="margin:0 0 6px;font-size:14px;font-weight:700;color:#1e8449;">
+          📄 After Purchasing — Upload Your Invoice
         </p>
-      </div>
-      ${approvedCards}
-      <div style="background:#eafaf1;border-left:3px solid #27ae60;border-radius:0 6px 6px 0;
-                  padding:12px 16px;margin-top:8px;">
-        <p style="margin:0;font-size:14px;color:#1e8449;line-height:1.6;">
-          <strong>Next step:</strong> Purchase the approved product${approved.length > 1 ? 's' : ''} and upload your invoice on the Nitro dashboard to proceed.
+        <p style="margin:0 0 14px;font-size:13px;color:#2e7d4f;line-height:1.6;">
+          Once you've purchased the product(s), go to <strong>My Tasks</strong> on the Nitro platform and upload your purchase invoice/proof. Your payout will be processed after verification.
         </p>
+        <table cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td style="background:linear-gradient(135deg,#27ae60,#1e8449);border-radius:8px;padding:0;">
+              <a href="${invoiceLink}" target="_blank"
+                 style="display:inline-block;padding:11px 26px;font-size:14px;font-weight:700;
+                        color:#ffffff;text-decoration:none;letter-spacing:0.3px;">
+                📤 Upload Invoice / Proof
+              </a>
+            </td>
+          </tr>
+        </table>
       </div>
     </div>` : '';
 
+  // ── Rejected section ─────────────────────────────────────────────────────
   const rejectedSection = hasRejected ? `
-    <div style="margin:28px 0 0;">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
-        <div style="width:4px;height:20px;background:#e74c3c;border-radius:2px;flex-shrink:0;"></div>
-        <p style="margin:0;font-size:15px;font-weight:700;color:#1a1a2e;">
-          Not Selected
-          <span style="font-size:13px;font-weight:400;color:#e74c3c;margin-left:6px;">
-            (${rejected.length} item${rejected.length > 1 ? 's' : ''})
-          </span>
-        </p>
-      </div>
-      ${rejectedCards}
-      <div style="background:#fdf3f4;border-left:3px solid #e74c3c;border-radius:0 6px 6px 0;
-                  padding:12px 16px;margin-top:8px;">
-        <p style="margin:0;font-size:14px;color:#922b21;line-height:1.6;">
-          These products were not selected this time. You're welcome to explore other available projects on the platform.
-        </p>
-      </div>
+    <div style="margin:24px 0 0;">
+      <p style="margin:0 0 4px;font-size:15px;font-weight:700;color:#1a1a2e;">
+        ❌ Not Selected (${rejected.length} product${rejected.length > 1 ? 's' : ''})
+      </p>
+      <p style="margin:0 0 14px;font-size:13px;color:#e07070;">
+        These products were not selected this time. You can explore other available projects on the platform.
+      </p>
+      ${rejectedBrandSections}
     </div>` : '';
 
-  // ── Summary header config ────────────────────────────────────────────────
+  // ── Review CTA (shown only when there are approved products) ─────────────
+  const reviewCta = hasApproved ? `
+    <div style="background:#f0f4ff;border:1.5px solid #bfcef7;border-radius:10px;
+                padding:16px 20px;margin-top:20px;">
+      <p style="margin:0 0 6px;font-size:14px;font-weight:700;color:#2c3e8c;">
+        ⭐ Submit Your Review After Purchase
+      </p>
+      <p style="margin:0 0 14px;font-size:13px;color:#3d5299;line-height:1.6;">
+        After uploading your invoice and it gets approved, you'll need to submit a genuine product review on the Nitro platform to complete your task and unlock your payout.
+      </p>
+      <table cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td style="background:#e8edff;border:1.5px solid #bfcef7;border-radius:8px;padding:0;">
+            <a href="${reviewLink}" target="_blank"
+               style="display:inline-block;padding:11px 26px;font-size:14px;font-weight:700;
+                      color:#2c3e8c;text-decoration:none;letter-spacing:0.3px;">
+              ✍️ Go to Review Submission
+            </a>
+          </td>
+        </tr>
+      </table>
+    </div>` : '';
+
+  // ── Summary header ───────────────────────────────────────────────────────
+  const uniqueBrands = [...new Set([...approved, ...rejected].map((p) => String(p.brand || '').trim()).filter(Boolean))];
+  const brandLabel = uniqueBrands.length > 1
+    ? `${uniqueBrands.length} brands`
+    : uniqueBrands[0] || projectTitle;
+
   const headingText = hasApproved && hasRejected
     ? 'Your Product Request Update 📋'
     : hasApproved
-    ? `Congratulations — You're Approved! 🎉`
+    ? "Congratulations — You're Approved! 🎉"
     : 'Product Request Update';
 
   const subText = hasApproved && hasRejected
-    ? `Mixed results for your application to <strong>${projectTitle}</strong>`
+    ? `Mixed results across your requests from <strong>${brandLabel}</strong>`
     : hasApproved
-    ? `Your product request for <strong>${projectTitle}</strong> has been approved`
-    : `Regarding your product request for <strong>${projectTitle}</strong>`;
+    ? `Your product request${approved.length > 1 ? 's' : ''} from <strong>${brandLabel}</strong> ha${approved.length > 1 ? 've' : 's'} been approved`
+    : `Regarding your product request${rejected.length > 1 ? 's' : ''} from <strong>${brandLabel}</strong>`;
 
-  const summaryLine = hasApproved && hasRejected
-    ? `We've reviewed all your product requests for the <strong>${projectTitle}</strong> project. Here's a detailed breakdown of each decision:`
-    : hasApproved
-    ? `Fantastic news! Your product request${approved.length > 1 ? 's' : ''} for <strong>${projectTitle}</strong> ha${approved.length > 1 ? 've' : 's'} been carefully reviewed and <strong>officially approved</strong>. You're all set to move forward — please proceed with the purchase at your earliest convenience.`
-    : `Thank you for your interest in the <strong>${projectTitle}</strong> project. After a thorough review, we were unable to approve your product request${rejected.length > 1 ? 's' : ''} at this time. We encourage you to keep an eye out for future opportunities.`;
+  const summaryLine = hasApproved
+    ? `Our team has reviewed all your product requests. Here's the full decision — approved products are <strong>ready for purchase</strong> right now.`
+    : `Thank you for your interest. After a thorough review, we were unable to approve your product request${rejected.length > 1 ? 's' : ''} at this time. We encourage you to keep an eye out for future opportunities.`;
 
   return wrap(`
     ${heading(headingText)}
@@ -1016,11 +1067,8 @@ const productDecisionEmail = (
     ${bodyText(summaryLine)}
     ${approvedSection}
     ${rejectedSection}
+    ${reviewCta}
     ${divider()}
-    ${ctaButton('View My Dashboard', dashboardUrl)}
-    ${bodyText(
-      `If you have any questions about these decisions or need assistance with the next steps, our support team is always here to help.`
-    )}
     <p style="margin:20px 0 0;font-size:15px;color:#4a5568;">Warm regards,<br/>
       <strong style="color:#1a1a2e;">The Nitro Team</strong>
     </p>

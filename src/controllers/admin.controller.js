@@ -294,6 +294,10 @@ const sendParticipantDecisionSummaryNotification = async ({
       ? `📋 Your Product Request Update — ${projectTitle || 'Nitro'}`
       : `📋 Product Request Update — ${projectTitle || 'Nitro'}`;
 
+    const participantBaseUrl = `https://nitro.com/participant/${participantId}`;
+    const invoiceUrl = `${participantBaseUrl}/allocation/active`;
+    const reviewUrl  = `${participantBaseUrl}/allocation/active`;
+
     await sendEmail({
       to: participantProfile.email,
       subject: subjectLine,
@@ -302,7 +306,9 @@ const sendParticipantDecisionSummaryNotification = async ({
         projectTitle || 'Project',
         approvedProducts,
         rejectedProducts,
-        'https://nitro.com/dashboard'
+        invoiceUrl,
+        invoiceUrl,
+        reviewUrl
       )
     });
   }
@@ -2464,6 +2470,8 @@ const bulkDecideApplications = async (req, res, next) => {
             : (approvedProducts[0]?.brand || rejectedProducts[0]?.brand || 'Nitro');
 
         const dashboardUrl = `https://nitro.com/participant/${participantId}/allocation/active`;
+        const invoiceUrl   = dashboardUrl;
+        const reviewUrl    = dashboardUrl;
         setImmediate(() => {
           sendEmail({
             to: participant.email,
@@ -2475,7 +2483,9 @@ const bulkDecideApplications = async (req, res, next) => {
               emailProjectTitle,
               approvedProducts,
               rejectedProducts,
-              dashboardUrl
+              dashboardUrl,
+              invoiceUrl,
+              reviewUrl
             )
           }).catch(() => {});
         });
