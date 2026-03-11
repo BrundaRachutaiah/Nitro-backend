@@ -758,76 +758,129 @@ const getCompletedProjects = async (req, res, next) => {
   try {
     const participantId = req.user.id;
 
-    let appRes = await supabase
-      .from('project_applications')
-      .select(
-        `
+    const selectFields = `
+      id,
+      project_id,
+      product_id,
+      allocated_budget,
+      status,
+      reviewed_at,
+      created_at,
+      projects (
         id,
-        project_id,
-        product_id,
-        allocated_budget,
-        status,
-        reviewed_at,
-        created_at,
-        projects (
-          id,
-          title,
-          reward,
-          status
-        ),
-        project_products (
-          id,
-          name,
-          product_url,
-          product_value
-        )
-      `
+        title,
+        reward,
+        status
+      ),
+      project_products (
+        id,
+        name,
+        product_url,
+        product_value
       )
+    `;
+
+    const selectFieldsNoOrder = `
+      id,
+      project_id,
+      product_id,
+      allocated_budget,
+      status,
+      projects (
+        id,
+        title,
+        reward,
+        status
+      ),
+      project_products (
+        id,
+        name,
+        product_url,
+        product_value
+      )
+    `;
+
+    // ── 1. Fetch COMPLETED applications ──────────────────────────────────────
+    let completedRes = await supabase
+      .from('project_applications')
+      .select(selectFields)
       .eq('participant_id', participantId)
       .eq('status', APPLICATION_STATUS.COMPLETED)
       .order('reviewed_at', { ascending: false })
       .order('created_at', { ascending: false });
 
-    if (appRes.error && /reviewed_at|created_at/i.test(String(appRes.error.message || ''))) {
-      appRes = await supabase
+    if (completedRes.error && /reviewed_at|created_at/i.test(String(completedRes.error.message || ''))) {
+      completedRes = await supabase
         .from('project_applications')
-        .select(
-          `
-          id,
-          project_id,
-          product_id,
-          allocated_budget,
-          status,
-          projects (
-            id,
-            title,
-            reward,
-            status
-          ),
-          project_products (
-            id,
-            name,
-            product_url,
-            product_value
-          )
-        `
-        )
+        .select(selectFieldsNoOrder)
         .eq('participant_id', participantId)
         .eq('status', APPLICATION_STATUS.COMPLETED);
     }
 
-    if (appRes.error && !isMissingTableOrColumn(appRes.error)) {
-      throw appRes.error;
+    if (completedRes.error && !isMissingTableOrColumn(completedRes.error)) {
+      throw completedRes.error;
     }
 
-    const data = (appRes.data || []).map((row) => ({
-      ...row,
-      completed_at: row.reviewed_at || row.created_at || null
-    }));
+    // ── 2. Also fetch APPROVED/PURCHASED applications that have an ELIGIBLE+ payout ──
+    // This shows products as "completed" from the participant's perspective as soon
+    // as their payout is ready — even before the admin marks the batch as paid.
+    let eligiblePayoutApps = [];
+    try {
+      const { data: payoutRows, error: payoutErr } = await supabase
+        .from('payouts')
+        .select('project_id, product_id')
+        .eq('participant_id', participantId)
+        .in('status', ['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID']);
+
+      if (!payoutErr && payoutRows && payoutRows.length > 0) {
+        // Build a set of project+product pairs that have payouts
+        const payoutKeySet = new Set(
+          payoutRows.map((p) => `${p.project_id}::${p.product_id || ''}`)
+        );
+
+        // Fetch the corresponding APPROVED/PURCHASED applications (not yet COMPLETED)
+        let pendingAppsRes = await supabase
+          .from('project_applications')
+          .select(selectFields)
+          .eq('participant_id', participantId)
+          .in('status', ['APPROVED', 'PURCHASED'])
+          .order('reviewed_at', { ascending: false })
+          .order('created_at', { ascending: false });
+
+        if (pendingAppsRes.error && /reviewed_at|created_at/i.test(String(pendingAppsRes.error.message || ''))) {
+          pendingAppsRes = await supabase
+            .from('project_applications')
+            .select(selectFieldsNoOrder)
+            .eq('participant_id', participantId)
+            .in('status', ['APPROVED', 'PURCHASED']);
+        }
+
+        for (const app of (pendingAppsRes.data || [])) {
+          const key = `${app.project_id}::${app.product_id || ''}`;
+          if (payoutKeySet.has(key)) {
+            // Treat as completed for display purposes
+            eligiblePayoutApps.push({ ...app, status: 'COMPLETED' });
+          }
+        }
+      }
+    } catch (payoutLookupErr) {
+      // Non-fatal — if payout lookup fails, just show the COMPLETED apps
+      console.warn('[getCompletedProjects] payout lookup failed:', payoutLookupErr?.message);
+    }
+
+    // ── 3. Merge: COMPLETED apps + apps-with-eligible-payouts (deduplicated) ─
+    const seenIds = new Set();
+    const merged = [];
+    for (const row of [...(completedRes.data || []), ...eligiblePayoutApps]) {
+      if (!seenIds.has(row.id)) {
+        seenIds.add(row.id);
+        merged.push({ ...row, completed_at: row.reviewed_at || row.created_at || null });
+      }
+    }
 
     res.json({
       success: true,
-      data
+      data: merged
     });
   } catch (err) {
     next(err);

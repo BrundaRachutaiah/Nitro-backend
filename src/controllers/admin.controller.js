@@ -95,8 +95,11 @@ const getApprovedApplicationBreakdownMap = async ({ participantIds = [], project
   const breakdownMap = new Map();
   for (const [key, app] of latestAppByPair.entries()) {
     const rewardAmount = toAmount(projectRewardMap.get(app.project_id));
-    const allocatedBudget = toAmount(app.allocated_budget);
-    const productAmount = allocatedBudget > 0 ? allocatedBudget : toAmount(productValueMap.get(app.product_id));
+    // Use product_value as primary. allocated_budget only as fallback when product_value=0.
+    const catalogueValue = toAmount(productValueMap.get(app.product_id));
+    const productAmount = catalogueValue > 0
+      ? catalogueValue
+      : toAmount(app.allocated_budget);
     breakdownMap.set(key, {
       rewardAmount,
       productAmount,
@@ -3029,10 +3032,18 @@ const getEligiblePayouts = async (req, res, next) => {
       const app = appMap.get(key) || null;
       const product = hasProductColumn ? (productMap.get(row.product_id) || null) : null;
       const rewardAmount = toAmount(breakdown.rewardAmount ?? project.reward);
-      const appProductAmount = toAmount(app?.allocated_budget || app?.project_products?.product_value);
+      // Use product_value as primary source of truth. allocated_budget is only
+      // a fallback when product_value is missing/zero to avoid accidental overrides.
       const mappedProductAmount = product ? toAmount(product.product_value) : 0;
-      const productAmount = appProductAmount || mappedProductAmount || toAmount(breakdown.productAmount);
-      const computedTotal = rewardAmount + productAmount;
+      const appCatalogueAmount = toAmount(app?.project_products?.product_value);
+      const appAllocatedBudget = toAmount(app?.allocated_budget);
+      const productAmount = mappedProductAmount > 0
+        ? mappedProductAmount
+        : appCatalogueAmount > 0
+          ? appCatalogueAmount
+          : appAllocatedBudget > 0
+            ? appAllocatedBudget
+            : toAmount(breakdown.productAmount);      const computedTotal = rewardAmount + productAmount;
       const clientProfile = project.created_by ? (clientProfileMap.get(project.created_by) || null) : null;
       const budgetInfo = projectBudgetMap.get(row.project_id) || null;
       return {
@@ -3738,7 +3749,13 @@ const backfillEligiblePayouts = async () => {
     if (coveredSet.has(covKey)) continue;
 
     const rewardAmount = toAmount(project?.reward);
-    const productAmount = toAmount(app.allocated_budget || productMap.get(productId)?.product_value);
+    // Always use product_value as the authoritative price. Only fall back to
+    // allocated_budget when product_value is missing/zero (prevents accidental
+    // override when admin set allocated_budget to a wrong value).
+    const catalogueValue = toAmount(productMap.get(productId)?.product_value);
+    const productAmount = catalogueValue > 0
+      ? catalogueValue
+      : toAmount(app.allocated_budget);
 
     newPayouts.push({
       participant_id: participantId,

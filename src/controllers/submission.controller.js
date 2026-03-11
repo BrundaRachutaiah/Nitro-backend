@@ -534,13 +534,18 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
         productAmount = Number(prod?.product_value || 0);
       }
 
+      // ── BUG 6 FIX: amount = productAmount only — no reward component ─────────
+      // The participant payouts page shows product_value only (not reward + product).
+      // backfillEligiblePayouts and backfillPayoutsForParticipant also use product_value
+      // only. Using rewardAmount + productAmount here caused inflated payout amounts
+      // that were inconsistent with what participants actually received.
       const inserted = await insertPayout({
         participant_id: participantId,
         user_id: participantId,
         project_id: projectId,
         product_id: application.product_id || null,
         purchase_proof_id: canonicalProofId,
-        amount: rewardAmount + productAmount,
+        amount: productAmount,
         status: 'ELIGIBLE',
       });
       if (inserted) coveredProductIds.add(productKey);

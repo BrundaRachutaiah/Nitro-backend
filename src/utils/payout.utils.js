@@ -21,7 +21,7 @@ const getApprovedApplication = async ({ supabase, participantId, projectId }) =>
     .select('id, product_id, allocated_budget')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
-    .in('status', ['APPROVED', 'PURCHASED'])
+    .in('status', ['APPROVED', 'PURCHASED', 'REVIEW_SUBMITTED', 'COMPLETED'])
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -32,7 +32,7 @@ const getApprovedApplication = async ({ supabase, participantId, projectId }) =>
       .select('id, product_id, allocated_budget')
       .eq('participant_id', participantId)
       .eq('project_id', projectId)
-      .in('status', ['APPROVED', 'PURCHASED'])
+      .in('status', ['APPROVED', 'PURCHASED', 'REVIEW_SUBMITTED', 'COMPLETED'])
       .limit(1)
       .maybeSingle();
   }
@@ -99,5 +99,6 @@ const calculatePayoutBreakdown = async ({
 };
 
 module.exports = {
+  toAmount,
   calculatePayoutBreakdown
 };
