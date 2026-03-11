@@ -1,5 +1,6 @@
 const express = require('express');
 const authMiddleware = require('../middlewares/auth.middleware');
+const authAnyStatusMiddleware = require('../middlewares/authAnyStatus.middleware');
 const roleMiddleware = require('../middlewares/role.middleware');
 const applicationController = require('../controllers/application.controller');
 
@@ -30,14 +31,14 @@ router.patch(
 
 router.get(
   '/applications/payment-details',
-  authMiddleware,
+  authAnyStatusMiddleware,
   roleMiddleware('PARTICIPANT'),
   applicationController.getPaymentDetails
 );
 
 router.put(
   '/applications/payment-details',
-  authMiddleware,
+  authAnyStatusMiddleware,
   roleMiddleware('PARTICIPANT'),
   applicationController.savePaymentDetails
 );

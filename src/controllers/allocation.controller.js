@@ -1,7 +1,9 @@
 const supabase = require('../config/supabaseClient');
+const env = require('../config/env');
 const { ALLOCATION_STATUS, PROOF_STATUS } = require('../utils/constants');
 const { sendEmail } = require('../services/email.service');
 const { allocationEmail, allocationCancelledParticipantEmail, adminAllocationCancelledEmail } = require('../services/email.templates');
+const frontendUrl = String(env.frontendUrl || 'http://localhost:5173').replace(/\/$/, '');
 
 const RESERVATION_DAYS = 20;
 
@@ -387,7 +389,8 @@ const getMyAllocationTracking = async (req, res, next) => {
           projects (
             id,
             title,
-            name
+            name,
+            mode
           ),
           project_products (
             id,
@@ -615,6 +618,7 @@ const getMyAllocationTracking = async (req, res, next) => {
         product_url: item?.project_products?.product_url || null,
         product_value: Number(item?.project_products?.product_value || 0),
         project_title: item?.projects?.title || item?.projects?.name || null,
+        project_mode: String(item?.projects?.mode || allocation?.projects?.mode || '').toUpperCase() || null,
         application_status: String(item?.status || '').toUpperCase(),
         purchase_proof: proofsByAllocationProduct.get(
           buildAllocationProductKey(allocation.id, item?.product_id)
@@ -1019,7 +1023,7 @@ const cancelAllocation = async (req, res, next) => {
             name:        participantProfile.full_name || 'Participant',
             projectName,
             products,
-            browseUrl:   'https://nitro.com/projects'
+            browseUrl:   `${frontendUrl}/projects`
           })
         });
       }
@@ -1056,7 +1060,7 @@ const cancelAllocation = async (req, res, next) => {
                 projectId:        allocation.project_id,
                 products,
                 restoredAmount:   restoredAmt,
-                dashboardUrl:     'https://nitro.com/admin/product-applications'
+                dashboardUrl:     `${frontendUrl}/admin/product-applications`
               })
             });
           }

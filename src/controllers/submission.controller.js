@@ -31,6 +31,96 @@ const isUniqueConstraintError = (error) => {
   );
 };
 
+const extractUrlMatches = (value) => {
+  const text = String(value || '');
+  return text.match(/https?:\/\/[^\s)]+/g) || [];
+};
+
+const buildReviewScreenshotData = ({ reviewUrl, reviewText }) => {
+  const screenshots = [];
+  const seen = new Set();
+
+  const addScreenshot = (url) => {
+    const normalized = String(url || '').trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    screenshots.push(normalized);
+  };
+
+  addScreenshot(reviewUrl);
+  extractUrlMatches(reviewText).forEach(addScreenshot);
+
+  const reviewTextDisplay = String(reviewText || '')
+    .replace(/\n?\s*(Extra screenshots|Screenshots):\s*\n?([\s\S]*)$/i, '')
+    .trim();
+
+  return {
+    review_screenshots: screenshots,
+    review_text_display: reviewTextDisplay || null
+  };
+};
+
+const getApprovedProductsForParticipantProject = async (participantId, projectId) => {
+  if (!participantId || !projectId) return [];
+
+  const { data, error } = await supabase
+    .from('project_applications')
+    .select(
+      `
+      product_id,
+      project_products (
+        id,
+        name,
+        image_url,
+        product_value
+      )
+    `
+    )
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+
+  if (error) throw error;
+
+  const seen = new Set();
+  return (data || [])
+    .map((row) => row?.project_products)
+    .filter((product) => {
+      if (!product?.id || seen.has(product.id)) return false;
+      seen.add(product.id);
+      return true;
+    })
+    .map((product) => ({
+      id: product.id,
+      name: product.name,
+      image_url: product.image_url || null,
+      product_value: product.product_value || null
+    }));
+};
+
+const getProductNameMap = async (productIds) => {
+  const ids = [...new Set((productIds || []).filter(Boolean))];
+  if (!ids.length) return new Map();
+
+  const { data, error } = await supabase
+    .from('project_products')
+    .select('id, name')
+    .in('id', ids);
+  if (error) throw error;
+
+  return new Map((data || []).map((item) => [item.id, item]));
+};
+
+const fetchReviewRows = async (queryBuilder) => {
+  let result = await queryBuilder('id, allocation_id, participant_id, project_id, product_id, review_text, review_url, status, created_at');
+
+  if (result.error && /product_id/i.test(String(result.error.message || ''))) {
+    result = await queryBuilder('id, allocation_id, participant_id, project_id, review_text, review_url, status, created_at');
+  }
+
+  return result;
+};
+
 const markAllocationCompleted = async ({ allocationId, participantId }) => {
   const completionRes = await supabase
     .from('unit_allocations')
@@ -53,6 +143,45 @@ const markAllocationCompleted = async ({ allocationId, participantId }) => {
   }
 
   if (completionRes.error) throw completionRes.error;
+};
+
+const markApplicationCompleted = async ({ participantId, projectId, productId }) => {
+  if (!participantId || !projectId) return;
+
+  let query = supabase
+    .from('project_applications')
+    .update({
+      status: 'COMPLETED',
+      reviewed_at: new Date().toISOString()
+    })
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .in('status', ['APPROVED', 'PURCHASED']);
+
+  if (productId) {
+    query = query.eq('product_id', productId);
+  }
+
+  let result = await query;
+
+  if (result.error && isMissingSchemaObjectError(result.error)) {
+    let fallbackQuery = supabase
+      .from('project_applications')
+      .update({ status: 'COMPLETED' })
+      .eq('participant_id', participantId)
+      .eq('project_id', projectId)
+      .in('status', ['APPROVED', 'PURCHASED']);
+
+    if (productId) {
+      fallbackQuery = fallbackQuery.eq('product_id', productId);
+    }
+
+    result = await fallbackQuery;
+  }
+
+  if (result.error && !isMissingSchemaObjectError(result.error)) {
+    throw result.error;
+  }
 };
 
 const buildAppMapKey = (participantId, projectId) => `${participantId}::${projectId}`;
@@ -161,17 +290,24 @@ const enrichReviewRows = async (rows) => {
   if (profileError) throw profileError;
 
   const profileMap = new Map((profiles || []).map((item) => [item.id, item]));
+  const directProductMap = await getProductNameMap(rows.map((row) => row.product_id));
 
   return rows.map((row) => {
     const app = appMap.get(buildAppMapKey(row.participant_id, row.project_id)) || {};
     const profile = profileMap.get(row.participant_id) || {};
+    const resolvedProductId = row.product_id || app.product_id || null;
+    const screenshotData = buildReviewScreenshotData({
+      reviewUrl: row.review_url,
+      reviewText: row.review_text
+    });
     return {
       ...row,
       project_name: projectMap.get(row.project_id) || null,
-      product_id: app.product_id || null,
-      product_name: app.product_name || null,
+      product_id: resolvedProductId,
+      product_name: directProductMap.get(resolvedProductId)?.name || app.product_name || null,
       participant_name: profile.full_name || null,
-      participant_email: profile.email || null
+      participant_email: profile.email || null,
+      ...screenshotData
     };
   });
 };
@@ -796,11 +932,13 @@ const submitReview = async (req, res, next) => {
 
 const getPendingReviews = async (req, res, next) => {
   try {
-    const { data, error } = await supabase
-      .from('participant_reviews')
-      .select('id, allocation_id, participant_id, project_id, review_text, review_url, status, created_at')
-      .eq('status', 'PENDING')
-      .order('created_at', { ascending: true });
+    const { data, error } = await fetchReviewRows((fields) =>
+      supabase
+        .from('participant_reviews')
+        .select(fields)
+        .eq('status', 'PENDING')
+        .order('created_at', { ascending: true })
+    );
 
     if (error) throw error;
 
@@ -819,17 +957,19 @@ const getReviews = async (req, res, next) => {
     const status = String(req.query.status || '').toUpperCase();
     const limit = Number(req.query.limit) > 0 ? Number(req.query.limit) : 100;
 
-    let query = supabase
-      .from('participant_reviews')
-      .select('id, allocation_id, participant_id, project_id, review_text, review_url, status, created_at')
-      .order('created_at', { ascending: false })
-      .limit(limit);
+    const { data, error } = await fetchReviewRows((fields) => {
+      let query = supabase
+        .from('participant_reviews')
+        .select(fields)
+        .order('created_at', { ascending: false })
+        .limit(limit);
 
-    if (status) {
-      query = query.eq('status', status);
-    }
+      if (status) {
+        query = query.eq('status', status);
+      }
 
-    const { data, error } = await query;
+      return query;
+    });
     if (error) throw error;
 
     const enriched = await enrichReviewRows(data || []);
@@ -846,24 +986,44 @@ const approveReview = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const { data: review, error } = await supabase
+    let reviewUpdateRes = await supabase
       .from('participant_reviews')
       .update({ status: 'APPROVED' })
       .eq('id', id)
       .eq('status', 'PENDING')
-      .select('id, allocation_id, participant_id, project_id')
+      .select('id, allocation_id, participant_id, project_id, product_id')
       .maybeSingle();
+
+    if (reviewUpdateRes.error && /product_id/i.test(String(reviewUpdateRes.error.message || ''))) {
+      reviewUpdateRes = await supabase
+        .from('participant_reviews')
+        .update({ status: 'APPROVED' })
+        .eq('id', id)
+        .eq('status', 'PENDING')
+        .select('id, allocation_id, participant_id, project_id')
+        .maybeSingle();
+    }
+
+    const { data: review, error } = reviewUpdateRes;
 
     if (error) throw error;
     let reviewRow = review;
     let alreadyProcessed = false;
 
     if (!reviewRow) {
-      const { data: existingReview, error: existingReviewError } = await supabase
+      let existingReviewRes = await supabase
         .from('participant_reviews')
-        .select('id, allocation_id, participant_id, project_id, status')
+        .select('id, allocation_id, participant_id, project_id, product_id, status')
         .eq('id', id)
         .maybeSingle();
+      if (existingReviewRes.error && /product_id/i.test(String(existingReviewRes.error.message || ''))) {
+        existingReviewRes = await supabase
+          .from('participant_reviews')
+          .select('id, allocation_id, participant_id, project_id, status')
+          .eq('id', id)
+          .maybeSingle();
+      }
+      const { data: existingReview, error: existingReviewError } = existingReviewRes;
       if (existingReviewError) throw existingReviewError;
       if (!existingReview) {
         return res.status(404).json({
@@ -901,6 +1061,16 @@ const approveReview = async (req, res, next) => {
       console.error('approveReview markAllocationCompleted warning:', allocationError);
     }
 
+    try {
+      await markApplicationCompleted({
+        participantId: reviewRow.participant_id,
+        projectId: reviewRow.project_id,
+        productId: reviewRow.product_id || null
+      });
+    } catch (applicationError) {
+      console.error('approveReview markApplicationCompleted warning:', applicationError);
+    }
+
     res.json({
       success: true,
       message: alreadyProcessed
@@ -918,12 +1088,15 @@ const approveReview = async (req, res, next) => {
       ? await supabase.from('projects').select('title, name').eq('id', reviewRow.project_id).maybeSingle()
       : { data: null };
     const reviewProjectName = reviewProject?.title || reviewProject?.name || null;
+    const approvedProducts = reviewRow.project_id
+      ? await getApprovedProductsForParticipantProject(reviewRow.participant_id, reviewRow.project_id)
+      : [];
 
     if (participant?.email) {
       sendEmail({
         to: participant.email,
         subject: '🎊 Review Approved — Your Payout Is Unlocked!',
-        html: reviewApprovedEmail(participant.full_name, reviewProjectName)
+        html: reviewApprovedEmail(participant.full_name, reviewProjectName, null, approvedProducts)
       });
     }
   } catch (err) {

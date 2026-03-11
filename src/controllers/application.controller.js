@@ -1,5 +1,9 @@
 const supabase = require('../config/supabaseClient');
 const { logActivity } = require('../services/activityLog.service');
+const {
+  ensureParticipantDetailsFromRegistration,
+  persistParticipantDetails
+} = require('../services/participantDetails.service');
 
 const hasValue = (value) => String(value || '').trim().length > 0;
 
@@ -117,11 +121,7 @@ const applyToProject = async (req, res, next) => {
         updated_at: new Date().toISOString()
       };
 
-      const { error: detailUpsertError } = await supabase
-        .from('participant_details')
-        .upsert(detailsPayload, { onConflict: 'participant_id' });
-
-      if (detailUpsertError) throw detailUpsertError;
+      await persistParticipantDetails(participantId, detailsPayload);
     }
     let existingRes = await supabase
       .from('project_applications')
@@ -345,11 +345,13 @@ const getPaymentDetails = async (req, res, next) => {
 
     if (error) throw error;
 
+    const details = await ensureParticipantDetailsFromRegistration(participantId, data || null);
+
     res.json({
       success: true,
       data: {
-        hasPaymentDetails: isPaymentDetailsComplete(data),
-        details: data || null
+        hasPaymentDetails: isPaymentDetailsComplete(details),
+        details: details || null
       }
     });
   } catch (err) {
@@ -425,13 +427,7 @@ const savePaymentDetails = async (req, res, next) => {
       detailsPayload.country = hasValue(address.country) ? String(address.country).trim() : 'India';
     }
 
-    const { data, error } = await supabase
-      .from('participant_details')
-      .upsert(detailsPayload, { onConflict: 'participant_id' })
-      .select('*')
-      .single();
-
-    if (error) throw error;
+    const data = await persistParticipantDetails(participantId, detailsPayload);
 
     await logActivity({
       actorId: req.user?.id,

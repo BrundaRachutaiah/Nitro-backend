@@ -1,11 +1,13 @@
 const cron = require('node-cron');
 const supabase = require('../config/supabaseClient');
+const env = require('../config/env');
 const { sendEmail } = require('../services/email.service');
 const {
   allocationReminderEmail,
   allocationExpiredEmail,
   adminBudgetRestoredEmail
 } = require('../services/email.templates');
+const frontendUrl = String(env.frontendUrl || 'http://localhost:5173').replace(/\/$/, '');
 
 // ─────────────────────────────────────────────
 // Reminder schedule (20-day window)
@@ -175,7 +177,7 @@ const processReminderWindow = async ({ dayNumber, daysLeft, hoursFromNow, type }
             daysLeft,
             expiryDate:  row.reserved_until,
             products,
-            dashboardUrl: 'https://nitro.com/dashboard'
+            dashboardUrl: `${frontendUrl}/dashboard`
           })
         });
       }
@@ -291,7 +293,7 @@ const processExpiredAllocations = async () => {
             name:       profile.full_name,
             projectName,
             products,
-            reapplyUrl: 'https://nitro.com/projects'
+            reapplyUrl: `${frontendUrl}/projects`
           })
         });
       }
@@ -353,7 +355,7 @@ const processExpiredAllocations = async () => {
               projectId,
               expiredSlots:   slots,
               restoredAmount: totalRestored,
-              dashboardUrl:   'https://nitro.com/admin/product-applications'
+              dashboardUrl:   `${frontendUrl}/admin/product-applications`
             })
           });
         }

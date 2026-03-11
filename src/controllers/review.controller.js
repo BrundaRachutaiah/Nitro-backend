@@ -10,6 +10,82 @@ const { ensureEligiblePayout } = require('./submission.controller');
 
 const buildAppMapKey = (participantId, projectId) => `${participantId}::${projectId}`;
 
+const getApprovedProductsForParticipantProject = async (participantId, projectId) => {
+  if (!participantId || !projectId) return [];
+
+  const { data, error } = await supabase
+    .from('project_applications')
+    .select(
+      `
+      product_id,
+      project_products (
+        id,
+        name,
+        image_url,
+        product_value
+      )
+    `
+    )
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+
+  if (error) throw error;
+
+  const seen = new Set();
+  return (data || [])
+    .map((row) => row?.project_products)
+    .filter((product) => {
+      if (!product?.id || seen.has(product.id)) return false;
+      seen.add(product.id);
+      return true;
+    })
+    .map((product) => ({
+      id: product.id,
+      name: product.name,
+      image_url: product.image_url || null,
+      product_value: product.product_value || null
+    }));
+};
+
+const getProductNameMap = async (productIds) => {
+  const ids = [...new Set((productIds || []).filter(Boolean))];
+  if (!ids.length) return new Map();
+
+  const { data, error } = await supabase
+    .from('project_products')
+    .select('id, name')
+    .in('id', ids);
+  if (error) throw error;
+
+  return new Map((data || []).map((item) => [item.id, item]));
+};
+
+const fetchPurchaseProofRows = async (queryBuilder) => {
+  let result = await queryBuilder(`
+    id,
+    file_url,
+    status,
+    uploaded_at,
+    allocation_id,
+    participant_id,
+    product_id
+  `);
+
+  if (result.error && /product_id/i.test(String(result.error.message || ''))) {
+    result = await queryBuilder(`
+      id,
+      file_url,
+      status,
+      uploaded_at,
+      allocation_id,
+      participant_id
+    `);
+  }
+
+  return result;
+};
+
 const getApprovedApplicationMap = async (participantIds, projectIds) => {
   if (!participantIds.length || !projectIds.length) {
     return new Map();
@@ -125,18 +201,20 @@ const enrichProofRows = async (rows) => {
   if (profileError) throw profileError;
 
   const profileMap = new Map((profiles || []).map((item) => [item.id, item]));
+  const directProductMap = await getProductNameMap(rows.map((row) => row.product_id));
 
   return rows.map((row) => {
     const projectId = allocationMap.get(row.allocation_id) || null;
     const app = appMap.get(buildAppMapKey(row.participant_id, projectId)) || {};
     const profile = profileMap.get(row.participant_id) || {};
+    const resolvedProductId = row.product_id || app.product_id || null;
 
     return {
       ...row,
       project_id: projectId,
       project_name: projectMap.get(projectId) || null,
-      product_id: app.product_id || null,
-      product_name: app.product_name || null,
+      product_id: resolvedProductId,
+      product_name: directProductMap.get(resolvedProductId)?.name || app.product_name || null,
       participant_name: profile.full_name || null,
       participant_email: profile.email || null
     };
@@ -148,18 +226,13 @@ const enrichProofRows = async (rows) => {
  */
 const getPendingPurchaseProofs = async (req, res, next) => {
   try {
-    const { data, error } = await supabase
-      .from('purchase_proofs')
-      .select(`
-        id,
-        file_url,
-        status,
-        uploaded_at,
-        allocation_id,
-        participant_id
-      `)
-      .eq('status', PROOF_STATUS.PENDING)
-      .order('uploaded_at', { ascending: true });
+    const { data, error } = await fetchPurchaseProofRows((fields) =>
+      supabase
+        .from('purchase_proofs')
+        .select(fields)
+        .eq('status', PROOF_STATUS.PENDING)
+        .order('uploaded_at', { ascending: true })
+    );
 
     if (error) throw error;
 
@@ -268,12 +341,15 @@ const approvePurchaseProof = async (req, res, next) => {
       ? await supabase.from('projects').select('title, name').eq('id', allocation.project_id).maybeSingle()
       : { data: null };
     const reviewProjName = proofProj?.title || proofProj?.name || null;
+    const approvedProducts = allocation?.project_id
+      ? await getApprovedProductsForParticipantProject(proof.participant_id, allocation.project_id)
+      : [];
 
     if (participant?.email) {
       sendEmail({
         to: participant.email,
         subject: '✅ Invoice Approved — Submit Your Review',
-        html: purchaseApprovedEmail(participant.full_name, reviewProjName, [])
+        html: purchaseApprovedEmail(participant.full_name, reviewProjName, approvedProducts)
       });
     }
 
@@ -290,26 +366,19 @@ const getPurchaseProofs = async (req, res, next) => {
     const status = String(req.query.status || "").toUpperCase();
     const limit = Number(req.query.limit) > 0 ? Number(req.query.limit) : 100;
 
-    let query = supabase
-      .from('purchase_proofs')
-      .select(
-        `
-        id,
-        file_url,
-        status,
-        uploaded_at,
-        allocation_id,
-        participant_id
-      `
-      )
-      .order('uploaded_at', { ascending: false })
-      .limit(limit);
+    const { data, error } = await fetchPurchaseProofRows((fields) => {
+      let query = supabase
+        .from('purchase_proofs')
+        .select(fields)
+        .order('uploaded_at', { ascending: false })
+        .limit(limit);
 
-    if (status) {
-      query = query.eq('status', status);
-    }
+      if (status) {
+        query = query.eq('status', status);
+      }
 
-    const { data, error } = await query;
+      return query;
+    });
     if (error) throw error;
 
     const enriched = await enrichProofRows(data || []);

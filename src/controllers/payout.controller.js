@@ -481,7 +481,7 @@ const markBatchPaid = async (req, res, next) => {
           });
 
           const totalAmount = items.reduce((s, i) => s + i.amount, 0);
-          const dashboardUrl = `${process.env.FRONTEND_URL || 'https://nitro.com'}/payouts`;
+          const dashboardUrl = `${String(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')}/payouts`;
 
           await sendEmail({
             to:      profile.email,
@@ -512,6 +512,8 @@ const markBatchPaid = async (req, res, next) => {
 const getMyPayouts = async (req, res, next) => {
   try {
     const participantId = req.user.id;
+
+    await backfillEligiblePayouts();
 
     let payoutRes = await supabase
       .from('payouts')

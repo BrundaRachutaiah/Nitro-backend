@@ -537,6 +537,41 @@ const getAppliedProjects = async (req, res, next) => {
     const rows = data || [];
     const projectIds = [...new Set(rows.map((row) => row?.project_id).filter(Boolean))];
 
+    let approvedReviewRows = [];
+    if (projectIds.length) {
+      let reviewRes = await supabase
+        .from('participant_reviews')
+        .select('id, project_id, product_id, status')
+        .eq('participant_id', participantId)
+        .eq('status', 'APPROVED')
+        .in('project_id', projectIds);
+
+      if (reviewRes.error && /product_id/i.test(String(reviewRes.error.message || ''))) {
+        reviewRes = await supabase
+          .from('participant_reviews')
+          .select('id, project_id, status')
+          .eq('participant_id', participantId)
+          .eq('status', 'APPROVED')
+          .in('project_id', projectIds);
+      }
+
+      if (reviewRes.error && !isMissingTableOrColumn(reviewRes.error)) {
+        throw reviewRes.error;
+      }
+
+      approvedReviewRows = reviewRes.data || [];
+    }
+
+    const approvedReviewByProjectProduct = new Set(
+      approvedReviewRows.map((row) => `${row.project_id || "na"}::${row.product_id || "na"}`)
+    );
+    const approvedReviewByProject = new Set(
+      approvedReviewRows
+        .filter((row) => !row.product_id)
+        .map((row) => row.project_id)
+        .filter(Boolean)
+    );
+
     // FIX: ONE allocation per participant covers ALL brands/projects.
     // Fetch by participant_id only — ALWAYS prefer RESERVED/PURCHASED over CANCELLED.
     // NOTE: unit_allocations does NOT have a created_at column — order by reserved_until.
@@ -598,8 +633,18 @@ const getAppliedProjects = async (req, res, next) => {
 
     // FIX: Same single allocation attached to every approved product row regardless of project_id
     const enriched = rows.map((row) => {
+      const reviewKey = `${row.project_id || "na"}::${row.product_id || "na"}`;
+      const hasApprovedReview =
+        approvedReviewByProjectProduct.has(reviewKey) ||
+        approvedReviewByProject.has(row.project_id);
+      const normalizedStatus =
+        hasApprovedReview && ['APPROVED', 'PURCHASED'].includes(String(row.status || '').toUpperCase())
+          ? 'COMPLETED'
+          : row.status;
+
       return {
         ...row,
+        status: normalizedStatus,
         allocation: singleAllocation
           ? {
               id: singleAllocation.id,

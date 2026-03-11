@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const { ensureParticipantDetailsFromRegistration } = require('../services/participantDetails.service');
 
 const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
 
@@ -18,7 +19,7 @@ const getMyProfile = async (req, res, next) => {
         .maybeSingle(),
       supabase
         .from('participant_details')
-        .select('bank_account_number, bank_ifsc, bank_account_name, bank_name, address_line1, address_line2, city, state, pincode, country')
+        .select('bank_account_number, bank_ifsc, bank_account_name, bank_name, address_line1, address_line2, city, state, pincode, country, pan_number')
         .eq('participant_id', userId)
         .maybeSingle()
     ]);
@@ -34,7 +35,7 @@ const getMyProfile = async (req, res, next) => {
     }
 
     // Merge: bank/address come entirely from participant_details
-    const details = detailsRes.data || {};
+    const details = await ensureParticipantDetailsFromRegistration(userId, detailsRes.data || null) || {};
     const merged = {
       ...profile,
       bank_account_number: details.bank_account_number || null,
@@ -47,6 +48,7 @@ const getMyProfile = async (req, res, next) => {
       state:               details.state               || null,
       pincode:             details.pincode             || null,
       country:             details.country             || 'India',
+      pan_number:          details.pan_number          || null,
     };
 
     res.json({ success: true, data: merged });

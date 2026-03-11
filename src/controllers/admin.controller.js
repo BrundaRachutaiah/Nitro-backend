@@ -1,4 +1,5 @@
 const supabase = require('../config/supabaseClient');
+const env = require('../config/env');
 const {
   buildDateRange,
   applyDateFilter
@@ -8,6 +9,7 @@ const { Parser } = require('json2csv');
 const { sendEmail } = require('../services/email.service');
 const { logActivity } = require('../services/activityLog.service');
 const { calculatePayoutBreakdown } = require('../utils/payout.utils');
+const { ensureParticipantDetailsFromRegistration } = require('../services/participantDetails.service');
 const {
   approvalEmail,
   rejectionEmail,
@@ -294,7 +296,7 @@ const sendParticipantDecisionSummaryNotification = async ({
       ? `📋 Your Product Request Update — ${projectTitle || 'Nitro'}`
       : `📋 Product Request Update — ${projectTitle || 'Nitro'}`;
 
-    const participantBaseUrl = `https://nitro.com/participant/${participantId}`;
+    const participantBaseUrl = `${env.frontendUrl.replace(/\/$/, '')}/participant/${participantId}`;
     const invoiceUrl = `${participantBaseUrl}/allocation/active`;
     const reviewUrl  = `${participantBaseUrl}/allocation/active`;
 
@@ -373,12 +375,30 @@ const approveParticipant = async (req, res, next) => {
       message: `Participant ${data.full_name || data.email || id} approved`
     });
 
+    try {
+      await ensureParticipantDetailsFromRegistration(id);
+    } catch (detailsError) {
+      console.error('[approveParticipant] Failed to backfill participant_details from registration metadata:', {
+        participantId: id,
+        error: detailsError?.message || String(detailsError)
+      });
+    }
+
     if (data?.email) {
-      sendEmail({
+      const loginUrl = `${env.frontendUrl.replace(/\/$/, '')}/login/participant`;
+      const emailResult = await sendEmail({
         to: data.email,
         subject: '🎉 Your Nitro Account Has Been Approved',
-        html: approvalEmail(data.full_name)
+        html: approvalEmail(data.full_name, loginUrl)
       });
+
+      if (!emailResult?.success) {
+        console.error('[approveParticipant] Approval email failed for participant:', {
+          participantId: id,
+          email: data.email,
+          error: emailResult?.error?.message || emailResult?.error || 'Unknown email error'
+        });
+      }
     }
   } catch (err) {
     next(err);
@@ -416,11 +436,19 @@ const rejectParticipant = async (req, res, next) => {
     });
 
     if (data?.email) {
-      sendEmail({
+      const emailResult = await sendEmail({
         to: data.email,
         subject: 'Update on Your Nitro Application',
         html: rejectionEmail(data.full_name)
       });
+
+      if (!emailResult?.success) {
+        console.error('[rejectParticipant] Rejection email failed for participant:', {
+          participantId: id,
+          email: data.email,
+          error: emailResult?.error?.message || emailResult?.error || 'Unknown email error'
+        });
+      }
     }
 
     await logActivity({
@@ -2469,7 +2497,7 @@ const bulkDecideApplications = async (req, res, next) => {
             ? 'Your Product Requests'
             : (approvedProducts[0]?.brand || rejectedProducts[0]?.brand || 'Nitro');
 
-        const dashboardUrl = `https://nitro.com/participant/${participantId}/allocation/active`;
+        const dashboardUrl = `${env.frontendUrl.replace(/\/$/, '')}/participant/${participantId}/allocation/active`;
         const invoiceUrl   = dashboardUrl;
         const reviewUrl    = dashboardUrl;
         setImmediate(() => {
@@ -3675,13 +3703,14 @@ const backfillEligiblePayouts = async () => {
 
   const existingPayouts = existingPayoutsRes.data || [];
 
-  // Build covered set: participantId::projectId::productId
-  // covered = any existing payout row for this participant+project, regardless of status or product_id
-  // Using participant::project as the key prevents re-creating ELIGIBLE after batch/paid
+  // Build covered set: participantId::projectId::productId when possible.
+  // Older schemas may miss product_id; in that case fall back to participant::project.
   const coveredSet = new Set();
   for (const p of existingPayouts) {
-    // Block by participant+project (covers product_id mismatches and null variations)
-    coveredSet.add(`${p.participant_id}::${p.project_id}`);
+    coveredSet.add(`${p.participant_id}::${p.project_id}::${p.product_id || ''}`);
+    if (!('product_id' in p)) {
+      coveredSet.add(`${p.participant_id}::${p.project_id}`);
+    }
   }
 
   // ── 9. For each application, create ELIGIBLE payout if needed ─────────────
@@ -3705,8 +3734,7 @@ const backfillEligiblePayouts = async () => {
     }
     if (!isEligible) continue;
 
-    // Check if ANY payout already exists for this participant+project
-    const covKey = `${participantId}::${projectId}`;
+    const covKey = `${participantId}::${projectId}::${productId || ''}`;
     if (coveredSet.has(covKey)) continue;
 
     const rewardAmount = toAmount(project?.reward);

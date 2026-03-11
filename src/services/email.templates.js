@@ -125,7 +125,7 @@ const statusBadge = (label, color) =>
 // ─────────────────────────────────────────────
 // 1. ACCOUNT APPROVED — Welcome email
 // ─────────────────────────────────────────────
-const approvalEmail = (name, loginUrl = 'https://nitro.com/login') =>
+const approvalEmail = (name, loginUrl = `${frontendUrl}/login/participant`) =>
   wrap(`
     ${heading('Welcome to Nitro! 🎉')}
     ${subheading('Your account has been approved by our team')}
@@ -188,7 +188,7 @@ const allocationEmail = (
   projectName,
   expiryDate,
   products = [],   // array of { name, image_url, product_url, product_value }
-  dashboardUrl = 'https://nitro.com/dashboard'
+  dashboardUrl = `${frontendUrl}/dashboard`
 ) => {
   const productCards = products.length
     ? `
@@ -264,7 +264,7 @@ const purchaseApprovedEmail = (
   name,
   projectName,
   products = [],
-  nextStepUrl = 'https://nitro.com/dashboard'
+  nextStepUrl = `${frontendUrl}/dashboard`
 ) => {
   const productList = products.length
     ? `
@@ -325,7 +325,7 @@ const purchaseApprovedEmail = (
 // ─────────────────────────────────────────────
 // 5. PURCHASE / INVOICE REJECTED
 // ─────────────────────────────────────────────
-const purchaseRejectedEmail = (name, projectName, reason = '', reuploadUrl = 'https://nitro.com/dashboard') =>
+const purchaseRejectedEmail = (name, projectName, reason = '', reuploadUrl = `${frontendUrl}/dashboard`) =>
   wrap(`
     ${heading('Invoice Requires Attention ⚠️')}
     ${subheading('Action needed: Please re-upload your purchase proof')}
@@ -366,14 +366,37 @@ const purchaseRejectedEmail = (name, projectName, reason = '', reuploadUrl = 'ht
 // ─────────────────────────────────────────────
 // 6. REVIEW APPROVED — Payout eligible
 // ─────────────────────────────────────────────
-const reviewApprovedEmail = (name, projectName, payoutAmount, dashboardUrl = 'https://nitro.com/dashboard') =>
-  wrap(`
+const reviewApprovedEmail = (
+  name,
+  projectName,
+  payoutAmount,
+  products = [],
+  dashboardUrl = `${frontendUrl}/dashboard`
+) => {
+  const productList = products.length
+    ? `
+      <p style="margin:24px 0 12px;font-size:15px;font-weight:700;color:#1a1a2e;">Reviewed Products:</p>
+      <div style="margin:0 0 18px;">
+        ${products
+          .map(
+            (product) => `
+              <div style="padding:10px 14px;margin-bottom:10px;border-radius:10px;border:1px solid #dbeafe;background:#f8fbff;">
+                <p style="margin:0;font-size:14px;font-weight:700;color:#1a1a2e;">${product.name}</p>
+              </div>
+            `
+          )
+          .join('')}
+      </div>
+    `
+    : '';
+
+  return wrap(`
     ${heading('Review Approved — Payout Unlocked! 🎊')}
     ${subheading('Your review has been accepted and your earnings are now eligible')}
     ${divider()}
     ${greeting(name)}
     ${bodyText(
-      `Fantastic work! Your review for <strong>${projectName || 'your project'}</strong> has been 
+      `Fantastic work! Your review for <strong>${projectName || 'your project'}</strong>${products.length ? ` covering <strong>${products.map((product) => product.name).join(', ')}</strong>` : ''} has been 
        evaluated and <strong>officially approved</strong> by our quality team. You've completed 
        all the required steps — your payout is now unlocked and pending processing.`
     )}
@@ -382,6 +405,7 @@ const reviewApprovedEmail = (name, projectName, payoutAmount, dashboardUrl = 'ht
       ...(payoutAmount ? [{ label: 'Eligible Payout', value: `₹${Number(payoutAmount).toLocaleString('en-IN')}` }] : []),
       { label: 'Status', value: '✅ Payout Eligible' }
     ])}
+    ${productList}
     ${bodyText(
       `Your earnings will be processed in the next scheduled payout cycle. 
        You can monitor the status of your payment directly from your dashboard.`
@@ -396,11 +420,12 @@ const reviewApprovedEmail = (name, projectName, payoutAmount, dashboardUrl = 'ht
       <strong style="color:#1a1a2e;">The Nitro Team</strong>
     </p>
   `);
+};
 
 // ─────────────────────────────────────────────
 // 7. REVIEW REJECTED
 // ─────────────────────────────────────────────
-const reviewRejectedEmail = (name, projectName, reason = '', resubmitUrl = 'https://nitro.com/dashboard') =>
+const reviewRejectedEmail = (name, projectName, reason = '', resubmitUrl = `${frontendUrl}/dashboard`) =>
   wrap(`
     ${heading('Review Needs Revision 📝')}
     ${subheading('Please update and resubmit your review')}
@@ -456,7 +481,7 @@ const allocationReminderEmail = ({
   daysLeft,
   expiryDate,
   products = [],
-  dashboardUrl = 'https://nitro.com/dashboard'
+  dashboardUrl = `${frontendUrl}/dashboard`
 }) => {
   // ── Urgency config per reminder day ──────────────────────────────────────
   const isLastWarning = dayNumber === 19;
@@ -583,7 +608,7 @@ const allocationReminderEmail = ({
  * @param {Array}  products     - [{ name, image_url, product_value }]
  * @param {string} reapplyUrl   - Explore projects CTA
  */
-const allocationExpiredEmail = ({ name, projectName, products = [], reapplyUrl = 'https://nitro.com/projects' }) => {
+const allocationExpiredEmail = ({ name, projectName, products = [], reapplyUrl = `${frontendUrl}/projects` }) => {
   const productList = products.length ? `
     <p style="margin:24px 0 12px;font-size:15px;font-weight:700;color:#1a1a2e;">
       Cancelled Product${products.length > 1 ? 's' : ''}:
@@ -667,7 +692,7 @@ const adminBudgetRestoredEmail = ({
   projectId,
   expiredSlots = [],
   restoredAmount = 0,
-  dashboardUrl = 'https://nitro.com/admin/product-applications'
+  dashboardUrl = `${frontendUrl}/admin/product-applications`
 }) => {
   const fmt = (n) =>
     new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(Number(n || 0));
@@ -762,7 +787,7 @@ const payoutPaidEmail = (
   name,
   items = [],
   totalAmount = 0,
-  dashboardUrl = 'https://nitro.com/dashboard'
+  dashboardUrl = `${frontendUrl}/dashboard`
 ) => {
   const fmt = (n) =>
     new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(Number(n || 0));
@@ -861,7 +886,7 @@ const productDecisionEmail = (
   projectTitle = 'Project',
   approved = [],
   rejected = [],
-  dashboardUrl = 'https://nitro.com/dashboard',
+  dashboardUrl = `${frontendUrl}/dashboard`,
   invoiceUrl = null,   // direct link to participant's allocation/active page
   reviewUrl = null     // direct link to review submission page (same page post-purchase)
 ) => {
@@ -1089,7 +1114,7 @@ const allocationCancelledParticipantEmail = ({
   name,
   projectName,
   products = [],
-  browseUrl = 'https://nitro.com/projects'
+  browseUrl = `${frontendUrl}/projects`
 }) => {
   const productList = products.length ? `
     <p style="margin:24px 0 12px;font-size:15px;font-weight:700;color:#1a1a2e;">
@@ -1175,7 +1200,7 @@ const adminAllocationCancelledEmail = ({
   projectId,
   products = [],
   restoredAmount = 0,
-  dashboardUrl = 'https://nitro.com/admin/product-applications'
+  dashboardUrl = `${frontendUrl}/admin/product-applications`
 }) => {
   const fmt = (n) =>
     new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(Number(n || 0));
@@ -1249,3 +1274,5 @@ module.exports = {
   allocationCancelledParticipantEmail,
   adminAllocationCancelledEmail,
 };
+const env = require('../config/env');
+const frontendUrl = String(env.frontendUrl || 'http://localhost:5173').replace(/\/$/, '');
