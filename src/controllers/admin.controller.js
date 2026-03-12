@@ -1796,28 +1796,65 @@ const rejectProjectAccessRequest = async (req, res, next) => {
 const getPendingProductApplications = async (req, res, next) => {
   try {
     const requestedStatus = String(req.query.status || 'PENDING').toUpperCase();
+    const statusFilterMap = {
+      PENDING: ['PENDING'],
+      APPROVED: ['APPROVED', 'PURCHASED', 'COMPLETED'],
+      REJECTED: ['REJECTED'],
+      ALL: ['PENDING', 'APPROVED', 'PURCHASED', 'COMPLETED', 'REJECTED']
+    };
+    const effectiveStatuses = statusFilterMap[requestedStatus] || ['PENDING'];
     const page = Math.max(1, Number(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 25));
     const from = (page - 1) * limit;
     const to = from + limit - 1;
 
-    const { data: applications, count, error } = await supabase
+    let applicationsQuery = supabase
       .from('project_applications')
       .select(
-      `
-        id,
-        project_id,
-        participant_id,
-        product_id,
-        allocated_budget,
-        status,
-        created_at
-      `,
-      { count: 'exact' }
+        `
+          id,
+          project_id,
+          participant_id,
+          product_id,
+          allocated_budget,
+          status,
+          created_at,
+          updated_at,
+          reviewed_at
+        `,
+        { count: 'exact' }
       )
-      .in('status', requestedStatus === 'ALL' ? ['PENDING', 'APPROVED', 'REJECTED'] : [requestedStatus])
-      .order('created_at', { ascending: true })
+      .in('status', effectiveStatuses)
+      .order('reviewed_at', { ascending: false })
+      .order('updated_at', { ascending: false })
+      .order('created_at', { ascending: false })
       .range(from, to);
+
+    let { data: applications, count, error } = await applicationsQuery;
+
+    if (error && /updated_at/i.test(String(error.message || ''))) {
+      applicationsQuery = supabase
+        .from('project_applications')
+        .select(
+          `
+            id,
+            project_id,
+            participant_id,
+            product_id,
+            allocated_budget,
+            status,
+            created_at,
+            reviewed_at
+          `,
+          { count: 'exact' }
+        )
+        .in('status', effectiveStatuses)
+        .order('reviewed_at', { ascending: false })
+        .order('created_at', { ascending: false })
+        .range(from, to);
+
+      ({ data: applications, count, error } = await applicationsQuery);
+    }
 
     if (error) throw error;
 

@@ -158,58 +158,28 @@ const applyToProject = async (req, res, next) => {
       });
     }
 
-    let data = null;
-    if (existing && ['REJECTED', 'COMPLETED', 'PURCHASED', 'APPROVED'].includes(existingStatus)) {
-      let updateRes = await supabase
-        .from('project_applications')
-        .update({
-          status: 'PENDING',
-          allocated_budget: null,
-          reviewed_at: null
-        })
-        .eq('id', existing.id)
-        .select()
-        .single();
+    const insertRes = await supabase
+      .from('project_applications')
+      .insert({
+        project_id: projectId,
+        participant_id: participantId,
+        product_id: productId,
+        status: 'PENDING'
+      })
+      .select()
+      .single();
 
-      if (updateRes.error && isMissingSchemaObjectError(updateRes.error)) {
-        updateRes = await supabase
-          .from('project_applications')
-          .update({
-            status: 'PENDING',
-            allocated_budget: null
-          })
-          .eq('id', existing.id)
-          .select()
-          .single();
+    if (insertRes.error) {
+      if (insertRes.error.code === '23505') {
+        return res.status(409).json({
+          success: false,
+          message: 'Repeat application is blocked by the current database constraint. Run the repeat-application SQL patch first.'
+        });
       }
-
-      if (updateRes.error) throw updateRes.error;
-      data = updateRes.data;
-    } else {
-      const insertRes = await supabase
-        .from('project_applications')
-        .insert({
-          project_id: projectId,
-          participant_id: participantId,
-          product_id: productId,
-          status: 'PENDING'
-        })
-        .select()
-        .single();
-
-      if (insertRes.error) {
-        if (insertRes.error.code === '23505') {
-          return res.status(200).json({
-            success: true,
-            alreadyPending: true,
-            message: 'You have already applied for this product. Please wait for admin approval.'
-          });
-        }
-        throw insertRes.error;
-      }
-
-      data = insertRes.data;
+      throw insertRes.error;
     }
+
+    const data = insertRes.data;
 
     const { data: participantProfile } = await supabase
       .from('profiles')

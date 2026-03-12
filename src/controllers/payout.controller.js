@@ -604,16 +604,67 @@ const getMyPayouts = async (req, res, next) => {
       }
     }
 
-    const seenKeys = new Set();
-    const dedupedPayoutRows = payoutRows.filter(row => {
-      const key = `${row.project_id}::${row.product_id || '__none__'}`;
-      if (seenKeys.has(key)) return false;
-      seenKeys.add(key);
-      return true;
-    });
+    const [proofsRes, reviewsRes, appsRes] = await Promise.all([
+      supabase
+        .from('purchase_proofs')
+        .select('id, allocation_id, participant_id, product_id, status, uploaded_at')
+        .eq('participant_id', participantId)
+        .in('status', ['PENDING', 'APPROVED'])
+        .order('uploaded_at', { ascending: false }),
+      supabase
+        .from('participant_reviews')
+        .select('id, participant_id, project_id, product_id, status, created_at')
+        .eq('participant_id', participantId)
+        .in('status', ['PENDING', 'APPROVED'])
+        .order('created_at', { ascending: false }),
+      supabase
+        .from('project_applications')
+        .select('id, participant_id, project_id, product_id, status, reviewed_at, created_at, projects ( id, title, name )')
+        .eq('participant_id', participantId)
+        .not('product_id', 'is', null)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('reviewed_at', { ascending: false })
+        .order('created_at', { ascending: false })
+    ]);
+
+    if (proofsRes.error && !isMissingSchemaObjectError(proofsRes.error)) throw proofsRes.error;
+    if (reviewsRes.error && !isMissingSchemaObjectError(reviewsRes.error)) throw reviewsRes.error;
+    if (appsRes.error && !isMissingSchemaObjectError(appsRes.error)) throw appsRes.error;
+
+    const latestProofByProduct = new Map();
+    for (const proof of (proofsRes.data || [])) {
+      if (!proof?.product_id) continue;
+      const key = String(proof.product_id);
+      if (!latestProofByProduct.has(key)) latestProofByProduct.set(key, proof);
+    }
+
+    const latestReviewByProjectProduct = new Map();
+    for (const review of (reviewsRes.data || [])) {
+      const key = `${review.project_id}::${review.product_id || ''}`;
+      if (!latestReviewByProjectProduct.has(key)) latestReviewByProjectProduct.set(key, review);
+    }
+
+    const latestAppByProjectProduct = new Map();
+    for (const app of (appsRes.data || [])) {
+      const key = `${app.project_id}::${app.product_id || ''}`;
+      if (!latestAppByProjectProduct.has(key)) latestAppByProjectProduct.set(key, app);
+    }
+
+    const appProductIds = [...new Set((appsRes.data || []).map((row) => row.product_id).filter(Boolean))];
+    const missingAppProductIds = appProductIds.filter((id) => !productMap.has(id));
+    if (missingAppProductIds.length) {
+      const { data: appProductRows, error: appProductError } = await supabase
+        .from('project_products')
+        .select('id, name, product_value')
+        .in('id', missingAppProductIds);
+      if (appProductError && !isMissingSchemaObjectError(appProductError)) throw appProductError;
+      for (const row of (appProductRows || [])) productMap.set(row.id, row);
+    }
+
+    const actualPayoutRows = payoutRows;
 
     const breakdownCache = new Map();
-    const enriched = await Promise.all(dedupedPayoutRows.map(async row => {
+    const enrichedPayouts = await Promise.all(actualPayoutRows.map(async row => {
       const cacheKey = `${row.participant_id}::${row.project_id}`;
       let breakdown  = breakdownCache.get(cacheKey);
       if (!breakdown) {
@@ -638,7 +689,45 @@ const getMyPayouts = async (req, res, next) => {
       };
     }));
 
-    res.json({ success: true, data: enriched });
+    const existingActualKeys = new Set(
+      actualPayoutRows.map((row) => `${row.project_id}::${row.product_id || ''}`)
+    );
+
+    const syntheticPendingRows = Array.from(latestAppByProjectProduct.values())
+      .map((app) => {
+        const key = `${app.project_id}::${app.product_id || ''}`;
+        if (existingActualKeys.has(key)) return null;
+
+        const proof = app.product_id ? latestProofByProduct.get(String(app.product_id)) || null : null;
+        const review = latestReviewByProjectProduct.get(key) || null;
+        if (!proof || !review) return null;
+
+        const product = app.product_id ? (productMap.get(app.product_id) || null) : null;
+        const createdAt = review?.created_at || proof?.uploaded_at || app.reviewed_at || app.created_at || null;
+
+        return {
+          id: `pending::${app.id}`,
+          amount: Number(product?.product_value || 0),
+          status: 'PENDING',
+          created_at: createdAt,
+          payout_batch_id: null,
+          participant_id: app.participant_id,
+          project_id: app.project_id,
+          product_id: app.product_id || null,
+          projects: app.projects || null,
+          project_products: product,
+          reward_amount: 0,
+          product_amount: Number(product?.product_value || 0),
+          total_amount: Number(product?.product_value || 0),
+          eligibility_reason: 'Invoice and review submitted. Waiting for admin approval.'
+        };
+      })
+      .filter(Boolean);
+
+    const finalRows = [...syntheticPendingRows, ...enrichedPayouts]
+      .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+
+    res.json({ success: true, data: finalRows });
   } catch (err) {
     next(err);
   }
