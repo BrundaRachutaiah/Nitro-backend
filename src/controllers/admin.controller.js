@@ -29,6 +29,12 @@ const isMissingSchemaObjectError = (error) => {
 };
 
 const normalizeStatus = (value) => String(value || '').trim().toUpperCase();
+const buildAllocationProductKey = (allocationId, productId) =>
+  `${allocationId || '__no_alloc__'}::${productId || '__allocation__'}`;
+const buildParticipantProjectProductKey = (participantId, projectId, productId) =>
+  `${participantId || '__no_participant__'}::${projectId || '__no_project__'}::${productId || '__no_product__'}`;
+const buildParticipantProductKey = (participantId, productId) =>
+  `${participantId || '__no_participant__'}::${productId || '__no_product__'}`;
 
 const toAmount = (value) => {
   const num = Number(value);
@@ -3983,19 +3989,19 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
   if (payoutIds.length) {
     payoutsRes = await supabase
       .from('payouts')
-      .select('id, amount, status, payout_batch_id, participant_id, project_id, product_id')
+      .select('id, amount, status, payout_batch_id, participant_id, project_id, product_id, purchase_proof_id')
       .in('id', payoutIds);
   } else {
     payoutsRes = await supabase
       .from('payouts')
-      .select('id, amount, status, payout_batch_id, participant_id, project_id, product_id')
+      .select('id, amount, status, payout_batch_id, participant_id, project_id, product_id, purchase_proof_id')
       .in('payout_batch_id', batchIds);
   }
   // schema-cache fallback — drop product_id if column missing
   if (payoutsRes.error && isMissingSchemaObjectError(payoutsRes.error)) {
     payoutsRes = payoutIds.length
-      ? await supabase.from('payouts').select('id, amount, status, payout_batch_id, participant_id, project_id').in('id', payoutIds)
-      : await supabase.from('payouts').select('id, amount, status, payout_batch_id, participant_id, project_id').in('payout_batch_id', batchIds);
+      ? await supabase.from('payouts').select('id, amount, status, payout_batch_id, participant_id, project_id, purchase_proof_id').in('id', payoutIds)
+      : await supabase.from('payouts').select('id, amount, status, payout_batch_id, participant_id, project_id, purchase_proof_id').in('payout_batch_id', batchIds);
   }
   if (payoutsRes.error) throw payoutsRes.error;
   const payouts = payoutsRes.data || [];
@@ -4076,24 +4082,29 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
   // ── 7. Unit allocations: participant+project → allocation_id ─────────────
   //    Reviews and proofs are stored by allocation_id, so we need this bridge.
   let allocByParticipantProject = new Map(); // "participantId::projectId" → allocation_id
-  if (participantIds.length && projectIds.length) {
+  let allocIdsByParticipant = new Map(); // participantId → allocation ids[]
+  if (participantIds.length) {
     const r = await supabase
       .from('unit_allocations')
       .select('id, participant_id, project_id')
-      .in('participant_id', participantIds)
-      .in('project_id', projectIds);
+      .in('participant_id', participantIds);
     if (!r.error) {
       for (const a of (r.data || [])) {
         const key = `${a.participant_id}::${a.project_id}`;
-        if (!allocByParticipantProject.has(key)) allocByParticipantProject.set(key, a.id);
+        if (a.project_id && !allocByParticipantProject.has(key)) allocByParticipantProject.set(key, a.id);
+        if (!allocIdsByParticipant.has(a.participant_id)) allocIdsByParticipant.set(a.participant_id, []);
+        allocIdsByParticipant.get(a.participant_id).push(a.id);
       }
     }
   }
 
-  const allAllocIds = [...allocByParticipantProject.values()];
+  const allAllocIds = [...new Set(Array.from(allocIdsByParticipant.values()).flat().filter(Boolean))];
 
   // ── 8. Purchase proofs (invoices) — fetched by allocation_id ─────────────
+  let proofById = new Map(); // proof id → proof row
   let proofByAllocId = new Map(); // allocation_id → proof row
+  let proofByAllocProduct = new Map(); // allocation_id::product_id → proof row
+  let proofByParticipantProduct = new Map(); // participant_id::product_id → proof row
   if (allAllocIds.length) {
     // Try with product_id column first
     let r = await supabase
@@ -4108,6 +4119,17 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
     }
     if (!r.error) {
       for (const p of (r.data || [])) {
+        if (p.id) proofById.set(p.id, p);
+        const allocProductKey = buildAllocationProductKey(p.allocation_id, p.product_id);
+        const existingByProduct = proofByAllocProduct.get(allocProductKey);
+        if (!existingByProduct || String(p.status || '').toUpperCase() === 'APPROVED') {
+          proofByAllocProduct.set(allocProductKey, p);
+        }
+        const participantProductKey = buildParticipantProductKey(p.participant_id, p.product_id);
+        const existingParticipantProduct = proofByParticipantProduct.get(participantProductKey);
+        if (!existingParticipantProduct || String(p.status || '').toUpperCase() === 'APPROVED') {
+          proofByParticipantProduct.set(participantProductKey, p);
+        }
         // Prefer APPROVED proof; otherwise keep first found
         const existing = proofByAllocId.get(p.allocation_id);
         if (!existing || String(p.status || '').toUpperCase() === 'APPROVED') {
@@ -4119,19 +4141,40 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
 
   // ── 9. Participant reviews — fetched by allocation_id + direct project_id ─
   let reviewByAllocId      = new Map(); // allocation_id → review row
+  let reviewByAllocProduct = new Map(); // allocation_id::product_id → review row
   let reviewByParticipantProject = new Map(); // "participantId::projectId" → review row
+  let reviewByParticipantProjectProduct = new Map(); // "participantId::projectId::productId" → review row
+  let reviewByParticipantProduct = new Map(); // "participantId::productId" → review row
   if (participantIds.length) {
-    const r = await supabase
+    let r = await supabase
       .from('participant_reviews')
-      .select('id, allocation_id, participant_id, project_id, review_text, review_url, status')
+      .select('id, allocation_id, participant_id, project_id, product_id, review_text, review_url, status')
       .in('participant_id', participantIds);
+    if (r.error && isMissingSchemaObjectError(r.error)) {
+      r = await supabase
+        .from('participant_reviews')
+        .select('id, allocation_id, participant_id, project_id, review_text, review_url, status')
+        .in('participant_id', participantIds);
+    }
     if (!r.error) {
       for (const rev of (r.data || [])) {
         // By allocation_id
         if (rev.allocation_id) {
+          const allocProductKey = buildAllocationProductKey(rev.allocation_id, rev.product_id);
+          const existingByProduct = reviewByAllocProduct.get(allocProductKey);
+          if (!existingByProduct || String(rev.status || '').toUpperCase() === 'APPROVED') {
+            reviewByAllocProduct.set(allocProductKey, rev);
+          }
           const existing = reviewByAllocId.get(rev.allocation_id);
           if (!existing || String(rev.status || '').toUpperCase() === 'APPROVED') {
             reviewByAllocId.set(rev.allocation_id, rev);
+          }
+        }
+        if (rev.product_id) {
+          const participantProductKey = buildParticipantProductKey(rev.participant_id, rev.product_id);
+          const existingParticipantProduct = reviewByParticipantProduct.get(participantProductKey);
+          if (!existingParticipantProduct || String(rev.status || '').toUpperCase() === 'APPROVED') {
+            reviewByParticipantProduct.set(participantProductKey, rev);
           }
         }
         // By participant+project (fallback when allocation_id is null on review row)
@@ -4140,6 +4183,11 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
           const existing = reviewByParticipantProject.get(key);
           if (!existing || String(rev.status || '').toUpperCase() === 'APPROVED') {
             reviewByParticipantProject.set(key, rev);
+          }
+          const keyWithProduct = buildParticipantProjectProductKey(rev.participant_id, rev.project_id, rev.product_id);
+          const existingWithProduct = reviewByParticipantProjectProduct.get(keyWithProduct);
+          if (!existingWithProduct || String(rev.status || '').toUpperCase() === 'APPROVED') {
+            reviewByParticipantProjectProduct.set(keyWithProduct, rev);
           }
         }
       }
@@ -4155,6 +4203,8 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
   return payouts.map((row) => {
     const ppKey   = `${row.participant_id}::${row.project_id}`;
     const allocId = allocByParticipantProject.get(ppKey) || null;
+    const pppKey  = buildParticipantProjectProductKey(row.participant_id, row.project_id, row.product_id);
+    const participantProductKey = buildParticipantProductKey(row.participant_id, row.product_id);
 
     // Product: direct product_id → project_products, else fallback via project_applications
     const directProduct  = productMap.get(row.product_id) || null;
@@ -4167,12 +4217,37 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
     );
 
     // Invoice: look up proof by allocation_id
-    const proof = allocId ? (proofByAllocId.get(allocId) || null) : null;
+    const participantAllocIds = allocIdsByParticipant.get(row.participant_id) || [];
+    const proofFromParticipantAllocs = participantAllocIds
+      .map((id) => proofByAllocProduct.get(buildAllocationProductKey(id, row.product_id)) || proofByAllocId.get(id) || null)
+      .find(Boolean) || null;
+    const proof = proofById.get(row.purchase_proof_id)
+      || proofByParticipantProduct.get(participantProductKey)
+      || (allocId
+        ? (
+            proofByAllocProduct.get(buildAllocationProductKey(allocId, row.product_id))
+            || proofByAllocId.get(allocId)
+            || null
+          )
+        : null)
+      || proofFromParticipantAllocs;
 
     // Review: by allocation_id first, then participant+project direct
-    const review = (allocId ? reviewByAllocId.get(allocId) : null)
-                || reviewByParticipantProject.get(ppKey)
-                || null;
+    const review = (
+      allocId
+        ? (
+            reviewByAllocProduct.get(buildAllocationProductKey(allocId, row.product_id))
+            || reviewByAllocId.get(allocId)
+            || null
+          )
+        : null
+    ) || reviewByParticipantProjectProduct.get(pppKey)
+      || reviewByParticipantProduct.get(participantProductKey)
+      || reviewByParticipantProject.get(ppKey)
+      || participantAllocIds
+        .map((id) => reviewByAllocProduct.get(buildAllocationProductKey(id, row.product_id)) || reviewByAllocId.get(id) || null)
+        .find(Boolean)
+      || null;
 
     const project = projectMap.get(row.project_id) || null;
     const brand   = project?.created_by ? (brandMap.get(project.created_by) || null) : null;

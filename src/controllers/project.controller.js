@@ -821,22 +821,36 @@ const getCompletedProjects = async (req, res, next) => {
       throw completedRes.error;
     }
 
-    // ── 2. Also fetch APPROVED/PURCHASED applications that have an ELIGIBLE+ payout ──
-    // This shows products as "completed" from the participant's perspective as soon
-    // as their payout is ready — even before the admin marks the batch as paid.
+    // ── 2. Also fetch payout state so the UI can distinguish Payment Pending vs Completed ──
+    // This also lets APPROVED/PURCHASED applications appear in Completed once a payout exists.
     let eligiblePayoutApps = [];
+    let payoutByKey = new Map();
+    let payoutByProject = new Map();
     try {
-      const { data: payoutRows, error: payoutErr } = await supabase
+      let payoutLookup = await supabase
         .from('payouts')
-        .select('project_id, product_id')
+        .select('id, project_id, product_id, amount, status, payout_batch_id, created_at')
         .eq('participant_id', participantId)
         .in('status', ['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID']);
 
+      if (payoutLookup.error && /product_id/i.test(String(payoutLookup.error.message || ''))) {
+        payoutLookup = await supabase
+          .from('payouts')
+          .select('id, project_id, amount, status, payout_batch_id, created_at')
+          .eq('participant_id', participantId)
+          .in('status', ['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID']);
+      }
+
+      const { data: payoutRows, error: payoutErr } = payoutLookup;
+
       if (!payoutErr && payoutRows && payoutRows.length > 0) {
-        // Build a set of project+product pairs that have payouts
-        const payoutKeySet = new Set(
-          payoutRows.map((p) => `${p.project_id}::${p.product_id || ''}`)
-        );
+        for (const payout of payoutRows) {
+          const key = `${payout.project_id}::${payout.product_id || ''}`;
+          if (!payoutByKey.has(key)) payoutByKey.set(key, payout);
+          if (payout.project_id && !payoutByProject.has(payout.project_id)) {
+            payoutByProject.set(payout.project_id, payout);
+          }
+        }
 
         // Fetch the corresponding APPROVED/PURCHASED applications (not yet COMPLETED)
         let pendingAppsRes = await supabase
@@ -857,9 +871,17 @@ const getCompletedProjects = async (req, res, next) => {
 
         for (const app of (pendingAppsRes.data || [])) {
           const key = `${app.project_id}::${app.product_id || ''}`;
-          if (payoutKeySet.has(key)) {
+          const payout = payoutByKey.get(key) || payoutByProject.get(app.project_id) || null;
+          if (payout) {
             // Treat as completed for display purposes
-            eligiblePayoutApps.push({ ...app, status: 'COMPLETED' });
+            eligiblePayoutApps.push({
+              ...app,
+              status: 'COMPLETED',
+              payout_status: payout.status || null,
+              payout_amount: Number(payout.amount || 0),
+              payout_batch_id: payout.payout_batch_id || null,
+              payout_created_at: payout.created_at || null
+            });
           }
         }
       }
@@ -874,7 +896,15 @@ const getCompletedProjects = async (req, res, next) => {
     for (const row of [...(completedRes.data || []), ...eligiblePayoutApps]) {
       if (!seenIds.has(row.id)) {
         seenIds.add(row.id);
-        merged.push({ ...row, completed_at: row.reviewed_at || row.created_at || null });
+        const payout = payoutByKey.get(`${row.project_id}::${row.product_id || ''}`) || payoutByProject.get(row.project_id) || null;
+        merged.push({
+          ...row,
+          completed_at: row.reviewed_at || row.created_at || payout?.created_at || null,
+          payout_status: row.payout_status || payout?.status || null,
+          payout_amount: Number(row.payout_amount || payout?.amount || 0),
+          payout_batch_id: row.payout_batch_id || payout?.payout_batch_id || null,
+          payout_created_at: row.payout_created_at || payout?.created_at || null
+        });
       }
     }
 
