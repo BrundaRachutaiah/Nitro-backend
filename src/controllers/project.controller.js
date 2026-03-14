@@ -498,7 +498,7 @@ const getAppliedProjects = async (req, res, next) => {
       `
       )
       .eq('participant_id', participantId)
-      .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED, APPLICATION_STATUS.PURCHASED, APPLICATION_STATUS.REJECTED])
+      .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.REJECTED])
       .order('created_at', { ascending: false }));
 
     // Fallback — if reviewed_at column doesn't exist yet, retry without it
@@ -526,10 +526,10 @@ const getAppliedProjects = async (req, res, next) => {
             product_value
           )
         `
-        )
-        .eq('participant_id', participantId)
-        .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.APPROVED, APPLICATION_STATUS.PURCHASED, APPLICATION_STATUS.REJECTED])
-        .order('created_at', { ascending: false }));
+         )
+         .eq('participant_id', participantId)
+         .in('status', [APPLICATION_STATUS.PENDING, APPLICATION_STATUS.REJECTED])
+         .order('created_at', { ascending: false }));
     }
 
     if (error) throw error;
@@ -776,8 +776,15 @@ const getCompletedProjects = async (req, res, next) => {
     }
 
     // ── 2. Also fetch proof/review state and payout state for submitted products ──
-    let proofByKey = new Map();
-    let reviewByKey = new Map();
+    let proofByKey = new Map(); // allocation_id::product_id -> latest proof
+    let proofById = new Map(); // proof_id -> proof row
+    let proofsByProduct = new Map(); // product_id -> proof rows
+    let allocationProjectById = new Map(); // allocation_id -> project_id (from proof allocations)
+
+    let reviewByKey = new Map(); // project_id::product_id -> latest review
+    let reviewsByProjectProduct = new Map(); // project_id::product_id -> review rows
+    let reviewByAllocationProduct = new Map(); // allocation_id::product_id -> latest review
+
     let payoutByKey = new Map();
     let payoutByProject = new Map();
     try {
@@ -798,16 +805,29 @@ const getCompletedProjects = async (req, res, next) => {
       const { data: proofRows, error: proofErr } = proofLookup;
       if (proofErr && !isMissingTableOrColumn(proofErr)) throw proofErr;
 
+      let reviewSelect = 'id, allocation_id, project_id, product_id, status, created_at';
       let reviewLookup = await supabase
         .from('participant_reviews')
-        .select('id, project_id, product_id, status, created_at')
+        .select(reviewSelect)
         .eq('participant_id', participantId)
         .in('status', ['PENDING', 'APPROVED']);
 
-      if (reviewLookup.error && /product_id/i.test(String(reviewLookup.error.message || ''))) {
+      if (reviewLookup.error && /allocation_id/i.test(String(reviewLookup.error.message || ''))) {
+        reviewSelect = 'id, project_id, product_id, status, created_at';
         reviewLookup = await supabase
           .from('participant_reviews')
-          .select('id, project_id, status, created_at')
+          .select(reviewSelect)
+          .eq('participant_id', participantId)
+          .in('status', ['PENDING', 'APPROVED']);
+      }
+
+      if (reviewLookup.error && /product_id/i.test(String(reviewLookup.error.message || ''))) {
+        reviewSelect = reviewSelect.includes('allocation_id')
+          ? 'id, allocation_id, project_id, status, created_at'
+          : 'id, project_id, status, created_at';
+        reviewLookup = await supabase
+          .from('participant_reviews')
+          .select(reviewSelect)
           .eq('participant_id', participantId)
           .in('status', ['PENDING', 'APPROVED']);
       }
@@ -832,25 +852,56 @@ const getCompletedProjects = async (req, res, next) => {
       const { data: payoutRows, error: payoutErr } = payoutLookup;
 
       if (!proofErr && Array.isArray(proofRows)) {
+        const proofAllocIds = [...new Set(proofRows.map((p) => p?.allocation_id).filter(Boolean))];
+        if (proofAllocIds.length) {
+          const allocRes = await supabase
+            .from('unit_allocations')
+            .select('id, project_id')
+            .in('id', proofAllocIds);
+
+          if (!allocRes.error) {
+            allocationProjectById = new Map((allocRes.data || []).map((a) => [a.id, a.project_id]));
+          }
+        }
+
         for (const proof of proofRows) {
-          if (!proof?.product_id) continue;
-          const existing = proofByKey.get(String(proof.product_id));
+          if (proof?.id) proofById.set(String(proof.id), proof);
+
+          if (proof?.product_id) {
+            const productKey = String(proof.product_id);
+            if (!proofsByProduct.has(productKey)) proofsByProduct.set(productKey, []);
+            proofsByProduct.get(productKey).push(proof);
+          }
+
+          if (!proof?.allocation_id || !proof?.product_id) continue;
+          const key = `${proof.allocation_id}::${proof.product_id}`;
+          const existing = proofByKey.get(key);
           const existingTime = new Date(existing?.uploaded_at || existing?.created_at || 0).getTime();
           const nextTime = new Date(proof.uploaded_at || proof.created_at || 0).getTime();
-          if (!existing || nextTime >= existingTime) {
-            proofByKey.set(String(proof.product_id), proof);
-          }
+          if (!existing || nextTime >= existingTime) proofByKey.set(key, proof);
         }
       }
 
       if (!reviewErr && Array.isArray(reviewRows)) {
         for (const review of reviewRows) {
           const key = buildProjectProductKey(review.project_id, review.product_id);
+          if (!reviewsByProjectProduct.has(key)) reviewsByProjectProduct.set(key, []);
+          reviewsByProjectProduct.get(key).push(review);
+
           const existing = reviewByKey.get(key);
           const existingTime = new Date(existing?.created_at || 0).getTime();
           const nextTime = new Date(review.created_at || 0).getTime();
           if (!existing || nextTime >= existingTime) {
             reviewByKey.set(key, review);
+          }
+
+          if (review?.allocation_id && (review?.product_id || review?.product_id === null)) {
+            const allocKey = `${review.allocation_id}::${review.product_id || ''}`;
+            const existingAlloc = reviewByAllocationProduct.get(allocKey);
+            const existingAllocTime = new Date(existingAlloc?.created_at || 0).getTime();
+            if (!existingAlloc || nextTime >= existingAllocTime) {
+              reviewByAllocationProduct.set(allocKey, review);
+            }
           }
         }
       }
@@ -880,11 +931,68 @@ const getCompletedProjects = async (req, res, next) => {
     }
 
     // ── 3. Derive participant-facing workflow stage ───────────────────────────
+    const pickLatestAfter = (rows, minTime, getTime) => {
+      if (!Array.isArray(rows) || rows.length === 0) return null;
+      let best = null;
+      let bestTime = -1;
+      for (const item of rows) {
+        const t = getTime(item);
+        if (!Number.isFinite(t)) continue;
+        if (minTime && t < minTime) continue;
+        if (!best || t >= bestTime) {
+          best = item;
+          bestTime = t;
+        }
+      }
+      return best;
+    };
+
     const merged = (completedRes.data || [])
       .map((row) => {
         const productId = row.product_id || row?.project_products?.id || null;
-        const proof = productId ? proofByKey.get(String(productId)) || null : null;
-        const review = reviewByKey.get(buildProjectProductKey(row.project_id, productId)) || reviewByKey.get(buildProjectProductKey(row.project_id, null)) || null;
+        const productIdStr = productId ? String(productId) : null;
+        const SKEW_MS = 2 * 60 * 1000;
+
+        const cycleAnchorAt = new Date(row.created_at || row.reviewed_at || 0).getTime();
+        const minArtifactTime = cycleAnchorAt ? (cycleAnchorAt - SKEW_MS) : 0;
+
+        const payoutCandidate = payoutByKey.get(buildProjectProductKey(row.project_id, productId)) || null;
+
+        let proof = null;
+        if (payoutCandidate?.purchase_proof_id) {
+          proof = proofById.get(String(payoutCandidate.purchase_proof_id)) || null;
+        }
+        if (!proof && productIdStr) {
+          const proofs = proofsByProduct.get(productIdStr) || [];
+          const scoped = allocationProjectById.size
+            ? proofs.filter((p) => !p?.allocation_id || allocationProjectById.get(p.allocation_id) === row.project_id)
+            : proofs;
+          proof = pickLatestAfter(
+            scoped,
+            minArtifactTime,
+            (p) => new Date(p?.uploaded_at || p?.created_at || 0).getTime()
+          );
+        }
+
+        let review = null;
+        const reviewKey = buildProjectProductKey(row.project_id, productId);
+        const reviewCandidates = [
+          ...(reviewsByProjectProduct.get(reviewKey) || []),
+          ...(reviewsByProjectProduct.get(buildProjectProductKey(row.project_id, null)) || [])
+        ];
+        review = pickLatestAfter(
+          reviewCandidates,
+          minArtifactTime,
+          (r) => new Date(r?.created_at || 0).getTime()
+        ) || reviewByKey.get(reviewKey) || reviewByKey.get(buildProjectProductKey(row.project_id, null)) || null;
+
+        // If we can scope by allocation (repeat-cycle safety), prefer that match.
+        if (proof?.allocation_id && reviewByAllocationProduct.size) {
+          const allocKey = `${proof.allocation_id}::${productIdStr || ''}`;
+          const allocScopedReview = reviewByAllocationProduct.get(allocKey);
+          if (allocScopedReview) review = allocScopedReview;
+        }
+
         const proofCreatedAt = new Date(proof?.uploaded_at || proof?.created_at || 0).getTime();
         const reviewCreatedAt = new Date(review?.created_at || 0).getTime();
         // Cycle anchor: only treat proof/review timestamps as "submission started".
@@ -893,9 +1001,7 @@ const getCompletedProjects = async (req, res, next) => {
         // re-approved application and incorrectly mark it as completed.
         const submissionStartedAt = Math.max(proofCreatedAt, reviewCreatedAt);
 
-        const payoutCandidate = payoutByKey.get(buildProjectProductKey(row.project_id, productId)) || null;
         const payoutCandidateTime = new Date(payoutCandidate?.created_at || 0).getTime();
-        const SKEW_MS = 2 * 60 * 1000;
         const payoutMatchesCurrentCycle = Boolean(payoutCandidate) && (
           (proof?.id && payoutCandidate?.purchase_proof_id && String(payoutCandidate.purchase_proof_id) === String(proof.id))
           || (submissionStartedAt > 0 && payoutCandidateTime >= (submissionStartedAt - SKEW_MS))
@@ -907,7 +1013,7 @@ const getCompletedProjects = async (req, res, next) => {
         const payoutStatus = String(payout?.status || '').toUpperCase();
         const appStatus = String(row.status || '').toUpperCase();
 
-        const hasSubmittedArtifacts = Boolean(proof) && Boolean(review);
+        const hasSubmittedArtifacts = Boolean(proof) || Boolean(review);
         const adminApprovedSubmission =
           proofStatus === 'APPROVED' &&
           reviewStatus === 'APPROVED';

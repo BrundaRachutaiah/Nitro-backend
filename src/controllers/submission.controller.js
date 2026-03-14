@@ -184,11 +184,12 @@ const markApplicationCompleted = async ({ participantId, projectId, productId })
   }
 };
 
-const buildAppMapKey = (participantId, projectId) => `${participantId}::${projectId}`;
+const buildAppMapKey = (participantId, projectId, productId) =>
+  `${participantId}::${projectId}::${productId || '__none__'}`;
 
 const getApprovedApplicationMap = async (participantIds, projectIds) => {
   if (!participantIds.length || !projectIds.length) {
-    return new Map();
+    return { byKey: new Map(), singleByProject: new Map() };
   }
 
   let appRows = [];
@@ -249,18 +250,44 @@ const getApprovedApplicationMap = async (participantIds, projectIds) => {
     productMap = new Map((products || []).map((item) => [item.id, item]));
   }
 
-  const approvedApplicationMap = new Map();
+  const byKey = new Map();
+  const productIdsByParticipantProject = new Map(); // pid::proj -> Set(product_id)
+  const latestByParticipantProject = new Map(); // pid::proj -> { product_id, product_name }
+
   for (const row of appRows) {
-    const key = buildAppMapKey(row.participant_id, row.project_id);
-    if (!approvedApplicationMap.has(key)) {
-      approvedApplicationMap.set(key, {
-        product_id: row.product_id || null,
-        product_name: row?.project_products?.name || productMap.get(row.product_id)?.name || null
-      });
+    const participantProjectKey = `${row.participant_id}::${row.project_id}`;
+    const productId = row.product_id || null;
+    const productName = row?.project_products?.name || productMap.get(row.product_id)?.name || null;
+
+    byKey.set(buildAppMapKey(row.participant_id, row.project_id, productId), {
+      product_id: productId,
+      product_name: productName
+    });
+
+    if (!productIdsByParticipantProject.has(participantProjectKey)) {
+      productIdsByParticipantProject.set(participantProjectKey, new Set());
+    }
+    productIdsByParticipantProject.get(participantProjectKey).add(productId || '__none__');
+
+    // appRows are ordered by created_at desc (when available), so the first seen is the latest.
+    if (!latestByParticipantProject.has(participantProjectKey)) {
+      latestByParticipantProject.set(participantProjectKey, { product_id: productId, product_name: productName });
     }
   }
 
-  return approvedApplicationMap;
+  const singleByProject = new Map();
+  for (const [participantProjectKey, productSet] of productIdsByParticipantProject.entries()) {
+    if (productSet.size !== 1) continue;
+    const only = Array.from(productSet)[0];
+    const resolvedOnly = only === '__none__' ? null : only;
+    const latest = latestByParticipantProject.get(participantProjectKey);
+    singleByProject.set(participantProjectKey, {
+      product_id: resolvedOnly,
+      product_name: latest?.product_name || null
+    });
+  }
+
+  return { byKey, singleByProject };
 };
 
 const enrichReviewRows = async (rows) => {
@@ -280,7 +307,9 @@ const enrichReviewRows = async (rows) => {
   const projectMap = new Map(
     (projects || []).map((item) => [item.id, item.title || item.name || null])
   );
-  const appMap = await getApprovedApplicationMap(participantIds, projectIds);
+  const appIndex = await getApprovedApplicationMap(participantIds, projectIds);
+  const appMap = appIndex.byKey;
+  const singleAppByParticipantProject = appIndex.singleByProject;
   const { data: profiles, error: profileError } = participantIds.length
     ? await supabase
         .from('profiles')
@@ -290,12 +319,21 @@ const enrichReviewRows = async (rows) => {
   if (profileError) throw profileError;
 
   const profileMap = new Map((profiles || []).map((item) => [item.id, item]));
-  const directProductMap = await getProductNameMap(rows.map((row) => row.product_id));
+  const directProductMap = await getProductNameMap([
+    ...rows.map((row) => row.product_id),
+    ...Array.from(singleAppByParticipantProject.values()).map((v) => v?.product_id)
+  ]);
 
   return rows.map((row) => {
-    const app = appMap.get(buildAppMapKey(row.participant_id, row.project_id)) || {};
     const profile = profileMap.get(row.participant_id) || {};
-    const resolvedProductId = row.product_id || app.product_id || null;
+
+    const participantProjectKey = `${row.participant_id}::${row.project_id}`;
+    const fallbackSingle = singleAppByParticipantProject.get(participantProjectKey) || null;
+    const resolvedProductId = row.product_id || fallbackSingle?.product_id || null;
+    const app = resolvedProductId
+      ? (appMap.get(buildAppMapKey(row.participant_id, row.project_id, resolvedProductId)) || {})
+      : {};
+
     const screenshotData = buildReviewScreenshotData({
       reviewUrl: row.review_url,
       reviewText: row.review_text
@@ -392,11 +430,22 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
 
   // ── Step 2: Find approved reviews for this participant in this project ────
   // Reviews can store project_id directly OR link via allocation_id → unit_allocations
-  const { data: allReviews } = await supabase
+  let allReviewsRes = await supabase
     .from('participant_reviews')
-    .select('id, allocation_id, project_id, status')
+    .select('id, allocation_id, project_id, product_id, status')
     .eq('participant_id', participantId)
     .eq('status', 'APPROVED');
+
+  if (allReviewsRes.error && /product_id/i.test(String(allReviewsRes.error.message || ''))) {
+    allReviewsRes = await supabase
+      .from('participant_reviews')
+      .select('id, allocation_id, project_id, status')
+      .eq('participant_id', participantId)
+      .eq('status', 'APPROVED');
+  }
+
+  if (allReviewsRes.error) throw allReviewsRes.error;
+  const allReviews = allReviewsRes.data || [];
 
   const reviews = (allReviews || []).filter(r => {
     // Match by direct project_id if present
@@ -422,14 +471,31 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
   });
 
   const hasApprovedReview = approvedReviews.length > 0;
+  const approvedReviewProductIds = new Set(
+    approvedReviews
+      .map((r) => r?.product_id)
+      .filter(Boolean)
+      .map((id) => String(id))
+  );
 
   // ── Step 3: Find approved proofs for this participant in this project ─────
   // Proofs only have allocation_id, no project_id — resolve via unit_allocations
-  const { data: allProofs } = await supabase
+  let allProofsRes = await supabase
     .from('purchase_proofs')
-    .select('id, allocation_id, status')
+    .select('id, allocation_id, product_id, status')
     .eq('participant_id', participantId)
     .eq('status', 'APPROVED');
+
+  if (allProofsRes.error && /product_id/i.test(String(allProofsRes.error.message || ''))) {
+    allProofsRes = await supabase
+      .from('purchase_proofs')
+      .select('id, allocation_id, status')
+      .eq('participant_id', participantId)
+      .eq('status', 'APPROVED');
+  }
+
+  if (allProofsRes.error) throw allProofsRes.error;
+  const allProofs = allProofsRes.data || [];
 
   const proofAllocIds = (allProofs || []).map(p => p.allocation_id).filter(Boolean);
   let proofAllocMap = new Map();
@@ -451,6 +517,19 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
     return false;
   });
 
+  const approvedProofProductIds = new Set(
+    approvedProofs
+      .map((p) => p?.product_id)
+      .filter(Boolean)
+      .map((id) => String(id))
+  );
+  const approvedProofIdByProduct = new Map();
+  for (const proof of approvedProofs) {
+    if (!proof?.product_id) continue;
+    const key = String(proof.product_id);
+    if (!approvedProofIdByProduct.has(key)) approvedProofIdByProduct.set(key, proof.id);
+  }
+
   // Also check if ANY of the participant's allocations for this project have approved proofs
   // by querying unit_allocations for this project directly
   let hasApprovedProof = approvedProofs.length > 0;
@@ -469,7 +548,7 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
   if (mode === 'MARKETPLACE') {
     eligible = hasApprovedReview; // marketplace: review only
   } else {
-    eligible = hasApprovedProof || hasApprovedReview; // D2C / default: either
+    eligible = hasApprovedProof && hasApprovedReview; // D2C / default: BOTH required
   }
 
   if (!eligible) return; // participant not eligible yet
@@ -497,9 +576,6 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
     (existingPayouts || []).map(p => p.product_id || '__none__')
   );
 
-  // Canonical proof id for linking (use first approved proof)
-  const canonicalProofId = approvedProofs[0]?.id || null;
-
   // ── Step 7: Create payout for each uncovered product ─────────────────────
   const insertPayout = async (payload) => {
     const candidates = [
@@ -523,6 +599,28 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
     for (const application of apps) {
       const productKey = application.product_id || '__none__';
       if (coveredProductIds.has(productKey)) continue;
+
+      // Eligibility must be evaluated per product to avoid cross-product leakage.
+      const productIdStr = application.product_id ? String(application.product_id) : null;
+      const hasProductScopedReviews = approvedReviewProductIds.size > 0;
+      const hasProductScopedProofs = approvedProofProductIds.size > 0;
+
+      const productHasApprovedReview = (productIdStr && hasProductScopedReviews)
+        ? approvedReviewProductIds.has(productIdStr)
+        : hasApprovedReview;
+      const productHasApprovedProof = (productIdStr && hasProductScopedProofs)
+        ? approvedProofProductIds.has(productIdStr)
+        : hasApprovedProof;
+
+      const eligibleForThisProduct = mode === 'MARKETPLACE'
+        ? productHasApprovedReview
+        : (productHasApprovedProof && productHasApprovedReview);
+
+      if (!eligibleForThisProduct) continue;
+
+      const canonicalProofId = productIdStr
+        ? (approvedProofIdByProduct.get(productIdStr) || approvedProofs[0]?.id || null)
+        : (approvedProofs[0]?.id || null);
 
       let productAmount = Number(application.allocated_budget || 0);
       if (!productAmount && application.product_id) {
@@ -553,6 +651,7 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
   } else {
     // No applications — create a reward-only payout if not covered
     if (!coveredProductIds.has('__none__')) {
+      const canonicalProofId = approvedProofs[0]?.id || null;
       await insertPayout({
         participant_id: participantId,
         user_id: participantId,
@@ -1042,7 +1141,7 @@ const approveReview = async (req, res, next) => {
 
     const { data: project, error: projectError } = await supabase
       .from('projects')
-      .select('reward')
+      .select('reward, mode')
       .eq('id', reviewRow.project_id)
       .maybeSingle();
     if (!projectError) {
@@ -1057,23 +1156,73 @@ const approveReview = async (req, res, next) => {
       }
     }
 
-    try {
-      await markAllocationCompleted({
-        allocationId: reviewRow.allocation_id,
-        participantId: reviewRow.participant_id
-      });
-    } catch (allocationError) {
-      console.error('approveReview markAllocationCompleted warning:', allocationError);
+    // Only mark completed when the full submission requirements are met.
+    // - MARKETPLACE: review-only flow
+    // - D2C/default: BOTH invoice (purchase proof) and review must be approved
+    const mode = String(project?.mode || '').toUpperCase();
+    let canComplete = mode === 'MARKETPLACE';
+
+    if (!canComplete) {
+      try {
+        let proofRes = null;
+
+        if (reviewRow.product_id) {
+          proofRes = await supabase
+            .from('purchase_proofs')
+            .select('id')
+            .eq('allocation_id', reviewRow.allocation_id)
+            .eq('participant_id', reviewRow.participant_id)
+            .eq('product_id', reviewRow.product_id)
+            .eq('status', 'APPROVED')
+            .limit(1);
+
+          if (proofRes.error && isMissingSchemaObjectError(proofRes.error)) {
+            proofRes = null;
+          }
+        }
+
+        if (!proofRes) {
+          proofRes = await supabase
+            .from('purchase_proofs')
+            .select('id')
+            .eq('allocation_id', reviewRow.allocation_id)
+            .eq('participant_id', reviewRow.participant_id)
+            .eq('status', 'APPROVED')
+            .limit(1);
+        }
+
+        if (proofRes.error && !isMissingSchemaObjectError(proofRes.error)) {
+          throw proofRes.error;
+        }
+
+        canComplete = Array.isArray(proofRes.data)
+          ? proofRes.data.length > 0
+          : Boolean(proofRes.data?.id);
+      } catch (proofLookupError) {
+        console.error('approveReview proof lookup warning:', proofLookupError);
+        canComplete = false;
+      }
     }
 
-    try {
-      await markApplicationCompleted({
-        participantId: reviewRow.participant_id,
-        projectId: reviewRow.project_id,
-        productId: reviewRow.product_id || null
-      });
-    } catch (applicationError) {
-      console.error('approveReview markApplicationCompleted warning:', applicationError);
+    if (canComplete) {
+      try {
+        await markAllocationCompleted({
+          allocationId: reviewRow.allocation_id,
+          participantId: reviewRow.participant_id
+        });
+      } catch (allocationError) {
+        console.error('approveReview markAllocationCompleted warning:', allocationError);
+      }
+
+      try {
+        await markApplicationCompleted({
+          participantId: reviewRow.participant_id,
+          projectId: reviewRow.project_id,
+          productId: reviewRow.product_id || null
+        });
+      } catch (applicationError) {
+        console.error('approveReview markApplicationCompleted warning:', applicationError);
+      }
     }
 
     res.json({

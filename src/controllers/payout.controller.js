@@ -157,8 +157,6 @@ const deduplicatePayoutRows = async (participantId = null) => {
  */
 const getEligiblePayouts = async (req, res, next) => {
   try {
-    await backfillEligiblePayouts();
-
     const { data, error } = await supabase
       .from('payouts')
       .select('id, participant_id, project_id, product_id, amount, status, created_at, payout_batch_id')
@@ -898,7 +896,7 @@ const getMyPayouts = async (req, res, next) => {
  * KEY FIX: Only creates payouts when BOTH invoice (proof) AND review are approved.
  */
 const backfillEligiblePayouts = async () => {
-  const SKEW_MS = 2 * 60 * 1000;
+  const SKEW_MS = 10 * 60 * 1000;
   let appRes = await supabase
     .from('project_applications')
     .select('id, participant_id, project_id, product_id, allocated_budget, status, reviewed_at, created_at')
@@ -971,10 +969,33 @@ const backfillEligiblePayouts = async () => {
   const tryInsert = async (payload) => {
     for (const v of [payload, { ...payload, purchase_proof_id: undefined }]) {
       const clean = Object.fromEntries(Object.entries(v).filter(([, val]) => val !== undefined));
-      const { error } = await supabase.from('payouts').insert(clean);
-      if (!error) return true;
-      const msg = String(error.message || '').toLowerCase();
-      if (!msg.includes('does not exist') && !msg.includes('column') && !msg.includes('schema cache')) return false;
+
+      // Prefer idempotent writes when a unique constraint exists (recommended for ELIGIBLE rows).
+      let writeRes = await supabase
+        .from('payouts')
+        .upsert(clean, {
+          onConflict: 'participant_id,project_id,product_id,status',
+          ignoreDuplicates: true
+        });
+
+      if (writeRes.error) {
+        const msg = String(writeRes.error.message || '').toLowerCase();
+
+        // If ON CONFLICT isn't supported due to missing constraint, fall back to plain insert.
+        const conflictUnsupported =
+          msg.includes('no unique')
+          || msg.includes('on conflict')
+          || msg.includes('unique or exclusion constraint');
+
+        if (conflictUnsupported || isMissingSchemaObjectError(writeRes.error)) {
+          writeRes = await supabase.from('payouts').insert(clean);
+        }
+      }
+
+      if (!writeRes.error) return true;
+
+      const finalMsg = String(writeRes.error.message || '').toLowerCase();
+      if (!finalMsg.includes('does not exist') && !finalMsg.includes('column') && !finalMsg.includes('schema cache')) return false;
     }
     return false;
   };
@@ -997,7 +1018,7 @@ const backfillEligiblePayouts = async () => {
 
     // Allow a new ELIGIBLE payout when the application is from a newer cycle than
     // the last recorded payout for this same (participant, project, product).
-    const appTime = new Date(app.reviewed_at || app.created_at || 0).getTime();
+    const appTime = new Date(app.created_at || app.reviewed_at || 0).getTime();
     const lastPayoutTime = latestPayoutTimeByKey.get(covKey) || 0;
     if (coveredSet.has(covKey) && appTime && lastPayoutTime >= (appTime - SKEW_MS)) continue;
     const productAmount = Number(productMap.get(productId)?.product_value || 0);

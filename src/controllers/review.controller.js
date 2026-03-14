@@ -8,7 +8,8 @@ const {
 
 const { createPayoutIfBothApproved } = require('./payout.controller');
 
-const buildAppMapKey = (participantId, projectId) => `${participantId}::${projectId}`;
+const buildAppMapKey = (participantId, projectId, productId) =>
+  `${participantId}::${projectId}::${productId || '__none__'}`;
 
 const getApprovedProductsForParticipantProject = async (participantId, projectId) => {
   if (!participantId || !projectId) return [];
@@ -115,7 +116,7 @@ const fetchParticipantReviewRows = async (queryBuilder) => {
 
 const getApprovedApplicationMap = async (participantIds, projectIds) => {
   if (!participantIds.length || !projectIds.length) {
-    return new Map();
+    return { byKey: new Map(), singleByProject: new Map() };
   }
 
   let appRows = [];
@@ -176,18 +177,44 @@ const getApprovedApplicationMap = async (participantIds, projectIds) => {
     productMap = new Map((products || []).map((item) => [item.id, item]));
   }
 
-  const approvedApplicationMap = new Map();
+  const byKey = new Map();
+  const productIdsByParticipantProject = new Map(); // pid::proj -> Set(product_id)
+  const latestByParticipantProject = new Map(); // pid::proj -> { product_id, product_name }
+
   for (const row of appRows) {
-    const key = buildAppMapKey(row.participant_id, row.project_id);
-    if (!approvedApplicationMap.has(key)) {
-      approvedApplicationMap.set(key, {
-        product_id: row.product_id || null,
-        product_name: row?.project_products?.name || productMap.get(row.product_id)?.name || null
-      });
+    const participantProjectKey = `${row.participant_id}::${row.project_id}`;
+    const productId = row.product_id || null;
+    const productName = row?.project_products?.name || productMap.get(row.product_id)?.name || null;
+
+    byKey.set(buildAppMapKey(row.participant_id, row.project_id, productId), {
+      product_id: productId,
+      product_name: productName
+    });
+
+    if (!productIdsByParticipantProject.has(participantProjectKey)) {
+      productIdsByParticipantProject.set(participantProjectKey, new Set());
+    }
+    productIdsByParticipantProject.get(participantProjectKey).add(productId || '__none__');
+
+    // appRows are ordered by created_at desc (when available), so the first seen is the latest.
+    if (!latestByParticipantProject.has(participantProjectKey)) {
+      latestByParticipantProject.set(participantProjectKey, { product_id: productId, product_name: productName });
     }
   }
 
-  return approvedApplicationMap;
+  const singleByProject = new Map();
+  for (const [participantProjectKey, productSet] of productIdsByParticipantProject.entries()) {
+    if (productSet.size !== 1) continue;
+    const only = Array.from(productSet)[0];
+    const resolvedOnly = only === '__none__' ? null : only;
+    const latest = latestByParticipantProject.get(participantProjectKey);
+    singleByProject.set(participantProjectKey, {
+      product_id: resolvedOnly,
+      product_name: latest?.product_name || null
+    });
+  }
+
+  return { byKey, singleByProject };
 };
 
 const enrichProofRows = async (rows) => {
@@ -218,7 +245,9 @@ const enrichProofRows = async (rows) => {
   const projectMap = new Map(
     (projects || []).map((item) => [item.id, item.title || item.name || null])
   );
-  const appMap = await getApprovedApplicationMap(participantIds, projectIds);
+  const appIndex = await getApprovedApplicationMap(participantIds, projectIds);
+  const appMap = appIndex.byKey;
+  const singleAppByParticipantProject = appIndex.singleByProject;
   const { data: profiles, error: profileError } = participantIds.length
     ? await supabase
         .from('profiles')
@@ -232,9 +261,14 @@ const enrichProofRows = async (rows) => {
 
   return rows.map((row) => {
     const projectId = allocationMap.get(row.allocation_id) || null;
-    const app = appMap.get(buildAppMapKey(row.participant_id, projectId)) || {};
     const profile = profileMap.get(row.participant_id) || {};
-    const resolvedProductId = row.product_id || app.product_id || null;
+
+    const participantProjectKey = `${row.participant_id}::${projectId}`;
+    const fallbackSingle = singleAppByParticipantProject.get(participantProjectKey) || null;
+    const resolvedProductId = row.product_id || fallbackSingle?.product_id || null;
+    const app = resolvedProductId
+      ? (appMap.get(buildAppMapKey(row.participant_id, projectId, resolvedProductId)) || {})
+      : {};
 
     return {
       ...row,
@@ -275,11 +309,18 @@ const enrichReviewRows = async (rows) => {
   if (profileError) throw profileError;
 
   const profileMap = new Map((profiles || []).map((item) => [item.id, item]));
-  const directProductMap = await getProductNameMap(rows.map((row) => row.product_id));
+  const appIndex = await getApprovedApplicationMap(participantIds, projectIds);
+  const singleAppByParticipantProject = appIndex.singleByProject;
+  const directProductMap = await getProductNameMap([
+    ...rows.map((row) => row.product_id),
+    ...Array.from(singleAppByParticipantProject.values()).map((v) => v?.product_id)
+  ]);
 
   return rows.map((row) => {
     const profile = profileMap.get(row.participant_id) || {};
-    const productId = row.product_id || null;
+    const participantProjectKey = `${row.participant_id}::${row.project_id}`;
+    const fallbackSingle = singleAppByParticipantProject.get(participantProjectKey) || null;
+    const productId = row.product_id || fallbackSingle?.product_id || null;
 
     return {
       ...row,

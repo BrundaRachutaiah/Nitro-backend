@@ -2729,8 +2729,6 @@ const approvePurchaseProof = async (req, res, next) => {
  */
 const generatePayoutBatch = async (req, res, next) => {
   try {
-    await backfillEligiblePayouts();
-
     const { data: payouts, error } = await supabase
       .from('payouts')
       .select('id, amount')
@@ -2814,8 +2812,6 @@ const generatePayoutBatch = async (req, res, next) => {
 
 const getEligiblePayouts = async (req, res, next) => {
   try {
-    await backfillEligiblePayouts();
-
     // Optional filters from query params
     const filterProjectId = req.query.project_id ? String(req.query.project_id) : null;
     const filterClientId = req.query.client_id ? String(req.query.client_id) : null;
@@ -3928,7 +3924,6 @@ const getPayoutReportRows = async ({ projectId = null, paidFilter = 'ALL' } = {}
 
 const getPayoutReport = async (req, res, next) => {
   try {
-    await backfillEligiblePayouts();
     const projectId = req.query.projectId || null;
     const paidFilter = String(req.query.paid || 'ALL').toUpperCase();
 
@@ -3952,7 +3947,6 @@ const getPayoutReport = async (req, res, next) => {
 
 const exportPayoutReportCSV = async (req, res, next) => {
   try {
-    await backfillEligiblePayouts();
     const projectId = req.query.projectId || null;
     const paidFilter = String(req.query.paid || 'ALL').toUpperCase();
     const rows = await getPayoutReportRows({ projectId, paidFilter });
