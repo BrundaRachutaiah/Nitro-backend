@@ -473,11 +473,32 @@ const approvePurchaseProof = async (req, res, next) => {
       .eq('id', proof.allocation_id)
       .maybeSingle();
 
+    // Resolve project_id via the participant's application for this product.
+    // allocation.project_id is NOT reliable across products/projects.
+    let resolvedProjectId = allocation?.project_id || null;
+    if (proof.participant_id && proof.product_id) {
+      const { data: appForProduct, error: appForProductError } = await supabase
+        .from('project_applications')
+        .select('project_id, created_at')
+        .eq('participant_id', proof.participant_id)
+        .eq('product_id', proof.product_id)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (appForProductError) {
+        console.warn('[approvePurchaseProof] Could not resolve project_id via project_applications:', appForProductError.message || appForProductError);
+      } else if (appForProduct?.project_id) {
+        resolvedProjectId = appForProduct.project_id;
+      }
+    }
+
     // ── TRY TO CREATE PAYOUT (if review is also approved) ──
-    if (allocation?.project_id && proof.product_id) {
+    if (resolvedProjectId && proof.product_id) {
       const payoutId = await createPayoutIfBothApproved({
         participantId: proof.participant_id,
-        projectId: allocation.project_id,
+        projectId: resolvedProjectId,
         productId: proof.product_id
       });
       
@@ -499,12 +520,12 @@ const approvePurchaseProof = async (req, res, next) => {
       .eq('id', proof.participant_id)
       .maybeSingle();
 
-    const { data: proofProj } = allocation?.project_id
-      ? await supabase.from('projects').select('title, name').eq('id', allocation.project_id).maybeSingle()
+    const { data: proofProj } = resolvedProjectId
+      ? await supabase.from('projects').select('title, name').eq('id', resolvedProjectId).maybeSingle()
       : { data: null };
     const reviewProjName = proofProj?.title || proofProj?.name || null;
-    const approvedProducts = allocation?.project_id
-      ? await getApprovedProductsForParticipantProject(proof.participant_id, allocation.project_id)
+    const approvedProducts = resolvedProjectId
+      ? await getApprovedProductsForParticipantProject(proof.participant_id, resolvedProjectId)
       : [];
 
     if (participant?.email) {
@@ -663,13 +684,33 @@ const approveParticipantReview = async (req, res, next) => {
     }
 
     // ── TRY TO CREATE PAYOUT (if invoice is also approved) ──
-    if (review.product_id) {
+    // Resolve project_id via project_applications (review.project_id may be allocation-derived in legacy rows).
+    let resolvedProjectId = review.project_id || null;
+    if (review.participant_id && review.product_id) {
+      const { data: appForProduct, error: appForProductError } = await supabase
+        .from('project_applications')
+        .select('project_id, created_at')
+        .eq('participant_id', review.participant_id)
+        .eq('product_id', review.product_id)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (appForProductError) {
+        console.warn('[approveParticipantReview] Could not resolve project_id via project_applications:', appForProductError.message || appForProductError);
+      } else if (appForProduct?.project_id) {
+        resolvedProjectId = appForProduct.project_id;
+      }
+    }
+
+    if (review.product_id && resolvedProjectId) {
       const payoutId = await createPayoutIfBothApproved({
         participantId: review.participant_id,
-        projectId: review.project_id,
+        projectId: resolvedProjectId,
         productId: review.product_id
       });
-      
+
       if (payoutId) {
         console.log(`[approveParticipantReview] Payout created: ${payoutId}`);
       }

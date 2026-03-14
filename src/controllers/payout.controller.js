@@ -28,22 +28,48 @@ const createPayoutIfBothApproved = async ({
     if (!participantId || !projectId || !productId) return null;
 
     // ── CHECK 1: Is purchase proof (invoice) APPROVED? ──
-    const { data: proof } = await supabase
+    // NOTE: multiple approved rows can exist (re-uploads). Avoid `maybeSingle()` ambiguity by ordering + limit.
+    let proofQuery = supabase
       .from('purchase_proofs')
-      .select('id, status')
+      .select('id, status, uploaded_at, created_at')
       .eq('participant_id', participantId)
       .eq('product_id', productId)
       .eq('status', 'APPROVED')
-      .maybeSingle();
+      .order('uploaded_at', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    let proofRes = await proofQuery.maybeSingle();
+    if (proofRes.error && /uploaded_at/i.test(String(proofRes.error.message || ''))) {
+      proofQuery = supabase
+        .from('purchase_proofs')
+        .select('id, status, created_at')
+        .eq('participant_id', participantId)
+        .eq('product_id', productId)
+        .eq('status', 'APPROVED')
+        .order('created_at', { ascending: false })
+        .limit(1);
+      proofRes = await proofQuery.maybeSingle();
+    }
+    if (proofRes.error && !isMissingSchemaObjectError(proofRes.error)) {
+      console.warn('[createPayoutIfBothApproved] proof lookup warning:', proofRes.error.message || proofRes.error);
+    }
+    const proof = proofRes.data || null;
 
     // ── CHECK 2: Is participant review APPROVED? ──
-    const { data: review } = await supabase
+    let reviewQuery = supabase
       .from('participant_reviews')
-      .select('id, status')
+      .select('id, status, created_at')
       .eq('participant_id', participantId)
       .eq('product_id', productId)
       .eq('status', 'APPROVED')
-      .maybeSingle();
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const reviewRes = await reviewQuery.maybeSingle();
+    if (reviewRes.error && !isMissingSchemaObjectError(reviewRes.error)) {
+      console.warn('[createPayoutIfBothApproved] review lookup warning:', reviewRes.error.message || reviewRes.error);
+    }
+    const review = reviewRes.data || null;
 
     // ── CRITICAL: Both must be approved ──
     if (!proof || !review) {
@@ -79,17 +105,29 @@ const createPayoutIfBothApproved = async ({
     }
 
     // ── CREATE ELIGIBLE PAYOUT ──
-    const { data: newPayout, error: insertError } = await supabase
+    // Some schemas enforce NOT NULL `user_id` on payouts; attempt with user_id first, then fall back.
+    const insertPayload = {
+      participant_id: participantId,
+      user_id: participantId,
+      project_id: projectId,
+      product_id: productId,
+      amount: product.product_value,
+      status: 'ELIGIBLE'
+    };
+
+    let { data: newPayout, error: insertError } = await supabase
       .from('payouts')
-      .insert({
-        participant_id: participantId,
-        project_id: projectId,
-        product_id: productId,
-        amount: product.product_value,
-        status: 'ELIGIBLE'
-      })
+      .insert(insertPayload)
       .select()
       .maybeSingle();
+
+    if (insertError && isMissingSchemaObjectError(insertError)) {
+      ({ data: newPayout, error: insertError } = await supabase
+        .from('payouts')
+        .insert({ ...insertPayload, user_id: undefined })
+        .select()
+        .maybeSingle());
+    }
 
     if (insertError) {
       console.error('[createPayoutIfBothApproved] Insert error:', insertError);
@@ -188,40 +226,45 @@ const getEligiblePayouts = async (req, res, next) => {
 
     // ── NEW VERIFICATION LOGIC ──────────────────────────────────────────────────
     // Only include payouts where BOTH invoice + review are APPROVED
-    const verifiedPayouts = await Promise.all(
-      rows.map(async (row) => {
-        // Check if invoice (purchase_proof) is APPROVED for this product
-        const { data: proof } = await supabase
+    // PERF: Avoid N+1 lookups by batching the verification queries.
+    const rowsWithProduct = rows.filter(r => r.product_id && r.participant_id);
+    const verifyParticipantIds = [...new Set(rowsWithProduct.map(r => r.participant_id).filter(Boolean))];
+    const verifyProductIds     = [...new Set(rowsWithProduct.map(r => r.product_id).filter(Boolean))];
+
+    const [proofRes, reviewRes] = await Promise.all([
+      (verifyParticipantIds.length && verifyProductIds.length)
+        ? supabase
           .from('purchase_proofs')
-          .select('id')
-          .eq('participant_id', row.participant_id)
-          .eq('product_id', row.product_id)
+          .select('participant_id, product_id')
+          .in('participant_id', verifyParticipantIds)
+          .in('product_id', verifyProductIds)
           .eq('status', 'APPROVED')
-          .maybeSingle();
-
-        // Check if review is APPROVED for this product
-        const { data: review } = await supabase
+        : Promise.resolve({ data: [] }),
+      (verifyParticipantIds.length && verifyProductIds.length)
+        ? supabase
           .from('participant_reviews')
-          .select('id')
-          .eq('participant_id', row.participant_id)
-          .eq('product_id', row.product_id)
+          .select('participant_id, product_id')
+          .in('participant_id', verifyParticipantIds)
+          .in('product_id', verifyProductIds)
           .eq('status', 'APPROVED')
-          .maybeSingle();
+        : Promise.resolve({ data: [] })
+    ]);
 
-        // Only return payout if BOTH are approved
-        const isVerified = Boolean(proof) && Boolean(review);
-        
-        if (!isVerified) {
-          console.log(`[getEligiblePayouts] Filtering out unverified payout - Product: ${row.product_id}, Proof: ${Boolean(proof)}, Review: ${Boolean(review)}`);
-          return null;
-        }
+    const approvedProofSet = new Set((proofRes.data || [])
+      .map(p => `${p.participant_id}::${p.product_id}`));
+    const approvedReviewSet = new Set((reviewRes.data || [])
+      .map(r => `${r.participant_id}::${r.product_id}`));
 
-        return row;
-      })
-    );
-
-    // Remove null entries (unverified payouts)
-    const validPayouts = verifiedPayouts.filter(Boolean);
+    const validPayouts = rows.filter(row => {
+      // Keep legacy rows without product_id; downstream fallback logic handles them.
+      if (!row.product_id) return true;
+      const key = `${row.participant_id}::${row.product_id}`;
+      const isVerified = approvedProofSet.has(key) && approvedReviewSet.has(key);
+      if (!isVerified) {
+        console.log(`[getEligiblePayouts] Filtering out unverified payout - Product: ${row.product_id}, Proof: ${approvedProofSet.has(key)}, Review: ${approvedReviewSet.has(key)}`);
+      }
+      return isVerified;
+    });
     // ── END OF NEW VERIFICATION LOGIC ────────────────────────────────────────
 
     // For payouts missing product_id, load all products for those projects
@@ -922,12 +965,31 @@ const backfillEligiblePayouts = async () => {
   const productMap = new Map((products || []).map(p => [p.id, p]));
 
   const { data: allReviews } = await supabase
-    .from('participant_reviews').select('id, participant_id, project_id, allocation_id, status')
+    .from('participant_reviews').select('id, participant_id, project_id, allocation_id, product_id, status')
     .eq('status', 'APPROVED').in('participant_id', participantIds);
   const proofRes  = await supabase
-    .from('purchase_proofs').select('id, participant_id, allocation_id, status')
+    .from('purchase_proofs').select('id, participant_id, allocation_id, product_id, status')
     .eq('status', 'APPROVED').in('participant_id', participantIds);
   const allProofs = proofRes.data || [];
+
+  // Resolve artifacts → project via product_id → project_applications (allocation.project_id is not reliable).
+  const allArtifactProductIds = [...new Set([
+    ...(allProofs || []).map(p => p.product_id),
+    ...((allReviews || [])).map(r => r.product_id)
+  ].filter(Boolean))];
+  let productProjectMap = new Map(); // `${participant_id}::${product_id}` → project_id
+  if (allArtifactProductIds.length && participantIds.length) {
+    const { data: appRows } = await supabase
+      .from('project_applications')
+      .select('participant_id, product_id, project_id, status')
+      .in('participant_id', participantIds)
+      .in('product_id', allArtifactProductIds)
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+    for (const app of (appRows || [])) {
+      const mapKey = `${app.participant_id}::${app.product_id}`;
+      if (!productProjectMap.has(mapKey)) productProjectMap.set(mapKey, app.project_id);
+    }
+  }
 
   const allAllocIds = [...new Set([...(allReviews || []).map(r => r.allocation_id), ...allProofs.map(p => p.allocation_id)].filter(Boolean))];
   let allocMap = new Map();
@@ -942,8 +1004,28 @@ const backfillEligiblePayouts = async () => {
     if (!eligibilityMap.has(key)) eligibilityMap.set(key, { hasReview: false, hasProof: false, proofId: null });
     return eligibilityMap.get(key);
   };
-  for (const review of (allReviews || [])) { const pid = review.project_id || allocMap.get(review.allocation_id); if (pid) getOrCreate(review.participant_id, pid).hasReview = true; }
-  for (const proof of allProofs) { const pid = allocMap.get(proof.allocation_id); if (pid) { const e = getOrCreate(proof.participant_id, pid); e.hasProof = true; if (!e.proofId) e.proofId = proof.id; } }
+  for (const review of (allReviews || [])) {
+    const productMapKey = (review.participant_id && review.product_id)
+      ? `${review.participant_id}::${review.product_id}`
+      : null;
+    const pidViaProduct = productMapKey ? productProjectMap.get(productMapKey) : null;
+    const pidViaReview = review.project_id;
+    const pidViaAlloc = allocMap.get(review.allocation_id);
+    const pid = pidViaProduct || pidViaReview || pidViaAlloc;
+    if (pid) getOrCreate(review.participant_id, pid).hasReview = true;
+  }
+  for (const proof of allProofs) {
+    const productMapKey = (proof.participant_id && proof.product_id)
+      ? `${proof.participant_id}::${proof.product_id}`
+      : null;
+    const pidViaProduct = productMapKey ? productProjectMap.get(productMapKey) : null;
+    const pidViaAlloc = allocMap.get(proof.allocation_id);
+    const pid = pidViaProduct || pidViaAlloc;
+    if (!pid) continue;
+    const e = getOrCreate(proof.participant_id, pid);
+    e.hasProof = true;
+    if (!e.proofId) e.proofId = proof.id;
+  }
 
   const { data: existingPayouts } = await supabase
     .from('payouts').select('participant_id, project_id, product_id, status, created_at')
@@ -964,7 +1046,14 @@ const backfillEligiblePayouts = async () => {
   }
 
   const tryInsert = async (payload) => {
-    for (const v of [payload, { ...payload, purchase_proof_id: undefined }]) {
+    const candidates = [
+      payload,
+      { ...payload, purchase_proof_id: undefined },
+      { ...payload, user_id: undefined },
+      { ...payload, user_id: undefined, purchase_proof_id: undefined },
+    ];
+
+    for (const v of candidates) {
       const clean = Object.fromEntries(Object.entries(v).filter(([, val]) => val !== undefined));
 
       // Prefer idempotent writes when a unique constraint exists (recommended for ELIGIBLE rows).
@@ -1015,11 +1104,11 @@ const backfillEligiblePayouts = async () => {
 
     // Allow a new ELIGIBLE payout when the application is from a newer cycle than
     // the last recorded payout for this same (participant, project, product).
-    const appTime = new Date(app.created_at || app.reviewed_at || 0).getTime();
+    const appTime = new Date(app.reviewed_at || app.created_at || 0).getTime();
     const lastPayoutTime = latestPayoutTimeByKey.get(covKey) || 0;
     if (coveredSet.has(covKey) && appTime && lastPayoutTime >= (appTime - SKEW_MS)) continue;
     const productAmount = Number(productMap.get(productId)?.product_value || 0);
-    const inserted = await tryInsert({ participant_id: pid, project_id: projId, product_id: productId || null, purchase_proof_id: eligi?.proofId || null, amount: productAmount, status: 'ELIGIBLE' });
+    const inserted = await tryInsert({ participant_id: pid, user_id: pid, project_id: projId, product_id: productId || null, purchase_proof_id: eligi?.proofId || null, amount: productAmount, status: 'ELIGIBLE' });
     if (inserted) {
       coveredSet.add(covKey);
       latestPayoutTimeByKey.set(covKey, Date.now());

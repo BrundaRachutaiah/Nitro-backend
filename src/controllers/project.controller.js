@@ -781,9 +781,10 @@ const getCompletedProjects = async (req, res, next) => {
     let proofsByProduct = new Map(); // product_id -> proof rows
     let allocationProjectById = new Map(); // allocation_id -> project_id (from proof allocations)
 
-    let reviewByKey = new Map(); // project_id::product_id -> latest review
-    let reviewsByProjectProduct = new Map(); // project_id::product_id -> review rows
-    let reviewByAllocationProduct = new Map(); // allocation_id::product_id -> latest review
+      let reviewByKey = new Map(); // project_id::product_id -> latest review
+      let reviewsByProjectProduct = new Map(); // project_id::product_id -> review rows
+      let reviewByAllocationProduct = new Map(); // allocation_id::product_id -> latest review
+      let reviewsByProduct = new Map(); // product_id -> review rows (project_id can be unreliable in multi-brand allocations)
 
     let payoutByKey = new Map();
     let payoutByProject = new Map();
@@ -888,6 +889,12 @@ const getCompletedProjects = async (req, res, next) => {
           if (!reviewsByProjectProduct.has(key)) reviewsByProjectProduct.set(key, []);
           reviewsByProjectProduct.get(key).push(review);
 
+          if (review?.product_id) {
+            const productKey = String(review.product_id);
+            if (!reviewsByProduct.has(productKey)) reviewsByProduct.set(productKey, []);
+            reviewsByProduct.get(productKey).push(review);
+          }
+
           const existing = reviewByKey.get(key);
           const existingTime = new Date(existing?.created_at || 0).getTime();
           const nextTime = new Date(review.created_at || 0).getTime();
@@ -964,14 +971,18 @@ const getCompletedProjects = async (req, res, next) => {
         }
         if (!proof && productIdStr) {
           const proofs = proofsByProduct.get(productIdStr) || [];
-          const scoped = allocationProjectById.size
-            ? proofs.filter((p) => !p?.allocation_id || allocationProjectById.get(p.allocation_id) === row.project_id)
-            : proofs;
+          // IMPORTANT: Do not scope proofs by allocation.project_id.
+          // A single allocation can span multiple products across different projects/brands.
+          // Proof rows are already tied to product_id; use the application cycle timestamp
+          // (minArtifactTime) for repeat-cycle safety instead.
+          const scoped = proofs;
+          const proofTime = (p) => new Date(p?.uploaded_at || p?.created_at || 0).getTime();
+          // Prefer an APPROVED artifact in this cycle over a newer PENDING one.
           proof = pickLatestAfter(
-            scoped,
+            scoped.filter((p) => String(p?.status || '').toUpperCase() === 'APPROVED'),
             minArtifactTime,
-            (p) => new Date(p?.uploaded_at || p?.created_at || 0).getTime()
-          );
+            proofTime
+          ) || pickLatestAfter(scoped, minArtifactTime, proofTime);
         }
 
         let review = null;
@@ -985,6 +996,18 @@ const getCompletedProjects = async (req, res, next) => {
           minArtifactTime,
           (r) => new Date(r?.created_at || 0).getTime()
         ) || reviewByKey.get(reviewKey) || reviewByKey.get(buildProjectProductKey(row.project_id, null)) || null;
+
+        // Fallback: project_id on review rows can be allocation-derived (wrong for cross-brand products).
+        // If we couldn't match by (project_id, product_id), try matching by product_id only.
+        if (!review && productIdStr && reviewsByProduct.size) {
+          const productScopedReviews = reviewsByProduct.get(productIdStr) || [];
+          const reviewTime = (r) => new Date(r?.created_at || 0).getTime();
+          review = pickLatestAfter(
+            productScopedReviews.filter((r) => String(r?.status || '').toUpperCase() === 'APPROVED'),
+            minArtifactTime,
+            reviewTime
+          ) || pickLatestAfter(productScopedReviews, minArtifactTime, reviewTime);
+        }
 
         // If we can scope by allocation (repeat-cycle safety), prefer that match.
         if (proof?.allocation_id && reviewByAllocationProduct.size) {

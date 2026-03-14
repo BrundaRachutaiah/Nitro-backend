@@ -6,6 +6,7 @@ const {
 } = require('../services/email.templates');
 const { calculatePayoutBreakdown } = require('../utils/payout.utils');
 const { ALLOCATION_STATUS } = require('../utils/constants');
+const { createPayoutIfBothApproved } = require('./payout.controller');
 
 const isMissingSchemaObjectError = (error) => {
   const text = String(error?.message || '').toLowerCase();
@@ -1139,20 +1140,55 @@ const approveReview = async (req, res, next) => {
       alreadyProcessed = String(existingReview.status || '').toUpperCase() === 'APPROVED';
     }
 
+    // Resolve the correct project_id via the participant's application for this product.
+    // reviewRow.project_id can be allocation-derived in multi-brand allocations.
+    let resolvedProjectId = reviewRow.project_id || null;
+    if (reviewRow.participant_id && reviewRow.product_id) {
+      const { data: appForProduct, error: appForProductError } = await supabase
+        .from('project_applications')
+        .select('project_id, created_at')
+        .eq('participant_id', reviewRow.participant_id)
+        .eq('product_id', reviewRow.product_id)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (appForProductError) {
+        console.warn('[approveReview] Could not resolve project_id via project_applications:', appForProductError.message || appForProductError);
+      } else if (appForProduct?.project_id) {
+        resolvedProjectId = appForProduct.project_id;
+      }
+    }
+
     const { data: project, error: projectError } = await supabase
       .from('projects')
       .select('reward, mode')
-      .eq('id', reviewRow.project_id)
+      .eq('id', resolvedProjectId)
       .maybeSingle();
     if (!projectError) {
       try {
         await ensureEligiblePayout({
           participantId: reviewRow.participant_id,
-          projectId: reviewRow.project_id,
+          projectId: resolvedProjectId,
           fallbackReward: project?.reward
         });
       } catch (sideEffectError) {
         console.error('approveReview ensureEligiblePayout warning:', sideEffectError);
+      }
+    }
+
+    // D2C: when the second artifact (review) is approved, attempt to create the per-product payout.
+    if (reviewRow.product_id && resolvedProjectId) {
+      try {
+        const payoutId = await createPayoutIfBothApproved({
+          participantId: reviewRow.participant_id,
+          projectId: resolvedProjectId,
+          productId: reviewRow.product_id
+        });
+        if (payoutId) console.log(`[approveReview] Payout created: ${payoutId}`);
+      } catch (payoutSideEffectError) {
+        console.error('approveReview createPayoutIfBothApproved warning:', payoutSideEffectError);
       }
     }
 
@@ -1217,7 +1253,7 @@ const approveReview = async (req, res, next) => {
       try {
         await markApplicationCompleted({
           participantId: reviewRow.participant_id,
-          projectId: reviewRow.project_id,
+          projectId: resolvedProjectId,
           productId: reviewRow.product_id || null
         });
       } catch (applicationError) {
