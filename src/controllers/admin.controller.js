@@ -29,6 +29,16 @@ const isMissingSchemaObjectError = (error) => {
 };
 
 const normalizeStatus = (value) => String(value || '').trim().toUpperCase();
+
+const isPayoutDebugEnabled = () => {
+  const raw = String(process.env.PAYOUT_DEBUG ?? '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+};
+
+const payoutDebug = (...args) => {
+  if (isPayoutDebugEnabled()) console.log('[payout-debug]', ...args);
+};
+
 const buildAllocationProductKey = (allocationId, productId) =>
   `${allocationId || '__no_alloc__'}::${productId || '__allocation__'}`;
 const buildParticipantProjectProductKey = (participantId, projectId, productId) =>
@@ -2670,39 +2680,67 @@ const approvePurchaseProof = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const { data: proof, error } = await supabase
+    let proofUpdateRes = await supabase
       .from('purchase_proofs')
       .update({ status: 'APPROVED' })
       .eq('id', id)
       .eq('status', 'PENDING')
-      .select('id, allocation_id, participant_id')
+      .select('id, allocation_id, participant_id, product_id')
       .maybeSingle();
-    if (error) throw error;
 
-    let proofRow = proof;
+    if (proofUpdateRes.error && /product_id/i.test(String(proofUpdateRes.error.message || ''))) {
+      proofUpdateRes = await supabase
+        .from('purchase_proofs')
+        .update({ status: 'APPROVED' })
+        .eq('id', id)
+        .eq('status', 'PENDING')
+        .select('id, allocation_id, participant_id')
+        .maybeSingle();
+    }
+
+    if (proofUpdateRes.error) throw proofUpdateRes.error;
+
+    let proofRow = proofUpdateRes.data;
     let alreadyProcessed = false;
 
     if (!proofRow) {
-      const { data: existingById, error: existingByIdError } = await supabase
+      let existingByIdRes = await supabase
         .from('purchase_proofs')
-        .select('id, allocation_id, participant_id, status')
+        .select('id, allocation_id, participant_id, product_id, status')
         .eq('id', id)
         .maybeSingle();
-      if (existingByIdError) throw existingByIdError;
+      if (existingByIdRes.error && /product_id/i.test(String(existingByIdRes.error.message || ''))) {
+        existingByIdRes = await supabase
+          .from('purchase_proofs')
+          .select('id, allocation_id, participant_id, status')
+          .eq('id', id)
+          .maybeSingle();
+      }
+      if (existingByIdRes.error) throw existingByIdRes.error;
 
+      const existingById = existingByIdRes.data;
       if (existingById) {
         proofRow = existingById;
         alreadyProcessed = String(existingById.status || '').toUpperCase() === 'APPROVED';
       } else {
-        const { data: existingByAllocation, error: existingByAllocationError } = await supabase
+        let existingByAllocationRes = await supabase
           .from('purchase_proofs')
-          .select('id, allocation_id, participant_id, status')
+          .select('id, allocation_id, participant_id, product_id, status')
           .eq('allocation_id', id)
           .order('uploaded_at', { ascending: false })
           .limit(1)
           .maybeSingle();
-        if (existingByAllocationError) throw existingByAllocationError;
+        if (existingByAllocationRes.error && /uploaded_at|product_id/i.test(String(existingByAllocationRes.error.message || ''))) {
+          existingByAllocationRes = await supabase
+            .from('purchase_proofs')
+            .select('id, allocation_id, participant_id, status')
+            .eq('allocation_id', id)
+            .limit(1)
+            .maybeSingle();
+        }
+        if (existingByAllocationRes.error) throw existingByAllocationRes.error;
 
+        const existingByAllocation = existingByAllocationRes.data;
         if (!existingByAllocation) {
           return res.status(404).json({
             success: false,
@@ -2717,7 +2755,7 @@ const approvePurchaseProof = async (req, res, next) => {
             .update({ status: 'APPROVED' })
             .eq('id', existingByAllocation.id)
             .eq('status', 'PENDING')
-            .select('id, allocation_id, participant_id')
+            .select('id, allocation_id, participant_id, product_id')
             .maybeSingle();
           if (promotedError) throw promotedError;
           if (promoted) {
@@ -2739,9 +2777,79 @@ const approvePurchaseProof = async (req, res, next) => {
 
     if (allocationError) throw allocationError;
 
-    // Do not create payouts or complete allocations here.
-    // Invoice approval only unlocks the review step. Payout eligibility is created
-    // when the review is approved.
+    // Admin can approve review first or invoice first. Whichever is second should create the payout.
+    // We try here as well to prevent "only 1 product gets a payout" issues in cross-product flows.
+    try {
+      const { createPayoutIfBothApproved } = require('./payout.controller');
+
+      payoutDebug('admin.approvePurchaseProof', {
+        proofId: proofRow?.id,
+        participantId: proofRow?.participant_id,
+        allocationId: proofRow?.allocation_id,
+        productId: proofRow?.product_id || null,
+        allocationProjectId: allocation?.project_id || null
+      });
+
+      if (proofRow?.participant_id && proofRow?.allocation_id) {
+        if (proofRow?.product_id) {
+          // Resolve correct project_id via project_applications for this product.
+          let resolvedProjectId = allocation?.project_id || null;
+          const { data: appForProduct, error: appForProductError } = await supabase
+            .from('project_applications')
+            .select('project_id, created_at')
+            .eq('participant_id', proofRow.participant_id)
+            .eq('product_id', proofRow.product_id)
+            .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (appForProductError) {
+            payoutDebug('admin.approvePurchaseProof appForProductError', appForProductError.message || appForProductError);
+          } else if (appForProduct?.project_id) {
+            resolvedProjectId = appForProduct.project_id;
+          }
+
+          if (resolvedProjectId) {
+            const payoutId = await createPayoutIfBothApproved({
+              participantId: proofRow.participant_id,
+              projectId: resolvedProjectId,
+              productId: proofRow.product_id,
+              allocationId: proofRow.allocation_id
+            });
+            if (payoutId) payoutDebug('admin.approvePurchaseProof payout created', { payoutId, resolvedProjectId, productId: proofRow.product_id });
+          }
+        } else {
+          // Legacy invoice: product_id is NULL. Try all approved apps for this participant.
+          const { data: apps, error: appsError } = await supabase
+            .from('project_applications')
+            .select('project_id, product_id, status, created_at, reviewed_at')
+            .eq('participant_id', proofRow.participant_id)
+            .not('product_id', 'is', null)
+            .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+            .order('reviewed_at', { ascending: false })
+            .order('created_at', { ascending: false });
+
+          if (appsError) {
+            payoutDebug('admin.approvePurchaseProof appsError', appsError.message || appsError);
+          } else {
+            payoutDebug('admin.approvePurchaseProof legacy-proof apps', { count: (apps || []).length });
+            for (const app of (apps || [])) {
+              if (!app?.project_id || !app?.product_id) continue;
+              // eslint-disable-next-line no-await-in-loop
+              const payoutId = await createPayoutIfBothApproved({
+                participantId: proofRow.participant_id,
+                projectId: app.project_id,
+                productId: app.product_id,
+                allocationId: proofRow.allocation_id
+              });
+              if (payoutId) payoutDebug('admin.approvePurchaseProof payout created (legacy)', { payoutId, projectId: app.project_id, productId: app.product_id });
+            }
+          }
+        }
+      }
+    } catch (sideEffectError) {
+      payoutDebug('admin.approvePurchaseProof payout side-effect error', sideEffectError?.message || sideEffectError);
+    }
 
     const { data: participant } = await supabase
       .from('profiles')
@@ -3591,6 +3699,55 @@ const markPayoutBatchPaid = async (req, res, next) => {
 
         if (appUpdateError && !isMissingSchemaObjectError(appUpdateError)) {
           throw appUpdateError;
+        }
+      }
+
+      // Close out allocations for participants who have no more in-progress apps.
+      // Otherwise, re-requests can get incorrectly attached to a stale allocation.
+      //
+      // We only close allocations for participants who have ZERO apps remaining in
+      // APPROVED/PURCHASED (i.e. nothing actively waiting on artifacts/payout creation).
+      const openAppsRes = await supabase
+        .from('project_applications')
+        .select('participant_id')
+        .in('participant_id', participantIds)
+        .in('status', ['APPROVED', 'PURCHASED']);
+
+      if (openAppsRes.error && !isMissingSchemaObjectError(openAppsRes.error)) {
+        throw openAppsRes.error;
+      }
+
+      const participantsWithOpenApps = new Set((openAppsRes.data || [])
+        .map((r) => r.participant_id)
+        .filter(Boolean));
+
+      const participantsToCloseAlloc = participantIds.filter((pid) => !participantsWithOpenApps.has(pid));
+      if (participantsToCloseAlloc.length) {
+        // Prefer completed_at (newer schema), fall back to status-only (older schema).
+        let allocUpdate = await supabase
+          .from('unit_allocations')
+          .update({ completed_at: nowIso, status: 'COMPLETED' })
+          .in('participant_id', participantsToCloseAlloc)
+          .is('completed_at', null);
+
+        if (allocUpdate.error && /completed_at/i.test(String(allocUpdate.error.message || ''))) {
+          allocUpdate = await supabase
+            .from('unit_allocations')
+            .update({ status: 'COMPLETED' })
+            .in('participant_id', participantsToCloseAlloc)
+            .neq('status', 'COMPLETED');
+        }
+
+        if (allocUpdate.error && /status/i.test(String(allocUpdate.error.message || ''))) {
+          // Last resort: if status column doesn't exist, just set completed_at when possible.
+          allocUpdate = await supabase
+            .from('unit_allocations')
+            .update({ completed_at: nowIso })
+            .in('participant_id', participantsToCloseAlloc);
+        }
+
+        if (allocUpdate.error && !isMissingSchemaObjectError(allocUpdate.error)) {
+          throw allocUpdate.error;
         }
       }
     }

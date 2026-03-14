@@ -1184,7 +1184,8 @@ const approveReview = async (req, res, next) => {
         const payoutId = await createPayoutIfBothApproved({
           participantId: reviewRow.participant_id,
           projectId: resolvedProjectId,
-          productId: reviewRow.product_id
+          productId: reviewRow.product_id,
+          allocationId: reviewRow.allocation_id
         });
         if (payoutId) console.log(`[approveReview] Payout created: ${payoutId}`);
       } catch (payoutSideEffectError) {

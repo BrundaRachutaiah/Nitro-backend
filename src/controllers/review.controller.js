@@ -499,7 +499,8 @@ const approvePurchaseProof = async (req, res, next) => {
       const payoutId = await createPayoutIfBothApproved({
         participantId: proof.participant_id,
         projectId: resolvedProjectId,
-        productId: proof.product_id
+        productId: proof.product_id,
+        allocationId: proof.allocation_id
       });
       
       if (payoutId) {
@@ -656,7 +657,7 @@ const approveParticipantReview = async (req, res, next) => {
       .update({ status: 'APPROVED' })
       .eq('id', id)
       .eq('status', 'PENDING')
-      .select('id, participant_id, project_id, product_id')
+      .select('id, allocation_id, participant_id, project_id, product_id')
       .maybeSingle();
 
     if (error) throw error;
@@ -667,7 +668,7 @@ const approveParticipantReview = async (req, res, next) => {
     if (!review) {
       const { data: existingById, error: existingByIdError } = await supabase
         .from('participant_reviews')
-        .select('id, participant_id, project_id, product_id, status')
+        .select('id, allocation_id, participant_id, project_id, product_id, status')
         .eq('id', id)
         .maybeSingle();
       if (existingByIdError) throw existingByIdError;
@@ -708,7 +709,8 @@ const approveParticipantReview = async (req, res, next) => {
       const payoutId = await createPayoutIfBothApproved({
         participantId: review.participant_id,
         projectId: resolvedProjectId,
-        productId: review.product_id
+        productId: review.product_id,
+        allocationId: review.allocation_id
       });
 
       if (payoutId) {

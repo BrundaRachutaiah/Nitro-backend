@@ -15,6 +15,15 @@ const isMissingSchemaObjectError = (error) => {
   );
 };
 
+const isPayoutDebugEnabled = () => {
+  const raw = String(process.env.PAYOUT_DEBUG ?? '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+};
+
+const payoutDebug = (...args) => {
+  if (isPayoutDebugEnabled()) console.log('[payout-debug]', ...args);
+};
+
 /**
  * ✅ Create ELIGIBLE payout ONLY when BOTH invoice + review are APPROVED
  * This is the KEY FIX — payouts now only appear after 2nd approval
@@ -22,58 +31,134 @@ const isMissingSchemaObjectError = (error) => {
 const createPayoutIfBothApproved = async ({
   participantId,
   projectId,
-  productId
+  productId,
+  allocationId
 } = {}) => {
   try {
     if (!participantId || !projectId || !productId) return null;
+    payoutDebug('createPayoutIfBothApproved start', { participantId, projectId, productId, allocationId: allocationId || null });
 
     // ── CHECK 1: Is purchase proof (invoice) APPROVED? ──
     // NOTE: multiple approved rows can exist (re-uploads). Avoid `maybeSingle()` ambiguity by ordering + limit.
-    let proofQuery = supabase
-      .from('purchase_proofs')
-      .select('id, status, uploaded_at, created_at')
-      .eq('participant_id', participantId)
-      .eq('product_id', productId)
-      .eq('status', 'APPROVED')
-      .order('uploaded_at', { ascending: false })
-      .order('created_at', { ascending: false })
-      .limit(1);
-
-    let proofRes = await proofQuery.maybeSingle();
-    if (proofRes.error && /uploaded_at/i.test(String(proofRes.error.message || ''))) {
-      proofQuery = supabase
+    const fetchLatestApprovedProof = async () => {
+      // Primary: per-product proof.
+      // Be defensive about schema drift: only select columns we strictly need.
+      let proofQuery = supabase
         .from('purchase_proofs')
-        .select('id, status, created_at')
+        .select('id, allocation_id, participant_id, product_id')
         .eq('participant_id', participantId)
         .eq('product_id', productId)
         .eq('status', 'APPROVED')
-        .order('created_at', { ascending: false })
         .limit(1);
-      proofRes = await proofQuery.maybeSingle();
-    }
-    if (proofRes.error && !isMissingSchemaObjectError(proofRes.error)) {
-      console.warn('[createPayoutIfBothApproved] proof lookup warning:', proofRes.error.message || proofRes.error);
-    }
-    const proof = proofRes.data || null;
+
+      let proofRes = await proofQuery.maybeSingle();
+
+      // If product_id column is missing OR the row simply doesn't exist, fall back to allocation-level proof.
+      const productLookupFailed = Boolean(proofRes.error && isMissingSchemaObjectError(proofRes.error));
+      const proofRow = proofRes.data || null;
+      if (proofRow) {
+        payoutDebug('proof found (product)', { proofId: proofRow.id, productId });
+        return proofRow;
+      }
+
+      if (!allocationId) {
+        if (proofRes.error && !isMissingSchemaObjectError(proofRes.error)) {
+          console.warn('[createPayoutIfBothApproved] proof lookup warning:', proofRes.error.message || proofRes.error);
+        }
+        payoutDebug('proof not found (product) and no allocationId for fallback');
+        return null;
+      }
+
+      // Fallback: allocation-level approved proof (legacy rows sometimes have product_id = NULL)
+      // Prefer a matching product_id if present, otherwise accept NULL product_id.
+      try {
+        let allocQuery = supabase
+          .from('purchase_proofs')
+          .select('id, allocation_id, participant_id, product_id')
+          .eq('participant_id', participantId)
+          .eq('allocation_id', allocationId)
+          .eq('status', 'APPROVED')
+          .limit(1);
+
+        if (!productLookupFailed) {
+          // If product_id exists in schema, allow either exact match or NULL (legacy)
+          allocQuery = allocQuery.or(`product_id.eq.${productId},product_id.is.null`);
+        }
+
+        const allocRes = await allocQuery.maybeSingle();
+
+        if (allocRes.error && !isMissingSchemaObjectError(allocRes.error)) {
+          console.warn('[createPayoutIfBothApproved] proof alloc-fallback warning:', allocRes.error.message || allocRes.error);
+        }
+        if (allocRes.data) payoutDebug('proof found (allocation fallback)', { proofId: allocRes.data.id, allocationId, productId: allocRes.data.product_id || null });
+        return allocRes.data || null;
+      } catch (allocErr) {
+        console.warn('[createPayoutIfBothApproved] proof alloc-fallback exception:', allocErr.message || allocErr);
+        return null;
+      }
+    };
+
+    const proof = await fetchLatestApprovedProof();
 
     // ── CHECK 2: Is participant review APPROVED? ──
-    let reviewQuery = supabase
-      .from('participant_reviews')
-      .select('id, status, created_at')
-      .eq('participant_id', participantId)
-      .eq('product_id', productId)
-      .eq('status', 'APPROVED')
-      .order('created_at', { ascending: false })
-      .limit(1);
-    const reviewRes = await reviewQuery.maybeSingle();
-    if (reviewRes.error && !isMissingSchemaObjectError(reviewRes.error)) {
-      console.warn('[createPayoutIfBothApproved] review lookup warning:', reviewRes.error.message || reviewRes.error);
-    }
-    const review = reviewRes.data || null;
+    const fetchLatestApprovedReview = async () => {
+      // Primary: per-product approved review
+      let reviewQuery = supabase
+        .from('participant_reviews')
+        .select('id, allocation_id, participant_id, product_id')
+        .eq('participant_id', participantId)
+        .eq('product_id', productId)
+        .eq('status', 'APPROVED')
+        .limit(1);
+
+      let reviewRes = await reviewQuery.maybeSingle();
+      const productLookupFailed = Boolean(reviewRes.error && isMissingSchemaObjectError(reviewRes.error));
+      const reviewRow = reviewRes.data || null;
+      if (reviewRow) {
+        payoutDebug('review found (product)', { reviewId: reviewRow.id, productId });
+        return reviewRow;
+      }
+
+      if (!allocationId) {
+        if (reviewRes.error && !isMissingSchemaObjectError(reviewRes.error)) {
+          console.warn('[createPayoutIfBothApproved] review lookup warning:', reviewRes.error.message || reviewRes.error);
+        }
+        payoutDebug('review not found (product) and no allocationId for fallback');
+        return null;
+      }
+
+      // Fallback: allocation-level approved review (legacy rows can have product_id = NULL)
+      try {
+        let allocQuery = supabase
+          .from('participant_reviews')
+          .select('id, allocation_id, participant_id, product_id')
+          .eq('participant_id', participantId)
+          .eq('allocation_id', allocationId)
+          .eq('status', 'APPROVED')
+          .limit(1);
+
+        if (!productLookupFailed) {
+          allocQuery = allocQuery.or(`product_id.eq.${productId},product_id.is.null`);
+        }
+
+        const allocRes = await allocQuery.maybeSingle();
+        if (allocRes.error && !isMissingSchemaObjectError(allocRes.error)) {
+          console.warn('[createPayoutIfBothApproved] review alloc-fallback warning:', allocRes.error.message || allocRes.error);
+        }
+        if (allocRes.data) payoutDebug('review found (allocation fallback)', { reviewId: allocRes.data.id, allocationId, productId: allocRes.data.product_id || null });
+        return allocRes.data || null;
+      } catch (allocErr) {
+        console.warn('[createPayoutIfBothApproved] review alloc-fallback exception:', allocErr.message || allocErr);
+        return null;
+      }
+    };
+
+    const review = await fetchLatestApprovedReview();
 
     // ── CRITICAL: Both must be approved ──
     if (!proof || !review) {
       console.log(`[createPayoutIfBothApproved] Waiting - Proof: ${Boolean(proof)}, Review: ${Boolean(review)}`);
+      payoutDebug('not eligible yet', { hasProof: Boolean(proof), hasReview: Boolean(review) });
       return null;  // Don't create payout yet
     }
 
@@ -101,6 +186,7 @@ const createPayoutIfBothApproved = async ({
 
     if (existingPayout) {
       console.log(`[createPayoutIfBothApproved] Payout already exists for product ${productId}`);
+      payoutDebug('payout exists', { payoutId: existingPayout.id, productId, projectId });
       return existingPayout.id;
     }
 
@@ -111,22 +197,35 @@ const createPayoutIfBothApproved = async ({
       user_id: participantId,
       project_id: projectId,
       product_id: productId,
+      purchase_proof_id: proof?.id || null,
       amount: product.product_value,
       status: 'ELIGIBLE'
     };
 
-    let { data: newPayout, error: insertError } = await supabase
-      .from('payouts')
-      .insert(insertPayload)
-      .select()
-      .maybeSingle();
+    const variants = [
+      insertPayload,
+      { ...insertPayload, purchase_proof_id: undefined },
+      { ...insertPayload, user_id: undefined },
+      { ...insertPayload, user_id: undefined, purchase_proof_id: undefined }
+    ];
 
-    if (insertError && isMissingSchemaObjectError(insertError)) {
-      ({ data: newPayout, error: insertError } = await supabase
-        .from('payouts')
-        .insert({ ...insertPayload, user_id: undefined })
-        .select()
-        .maybeSingle());
+    let newPayout = null;
+    let insertError = null;
+    for (const variant of variants) {
+      const clean = Object.fromEntries(
+        Object.entries(variant).filter(([, v]) => v !== undefined && v !== null)
+      );
+      // eslint-disable-next-line no-await-in-loop
+      const res = await supabase.from('payouts').insert(clean).select().maybeSingle();
+      if (!res.error) {
+        newPayout = res.data || null;
+        insertError = null;
+        payoutDebug('payout inserted', { payoutId: newPayout?.id || null, productId, projectId });
+        break;
+      }
+      insertError = res.error;
+      payoutDebug('payout insert error', { message: insertError?.message || insertError, code: insertError?.code || null });
+      if (!isMissingSchemaObjectError(insertError)) break;
     }
 
     if (insertError) {
@@ -195,15 +294,23 @@ const deduplicatePayoutRows = async (participantId = null) => {
  */
 const getEligiblePayouts = async (req, res, next) => {
   try {
-    const { data, error } = await supabase
+    let payoutsRes = await supabase
       .from('payouts')
-      .select('id, participant_id, project_id, product_id, amount, status, created_at, payout_batch_id')
+      .select('id, participant_id, project_id, product_id, purchase_proof_id, amount, status, created_at, payout_batch_id')
       .eq('status', 'ELIGIBLE')
       .order('created_at', { ascending: false });
 
-    if (error) throw error;
+    if (payoutsRes.error && /purchase_proof_id/i.test(String(payoutsRes.error.message || ''))) {
+      payoutsRes = await supabase
+        .from('payouts')
+        .select('id, participant_id, project_id, product_id, amount, status, created_at, payout_batch_id')
+        .eq('status', 'ELIGIBLE')
+        .order('created_at', { ascending: false });
+    }
 
-    const rows           = data || [];
+    if (payoutsRes.error) throw payoutsRes.error;
+
+    const rows           = payoutsRes.data || [];
     const participantIds = [...new Set(rows.map(r => r.participant_id).filter(Boolean))];
     const projectIds     = [...new Set(rows.map(r => r.project_id).filter(Boolean))];
     const productIds     = [...new Set(rows.map(r => r.product_id).filter(Boolean))];
@@ -230,8 +337,9 @@ const getEligiblePayouts = async (req, res, next) => {
     const rowsWithProduct = rows.filter(r => r.product_id && r.participant_id);
     const verifyParticipantIds = [...new Set(rowsWithProduct.map(r => r.participant_id).filter(Boolean))];
     const verifyProductIds     = [...new Set(rowsWithProduct.map(r => r.product_id).filter(Boolean))];
+    const verifyProofIds       = [...new Set(rowsWithProduct.map(r => r.purchase_proof_id).filter(Boolean))];
 
-    const [proofRes, reviewRes] = await Promise.all([
+    const [proofRes, reviewRes, proofByIdRes, legacyNullProofRes] = await Promise.all([
       (verifyParticipantIds.length && verifyProductIds.length)
         ? supabase
           .from('purchase_proofs')
@@ -248,20 +356,45 @@ const getEligiblePayouts = async (req, res, next) => {
           .in('product_id', verifyProductIds)
           .eq('status', 'APPROVED')
         : Promise.resolve({ data: [] })
+      ,
+      (verifyProofIds.length)
+        ? supabase
+          .from('purchase_proofs')
+          .select('id')
+          .in('id', verifyProofIds)
+          .eq('status', 'APPROVED')
+        : Promise.resolve({ data: [] }),
+      // Legacy fallback: if a participant has an allocation-level approved proof with product_id = NULL,
+      // treat invoice as approved for all products (old 1-invoice-per-allocation flow).
+      // If the schema doesn't have product_id, skip silently.
+      (verifyParticipantIds.length)
+        ? supabase
+          .from('purchase_proofs')
+          .select('participant_id')
+          .in('participant_id', verifyParticipantIds)
+          .is('product_id', null)
+          .eq('status', 'APPROVED')
+        : Promise.resolve({ data: [] })
     ]);
 
     const approvedProofSet = new Set((proofRes.data || [])
       .map(p => `${p.participant_id}::${p.product_id}`));
     const approvedReviewSet = new Set((reviewRes.data || [])
       .map(r => `${r.participant_id}::${r.product_id}`));
+    const approvedProofIdSet = new Set((proofByIdRes.data || []).map(p => p.id));
+    const legacyNullProofParticipantSet = new Set((legacyNullProofRes.data || []).map(p => p.participant_id));
 
     const validPayouts = rows.filter(row => {
       // Keep legacy rows without product_id; downstream fallback logic handles them.
       if (!row.product_id) return true;
       const key = `${row.participant_id}::${row.product_id}`;
-      const isVerified = approvedProofSet.has(key) && approvedReviewSet.has(key);
+      const proofOk = (row.purchase_proof_id && approvedProofIdSet.has(row.purchase_proof_id))
+        || approvedProofSet.has(key)
+        || legacyNullProofParticipantSet.has(row.participant_id);
+      const reviewOk = approvedReviewSet.has(key);
+      const isVerified = proofOk && reviewOk;
       if (!isVerified) {
-        console.log(`[getEligiblePayouts] Filtering out unverified payout - Product: ${row.product_id}, Proof: ${approvedProofSet.has(key)}, Review: ${approvedReviewSet.has(key)}`);
+        console.log(`[getEligiblePayouts] Filtering out unverified payout - Product: ${row.product_id}, Proof: ${proofOk}, Review: ${reviewOk}`);
       }
       return isVerified;
     });
