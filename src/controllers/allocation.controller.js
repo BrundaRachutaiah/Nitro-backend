@@ -251,7 +251,7 @@ const getMyAllocationTracking = async (req, res, next) => {
         .from('project_applications')
         .select('id, project_id, participant_id, status')
         .eq('participant_id', participantId)
-        .in('status', ['APPROVED', 'PURCHASED']);
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
 
       if (approvedAppsRes.error && !isMissingSchemaObjectError(approvedAppsRes.error)) {
         throw approvedAppsRes.error;
@@ -399,7 +399,7 @@ const getMyAllocationTracking = async (req, res, next) => {
         // Only active task items should show up in "My Tasks".
         // COMPLETED apps are already paid out and must not appear again when the
         // participant re-applies in a later cycle.
-        .in('status', ['APPROVED', 'PURCHASED'])
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
         .order('created_at', { ascending: false })
     ]);
 
@@ -493,7 +493,7 @@ const getMyAllocationTracking = async (req, res, next) => {
         .from('project_applications')
         .select('id, project_id, product_id, allocated_budget, status')
         .eq('participant_id', participantId)
-        .in('status', ['APPROVED', 'PURCHASED'])
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
         .order('created_at', { ascending: false });
 
       if (fallbackApps.error && !isMissingSchemaObjectError(fallbackApps.error)) {

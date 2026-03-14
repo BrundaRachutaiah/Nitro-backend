@@ -793,32 +793,29 @@ const getMyPayouts = async (req, res, next) => {
 
     const actualPayoutRows = payoutRows;
 
-    const breakdownCache = new Map();
-    const enrichedPayouts = await Promise.all(actualPayoutRows.map(async row => {
+    const enrichedPayouts = actualPayoutRows.map((row) => {
       const cacheKey = `${row.participant_id}::${row.project_id}`;
-      let breakdown  = breakdownCache.get(cacheKey);
-      if (!breakdown) {
-        breakdown = await calculatePayoutBreakdown({ supabase, participantId: row.participant_id, projectId: row.project_id });
-        breakdownCache.set(cacheKey, breakdown);
-      }
       const effectiveProductId = row.product_id || fallbackProductByKey.get(cacheKey) || null;
-      const effectiveProduct   = effectiveProductId ? (productMap.get(effectiveProductId) || null) : null;
-      const productAmount      = effectiveProductId ? Number(effectiveProduct?.product_value || 0) : breakdown.productAmount;
+      const effectiveProduct = effectiveProductId ? (productMap.get(effectiveProductId) || null) : null;
+
+      const mappedValue = effectiveProductId ? Number(effectiveProduct?.product_value || 0) : 0;
+      const productAmount = mappedValue > 0 ? mappedValue : Number(row.amount || 0);
+
       return {
         ...row,
-        product_id:         effectiveProductId,
-        project_products:   effectiveProduct,
-        reward_amount:      0,
-        product_amount:     productAmount,
-        total_amount:       productAmount,
+        product_id: effectiveProductId,
+        project_products: effectiveProduct,
+        reward_amount: 0,
+        product_amount: Number.isFinite(productAmount) ? productAmount : 0,
+        total_amount: Number.isFinite(productAmount) ? productAmount : 0,
         eligibility_reason:
-          row.status === 'PAID'     ? 'Payout paid successfully' :
+          row.status === 'PAID' ? 'Payout paid successfully' :
           row.status === 'IN_BATCH' ? 'Included in payout batch' :
           row.status === 'EXPORTED' ? 'Batch exported and waiting for transfer' :
           row.status === 'ELIGIBLE' ? 'Admin approved your invoice and review. Payout will be processed soon.' :
-                                      'Payout eligible and waiting for batch processing'
+            'Payout eligible and waiting for batch processing'
       };
-    }));
+    });
 
     // For repeat application cycles, a participant can have older PAID rows for the
     // same (project, product). We still want to show the latest cycle's state.

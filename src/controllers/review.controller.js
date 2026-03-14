@@ -137,7 +137,7 @@ const getApprovedApplicationMap = async (participantIds, projectIds) => {
     )
     .in('participant_id', participantIds)
     .in('project_id', projectIds)
-    .in('status', ['APPROVED', 'PURCHASED'])
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
     .order('created_at', { ascending: false });
 
   if (appRes.error && /created_at/i.test(String(appRes.error.message || ''))) {
@@ -158,7 +158,7 @@ const getApprovedApplicationMap = async (participantIds, projectIds) => {
       )
       .in('participant_id', participantIds)
       .in('project_id', projectIds)
-      .in('status', ['APPROVED', 'PURCHASED']);
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
   }
 
   if (appRes.error) throw appRes.error;
@@ -222,6 +222,7 @@ const enrichProofRows = async (rows) => {
 
   const allocationIds = [...new Set(rows.map((row) => row.allocation_id).filter(Boolean))];
   const participantIds = [...new Set(rows.map((row) => row.participant_id).filter(Boolean))];
+  const productIdsFromRows = [...new Set(rows.map((row) => row.product_id).filter(Boolean))];
 
   const { data: allocations, error: allocationError } = allocationIds.length
     ? await supabase
@@ -232,7 +233,43 @@ const enrichProofRows = async (rows) => {
   if (allocationError) throw allocationError;
 
   const allocationMap = new Map((allocations || []).map((item) => [item.id, item.project_id]));
-  const projectIds = [...new Set((allocations || []).map((row) => row.project_id).filter(Boolean))];
+
+  // Resolve the *actual* project_id for each proof via product_id -> project_applications -> project_id.
+  // Allocation-level project_id can be misleading when a participant has products across projects.
+  const productProjectMap = new Map(); // product_id -> project_id
+  let productProjectIds = [];
+  if (productIdsFromRows.length) {
+    let appsRes = await supabase
+      .from('project_applications')
+      .select('product_id, project_id, created_at, status')
+      .in('product_id', productIdsFromRows)
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+      .order('created_at', { ascending: false });
+
+    if (appsRes.error && /created_at/i.test(String(appsRes.error.message || ''))) {
+      appsRes = await supabase
+        .from('project_applications')
+        .select('product_id, project_id, status')
+        .in('product_id', productIdsFromRows)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+    }
+
+    if (appsRes.error && !isMissingSchemaObjectError(appsRes.error)) throw appsRes.error;
+
+    for (const app of (appsRes.data || [])) {
+      if (!app?.product_id || !app?.project_id) continue;
+      if (!productProjectMap.has(app.product_id)) {
+        productProjectMap.set(app.product_id, app.project_id);
+      }
+    }
+
+    productProjectIds = [...new Set(Array.from(productProjectMap.values()).filter(Boolean))];
+  }
+
+  const projectIds = [...new Set([
+    ...(allocations || []).map((row) => row.project_id).filter(Boolean),
+    ...productProjectIds
+  ])];
 
   const { data: projects, error: projectError } = projectIds.length
     ? await supabase
@@ -260,7 +297,10 @@ const enrichProofRows = async (rows) => {
   const directProductMap = await getProductNameMap(rows.map((row) => row.product_id));
 
   return rows.map((row) => {
-    const projectId = allocationMap.get(row.allocation_id) || null;
+    const projectId =
+      (row.product_id ? (productProjectMap.get(row.product_id) || null) : null)
+      || allocationMap.get(row.allocation_id)
+      || null;
     const profile = profileMap.get(row.participant_id) || {};
 
     const participantProjectKey = `${row.participant_id}::${projectId}`;

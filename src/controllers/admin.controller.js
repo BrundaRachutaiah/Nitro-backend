@@ -76,7 +76,7 @@ const getApprovedApplicationBreakdownMap = async ({ participantIds = [], project
 
   const latestAppByPair = new Map();
   for (const row of (appRes.data || [])) {
-    const key = `${row.participant_id}::${row.project_id}`;
+    const key = buildParticipantProjectProductKey(row.participant_id, row.project_id, row.product_id);
     if (!latestAppByPair.has(key)) latestAppByPair.set(key, row);
   }
 
@@ -832,32 +832,66 @@ const getParticipantById = async (req, res, next) => {
 
     let proofsRes = await supabase
       .from('purchase_proofs')
-      .select('id, allocation_id, participant_id, status, file_url, created_at, uploaded_at')
+      .select('id, allocation_id, participant_id, product_id, status, file_url, created_at, uploaded_at')
       .eq('participant_id', id)
       .order('uploaded_at', { ascending: false });
 
     if (proofsRes.error && /created_at/i.test(String(proofsRes.error.message || ''))) {
       proofsRes = await supabase
         .from('purchase_proofs')
-        .select('id, allocation_id, participant_id, status, file_url, uploaded_at')
+        .select('id, allocation_id, participant_id, product_id, status, file_url, uploaded_at')
         .eq('participant_id', id)
         .order('uploaded_at', { ascending: false });
     }
+
+    if (proofsRes.error && /product_id/i.test(String(proofsRes.error.message || ''))) {
+      proofsRes = await supabase
+        .from('purchase_proofs')
+        .select('id, allocation_id, participant_id, status, file_url, created_at, uploaded_at')
+        .eq('participant_id', id)
+        .order('uploaded_at', { ascending: false });
+
+      if (proofsRes.error && /created_at/i.test(String(proofsRes.error.message || ''))) {
+        proofsRes = await supabase
+          .from('purchase_proofs')
+          .select('id, allocation_id, participant_id, status, file_url, uploaded_at')
+          .eq('participant_id', id)
+          .order('uploaded_at', { ascending: false });
+      }
+    }
     if (proofsRes.error) throw proofsRes.error;
 
-    const { data: reviews, error: reviewsError } = await supabase
+    let reviewsRes = await supabase
       .from('participant_reviews')
-      .select('id, allocation_id, participant_id, project_id, status, review_text, review_url, created_at')
+      .select('id, allocation_id, participant_id, project_id, product_id, status, review_text, review_url, created_at')
       .eq('participant_id', id)
       .order('created_at', { ascending: false });
-    if (reviewsError) throw reviewsError;
 
-    const { data: payouts, error: payoutsError } = await supabase
+    if (reviewsRes.error && /product_id/i.test(String(reviewsRes.error.message || ''))) {
+      reviewsRes = await supabase
+        .from('participant_reviews')
+        .select('id, allocation_id, participant_id, project_id, status, review_text, review_url, created_at')
+        .eq('participant_id', id)
+        .order('created_at', { ascending: false });
+    }
+    if (reviewsRes.error) throw reviewsRes.error;
+    const reviews = reviewsRes.data || [];
+
+    let payoutsRes = await supabase
       .from('payouts')
-      .select('id, participant_id, project_id, payout_batch_id, amount, status, created_at')
+      .select('id, participant_id, project_id, product_id, payout_batch_id, amount, status, created_at')
       .eq('participant_id', id)
       .order('created_at', { ascending: false });
-    if (payoutsError) throw payoutsError;
+
+    if (payoutsRes.error && /product_id/i.test(String(payoutsRes.error.message || ''))) {
+      payoutsRes = await supabase
+        .from('payouts')
+        .select('id, participant_id, project_id, payout_batch_id, amount, status, created_at')
+        .eq('participant_id', id)
+        .order('created_at', { ascending: false });
+    }
+    if (payoutsRes.error) throw payoutsRes.error;
+    const payouts = payoutsRes.data || [];
 
     let applications = applicationRes.data || [];
     const allocations = allocationRes.data || [];
@@ -889,49 +923,74 @@ const getParticipantById = async (req, res, next) => {
         allocationsByProject.set(row.project_id, row);
       }
     }
+    const singleAllocation = allocations.length === 1 ? allocations[0] : null;
 
     const proofsByAllocation = new Map();
+    const proofsByProduct = new Map();
     for (const row of proofs) {
       if (!proofsByAllocation.has(row.allocation_id)) {
         proofsByAllocation.set(row.allocation_id, row);
       }
+      if (row.product_id && !proofsByProduct.has(row.product_id)) {
+        proofsByProduct.set(row.product_id, row);
+      }
     }
 
     const reviewsByAllocation = new Map();
+    const reviewsByAllocationProduct = new Map();
     for (const row of reviewRows) {
       if (!reviewsByAllocation.has(row.allocation_id)) {
         reviewsByAllocation.set(row.allocation_id, row);
       }
+      if (row.allocation_id && row.product_id) {
+        const key = `${row.allocation_id}::${row.product_id}`;
+        if (!reviewsByAllocationProduct.has(key)) reviewsByAllocationProduct.set(key, row);
+      }
     }
 
     const reviewsByProject = new Map();
+    const reviewsByProjectProduct = new Map();
     for (const row of reviewRows) {
       if (row.project_id && !reviewsByProject.has(row.project_id)) {
         reviewsByProject.set(row.project_id, row);
       }
+      if (row.project_id && row.product_id) {
+        const key = `${row.project_id}::${row.product_id}`;
+        if (!reviewsByProjectProduct.has(key)) reviewsByProjectProduct.set(key, row);
+      }
     }
 
     const payoutsByProject = new Map();
+    const payoutsByProjectProduct = new Map();
     for (const row of payoutRows) {
       if (row.project_id && !payoutsByProject.has(row.project_id)) {
         payoutsByProject.set(row.project_id, row);
+      }
+      if (row.project_id && row.product_id) {
+        const key = `${row.project_id}::${row.product_id}`;
+        if (!payoutsByProjectProduct.has(key)) payoutsByProjectProduct.set(key, row);
       }
     }
 
     const completedProducts = applications
       .filter((app) => ['APPROVED', 'PURCHASED', 'COMPLETED'].includes(String(app.status || '').toUpperCase()))
       .map((app) => {
-        const allocation = allocationsByProject.get(app.project_id) || null;
-        const proof = allocation ? proofsByAllocation.get(allocation.id) || null : null;
-        const review = (allocation ? reviewsByAllocation.get(allocation.id) : null)
+        const allocation = allocationsByProject.get(app.project_id) || singleAllocation || null;
+        const proof = (app.product_id ? (proofsByProduct.get(app.product_id) || null) : null)
+          || (allocation ? proofsByAllocation.get(allocation.id) || null : null);
+        const review = (allocation && app.product_id ? (reviewsByAllocationProduct.get(`${allocation.id}::${app.product_id}`) || null) : null)
+          || (app.product_id ? (reviewsByProjectProduct.get(`${app.project_id}::${app.product_id}`) || null) : null)
+          || (allocation ? reviewsByAllocation.get(allocation.id) : null)
           || reviewsByProject.get(app.project_id)
           || null;
-        const payout = payoutsByProject.get(app.project_id) || null;
+        const payout = (app.product_id ? (payoutsByProjectProduct.get(`${app.project_id}::${app.product_id}`) || null) : null)
+          || payoutsByProject.get(app.project_id)
+          || null;
 
         const projectName = app?.projects?.title || app?.projects?.name || '-';
         const productName = app?.project_products?.name || '-';
         const rewardAmount = Number(app?.projects?.reward || 0);
-        const allocatedBudget = Number(app?.allocated_budget || app?.project_products?.product_value || 0);
+        const allocatedBudget = Number(app?.project_products?.product_value || app?.allocated_budget || 0);
         const totalPayout = rewardAmount + allocatedBudget;
 
         return {
@@ -2965,15 +3024,15 @@ const getEligiblePayouts = async (req, res, next) => {
     const productMap = new Map((productsRes.data || []).map((row) => [row.id, row]));
     const appMap = new Map();
     for (const row of (applicationsRes.data || [])) {
-      const key = `${row.participant_id}::${row.project_id}`;
+      const key = buildParticipantProjectProductKey(row.participant_id, row.project_id, row.product_id);
       if (!appMap.has(key)) appMap.set(key, row);
     }
 
     const rows = (data || []).map((row) => {
-      const key = `${row.participant_id}::${row.project_id}`;
-      const breakdown = breakdownMap.get(key) || {};
+      const key = buildParticipantProjectProductKey(row.participant_id, row.project_id, hasProductColumn ? row.product_id : null);
+      const breakdown = breakdownMap.get(key) || breakdownMap.get(buildParticipantProjectProductKey(row.participant_id, row.project_id, null)) || {};
       const project = projectMap.get(row.project_id) || {};
-      const app = appMap.get(key) || null;
+      const app = appMap.get(key) || appMap.get(buildParticipantProjectProductKey(row.participant_id, row.project_id, null)) || null;
       const product = hasProductColumn ? (productMap.get(row.product_id) || null) : null;
       const rewardAmount = toAmount(breakdown.rewardAmount ?? project.reward);
       // Use product_value as primary source of truth. allocated_budget is only
@@ -3494,25 +3553,30 @@ const markPayoutBatchPaid = async (req, res, next) => {
         throw appRes.error;
       }
 
-      const latestAppIdByKey = new Map();
+      const allAppsByKey = new Map(); // participant::project::product -> [appId...]
+      const allAppsByProjectKey = new Map(); // participant::project -> [appId...]
       for (const row of (appRes.data || [])) {
         const key = `${row.participant_id}::${row.project_id}::${row.product_id || ''}`;
-        if (!latestAppIdByKey.has(key)) {
-          latestAppIdByKey.set(key, row.id);
-        }
+        if (!allAppsByKey.has(key)) allAppsByKey.set(key, []);
+        allAppsByKey.get(key).push(row.id);
+
+        const projKey = `${row.participant_id}::${row.project_id}`;
+        if (!allAppsByProjectKey.has(projKey)) allAppsByProjectKey.set(projKey, []);
+        allAppsByProjectKey.get(projKey).push(row.id);
       }
 
       const appIdsToComplete = [];
       for (const payout of payouts) {
         const key = `${payout.participant_id}::${payout.project_id}::${payout.product_id || ''}`;
-        const appId = latestAppIdByKey.get(key);
-        if (!appId) {
-          const fallbackKey = `${payout.participant_id}::${payout.project_id}::`;
-          const fallbackAppId = latestAppIdByKey.get(fallbackKey);
-          if (fallbackAppId) appIdsToComplete.push(fallbackAppId);
+        const ids = allAppsByKey.get(key) || [];
+        if (ids.length) {
+          appIdsToComplete.push(...ids);
           continue;
         }
-        if (appId) appIdsToComplete.push(appId);
+
+        // Fallback for legacy payouts without product_id: complete ALL apps for this participant+project.
+        const fallbackIds = allAppsByProjectKey.get(`${payout.participant_id}::${payout.project_id}`) || [];
+        if (fallbackIds.length) appIdsToComplete.push(...fallbackIds);
       }
 
       if (appIdsToComplete.length) {

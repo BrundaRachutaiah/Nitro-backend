@@ -156,7 +156,7 @@ const markApplicationCompleted = async ({ participantId, projectId, productId })
     })
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
-    .in('status', ['APPROVED', 'PURCHASED']);
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
 
   if (productId) {
     query = query.eq('product_id', productId);
@@ -170,7 +170,7 @@ const markApplicationCompleted = async ({ participantId, projectId, productId })
       .update({ status: 'COMPLETED' })
       .eq('participant_id', participantId)
       .eq('project_id', projectId)
-      .in('status', ['APPROVED', 'PURCHASED']);
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
 
     if (productId) {
       fallbackQuery = fallbackQuery.eq('product_id', productId);
@@ -210,7 +210,7 @@ const getApprovedApplicationMap = async (participantIds, projectIds) => {
     )
     .in('participant_id', participantIds)
     .in('project_id', projectIds)
-    .in('status', ['APPROVED', 'PURCHASED'])
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
     .order('created_at', { ascending: false });
 
   if (appRes.error && /created_at/i.test(String(appRes.error.message || ''))) {
@@ -231,7 +231,7 @@ const getApprovedApplicationMap = async (participantIds, projectIds) => {
       )
       .in('participant_id', participantIds)
       .in('project_id', projectIds)
-      .in('status', ['APPROVED', 'PURCHASED']);
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
   }
 
   if (appRes.error) throw appRes.error;
