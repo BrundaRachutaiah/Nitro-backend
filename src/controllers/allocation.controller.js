@@ -346,7 +346,6 @@ const getMyAllocationTracking = async (req, res, next) => {
     }
 
     const allocationIds = allocations.map((item) => item.id);
-    const projectIds = [...new Set(allocations.map((item) => item.project_id).filter(Boolean))];
 
     const [proofsRes, reviewsRes, feedbacksRes, payoutsRes, applicationsRes] = await Promise.all([
       supabase
@@ -367,15 +366,12 @@ const getMyAllocationTracking = async (req, res, next) => {
         .eq('participant_id', participantId)
         .in('allocation_id', allocationIds)
         .order('created_at', { ascending: false }),
-      projectIds.length
-        ? supabase
-            .from('payouts')
-            .select('id, project_id, purchase_proof_id, amount, status, created_at')
-            .eq('participant_id', participantId)
-            .in('project_id', projectIds)
-            .order('created_at', { ascending: false })
-        : Promise.resolve({ data: [], error: null }),
-      // Fetch approved applications relevant to these allocations.
+      supabase
+        .from('payouts')
+        .select('id, project_id, product_id, purchase_proof_id, amount, status, created_at')
+        .eq('participant_id', participantId)
+        .order('created_at', { ascending: false }),
+      // Fetch active task applications for this participant (across ALL projects).
       supabase
         .from('project_applications')
         .select(
@@ -400,7 +396,6 @@ const getMyAllocationTracking = async (req, res, next) => {
         `
         )
         .eq('participant_id', participantId)
-        .in('project_id', projectIds)
         // Only active task items should show up in "My Tasks".
         // COMPLETED apps are already paid out and must not appear again when the
         // participant re-applies in a later cycle.
@@ -472,37 +467,32 @@ const getMyAllocationTracking = async (req, res, next) => {
     if (payoutsRes.error) {
       if (!isMissingSchemaObjectError(payoutsRes.error)) throw payoutsRes.error;
 
-      if (projectIds.length) {
-        const fallbackPayouts = await supabase
-          .from('payouts')
-          .select('id, project_id, amount, status, created_at')
-          .eq('participant_id', participantId)
-          .in('project_id', projectIds)
-          .order('created_at', { ascending: false });
+      const fallbackPayouts = await supabase
+        .from('payouts')
+        .select('id, project_id, amount, status, created_at')
+        .eq('participant_id', participantId)
+        .order('created_at', { ascending: false });
 
-        if (fallbackPayouts.error && !isMissingSchemaObjectError(fallbackPayouts.error)) {
-          throw fallbackPayouts.error;
-        }
-
-        payoutRows = (fallbackPayouts.data || []).map((item) => ({
-          ...item,
-          purchase_proof_id: null
-        }));
-      } else {
-        payoutRows = [];
+      if (fallbackPayouts.error && !isMissingSchemaObjectError(fallbackPayouts.error)) {
+        throw fallbackPayouts.error;
       }
+
+      payoutRows = (fallbackPayouts.data || []).map((item) => ({
+        ...item,
+        purchase_proof_id: null,
+        product_id: null
+      }));
     }
 
     let approvedApplications = applicationsRes.data || [];
     if (applicationsRes.error) {
       if (!isMissingSchemaObjectError(applicationsRes.error)) throw applicationsRes.error;
 
-      // Fallback: fetch approved apps for the projects we have allocations for.
+      // Fallback: fetch approved apps for this participant (across ALL projects).
       const fallbackApps = await supabase
         .from('project_applications')
         .select('id, project_id, product_id, allocated_budget, status')
         .eq('participant_id', participantId)
-        .in('project_id', projectIds)
         .in('status', ['APPROVED', 'PURCHASED'])
         .order('created_at', { ascending: false });
 
@@ -546,6 +536,7 @@ const getMyAllocationTracking = async (req, res, next) => {
 
     const proofsByAllocation = new Map();
     const proofsByAllocationProduct = new Map();
+    const proofsByProduct = new Map();
     for (const item of proofRows) {
       const pairKey = buildAllocationProductKey(item.allocation_id, item.product_id);
       if (!proofsByAllocationProduct.has(pairKey)) {
@@ -554,10 +545,14 @@ const getMyAllocationTracking = async (req, res, next) => {
       if (!proofsByAllocation.has(item.allocation_id)) {
         proofsByAllocation.set(item.allocation_id, item);
       }
+      if (item.product_id && !proofsByProduct.has(item.product_id)) {
+        proofsByProduct.set(item.product_id, item);
+      }
     }
 
     const reviewsByAllocation = new Map();
     const reviewsByAllocationProduct = new Map();
+    const reviewsByProduct = new Map();
     for (const item of reviewRows) {
       const pairKey = buildAllocationProductKey(item.allocation_id, item.product_id);
       if (!reviewsByAllocationProduct.has(pairKey)) {
@@ -566,10 +561,14 @@ const getMyAllocationTracking = async (req, res, next) => {
       if (!reviewsByAllocation.has(item.allocation_id)) {
         reviewsByAllocation.set(item.allocation_id, item);
       }
+      if (item.product_id && !reviewsByProduct.has(item.product_id)) {
+        reviewsByProduct.set(item.product_id, item);
+      }
     }
 
     const feedbacksByAllocation = new Map();
     const feedbacksByAllocationProduct = new Map();
+    const feedbacksByProduct = new Map();
     for (const item of feedbackRows) {
       const pairKey = buildAllocationProductKey(item.allocation_id, item.product_id);
       if (!feedbacksByAllocationProduct.has(pairKey)) {
@@ -578,13 +577,22 @@ const getMyAllocationTracking = async (req, res, next) => {
       if (!feedbacksByAllocation.has(item.allocation_id)) {
         feedbacksByAllocation.set(item.allocation_id, item);
       }
+      if (item.product_id && !feedbacksByProduct.has(item.product_id)) {
+        feedbacksByProduct.set(item.product_id, item);
+      }
     }
 
     const payoutsByProofId = new Map();
     const payoutsByProjectId = new Map();
+    const payoutsByProjectProduct = new Map();
     for (const item of payoutRows) {
       if (item.purchase_proof_id && !payoutsByProofId.has(item.purchase_proof_id)) {
         payoutsByProofId.set(item.purchase_proof_id, item);
+      }
+
+      if (item.project_id && item.product_id) {
+        const key = `${item.project_id}::${item.product_id}`;
+        if (!payoutsByProjectProduct.has(key)) payoutsByProjectProduct.set(key, item);
       }
 
       if (item.project_id && !payoutsByProjectId.has(item.project_id)) {
@@ -593,10 +601,10 @@ const getMyAllocationTracking = async (req, res, next) => {
     }
 
     const rows = allocations.map((allocation) => {
-      // Only products approved for THIS allocation's project should appear in My Tasks.
-      const approvedForProject = approvedApplications.filter(
-        (item) => String(item?.project_id || '') === String(allocation.project_id || '')
-      );
+      // One allocation covers products from ALL projects for this participant.
+      // Filtering by allocation.project_id hides tasks when the participant has approvals
+      // across multiple different projects.
+      const approvedForProject = approvedApplications;
 
       // Deduplicate by product_id within this project, keep the latest row.
       const latestByProduct = new Map(); // productId -> application row
@@ -629,15 +637,23 @@ const getMyAllocationTracking = async (req, res, next) => {
         project_title: item?.projects?.title || item?.projects?.name || null,
         project_mode: String(item?.projects?.mode || allocation?.projects?.mode || '').toUpperCase() || null,
         application_status: String(item?.status || '').toUpperCase(),
-        purchase_proof: proofsByAllocationProduct.get(
-          buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || null,
-        review_submission: reviewsByAllocationProduct.get(
-          buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || null,
-        feedback_submission: feedbacksByAllocationProduct.get(
-          buildAllocationProductKey(allocation.id, item?.product_id)
-        ) || null
+        purchase_proof:
+          proofsByAllocationProduct.get(buildAllocationProductKey(allocation.id, item?.product_id))
+          || proofsByProduct.get(item?.product_id)
+          || null,
+        review_submission:
+          reviewsByAllocationProduct.get(buildAllocationProductKey(allocation.id, item?.product_id))
+          || reviewsByProduct.get(item?.product_id)
+          || null,
+        feedback_submission:
+          feedbacksByAllocationProduct.get(buildAllocationProductKey(allocation.id, item?.product_id))
+          || feedbacksByProduct.get(item?.product_id)
+          || null,
+        payout:
+          (item?.project_id && item?.product_id
+            ? payoutsByProjectProduct.get(`${item.project_id}::${item.product_id}`)
+            : null)
+          || null
       }));
 
       // Compatibility fallback: if DB stores proof/review at allocation-level (no product_id),
