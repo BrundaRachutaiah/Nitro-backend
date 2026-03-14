@@ -858,9 +858,18 @@ const getCompletedProjects = async (req, res, next) => {
       if (!payoutErr && payoutRows && payoutRows.length > 0) {
         for (const payout of payoutRows) {
           const key = `${payout.project_id}::${payout.product_id || ''}`;
-          if (!payoutByKey.has(key)) payoutByKey.set(key, payout);
-          if (payout.project_id && !payoutByProject.has(payout.project_id)) {
-            payoutByProject.set(payout.project_id, payout);
+          // Repeat cycles can create multiple payouts for the same (project, product).
+          // Always keep the latest by created_at so workflow_status reflects the most
+          // recent cycle (e.g. new PAID payout should override an older PAID payout).
+          const nextTime = new Date(payout?.created_at || 0).getTime();
+          const existing = payoutByKey.get(key);
+          const existingTime = new Date(existing?.created_at || 0).getTime();
+          if (!existing || nextTime >= existingTime) payoutByKey.set(key, payout);
+
+          if (payout.project_id) {
+            const existingProj = payoutByProject.get(payout.project_id);
+            const existingProjTime = new Date(existingProj?.created_at || 0).getTime();
+            if (!existingProj || nextTime >= existingProjTime) payoutByProject.set(payout.project_id, payout);
           }
         }
 
@@ -878,17 +887,18 @@ const getCompletedProjects = async (req, res, next) => {
         const review = reviewByKey.get(buildProjectProductKey(row.project_id, productId)) || reviewByKey.get(buildProjectProductKey(row.project_id, null)) || null;
         const proofCreatedAt = new Date(proof?.uploaded_at || proof?.created_at || 0).getTime();
         const reviewCreatedAt = new Date(review?.created_at || 0).getTime();
-        const submissionStartedAt = Math.max(
-          proofCreatedAt,
-          reviewCreatedAt,
-          new Date(row.reviewed_at || row.created_at || 0).getTime()
-        );
+        // Cycle anchor: only treat proof/review timestamps as "submission started".
+        // Do NOT use row.reviewed_at (admin approval) here; otherwise an old PAID
+        // payout whose created_at was bumped when paying a batch can match a newly
+        // re-approved application and incorrectly mark it as completed.
+        const submissionStartedAt = Math.max(proofCreatedAt, reviewCreatedAt);
 
         const payoutCandidate = payoutByKey.get(buildProjectProductKey(row.project_id, productId)) || null;
         const payoutCandidateTime = new Date(payoutCandidate?.created_at || 0).getTime();
+        const SKEW_MS = 2 * 60 * 1000;
         const payoutMatchesCurrentCycle = Boolean(payoutCandidate) && (
           (proof?.id && payoutCandidate?.purchase_proof_id && String(payoutCandidate.purchase_proof_id) === String(proof.id))
-          || payoutCandidateTime >= submissionStartedAt
+          || (submissionStartedAt > 0 && payoutCandidateTime >= (submissionStartedAt - SKEW_MS))
         );
         const payout = payoutMatchesCurrentCycle ? payoutCandidate : null;
 
@@ -909,6 +919,15 @@ const getCompletedProjects = async (req, res, next) => {
           workflowStatus = 'APPROVED';
         } else if (hasSubmittedArtifacts) {
           workflowStatus = 'SUBMITTED';
+        } else if (appStatus === 'APPROVED' || appStatus === 'PURCHASED') {
+          // ── BUG 1 FIX ────────────────────────────────────────────────────────
+          // Admin has approved this product but the participant hasn't submitted
+          // their invoice/review yet. These rows were being silently dropped
+          // (workflowStatus = null → filtered out) which caused them to remain
+          // stuck in the Approved tab and never appear in the Completed tab.
+          // Setting workflowStatus = 'APPROVED' here makes them visible in
+          // Completed with an "Approved" badge while awaiting submission.
+          workflowStatus = 'APPROVED';
         }
 
         if (!workflowStatus) return null;

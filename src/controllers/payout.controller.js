@@ -16,6 +16,95 @@ const isMissingSchemaObjectError = (error) => {
 };
 
 /**
+ * ✅ Create ELIGIBLE payout ONLY when BOTH invoice + review are APPROVED
+ * This is the KEY FIX — payouts now only appear after 2nd approval
+ */
+const createPayoutIfBothApproved = async ({
+  participantId,
+  projectId,
+  productId
+} = {}) => {
+  try {
+    if (!participantId || !projectId || !productId) return null;
+
+    // ── CHECK 1: Is purchase proof (invoice) APPROVED? ──
+    const { data: proof } = await supabase
+      .from('purchase_proofs')
+      .select('id, status')
+      .eq('participant_id', participantId)
+      .eq('product_id', productId)
+      .eq('status', 'APPROVED')
+      .maybeSingle();
+
+    // ── CHECK 2: Is participant review APPROVED? ──
+    const { data: review } = await supabase
+      .from('participant_reviews')
+      .select('id, status')
+      .eq('participant_id', participantId)
+      .eq('product_id', productId)
+      .eq('status', 'APPROVED')
+      .maybeSingle();
+
+    // ── CRITICAL: Both must be approved ──
+    if (!proof || !review) {
+      console.log(`[createPayoutIfBothApproved] Waiting - Proof: ${Boolean(proof)}, Review: ${Boolean(review)}`);
+      return null;  // Don't create payout yet
+    }
+
+    // Get product value
+    const { data: product } = await supabase
+      .from('project_products')
+      .select('product_value')
+      .eq('id', productId)
+      .maybeSingle();
+
+    if (!product?.product_value) {
+      console.log(`[createPayoutIfBothApproved] Product value not found for ${productId}`);
+      return null;
+    }
+
+    // ── CHECK 3: Does payout already exist? ──
+    const { data: existingPayout } = await supabase
+      .from('payouts')
+      .select('id')
+      .eq('participant_id', participantId)
+      .eq('project_id', projectId)
+      .eq('product_id', productId)
+      .in('status', ['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID'])
+      .maybeSingle();
+
+    if (existingPayout) {
+      console.log(`[createPayoutIfBothApproved] Payout already exists for product ${productId}`);
+      return existingPayout.id;
+    }
+
+    // ── CREATE ELIGIBLE PAYOUT ──
+    const { data: newPayout, error: insertError } = await supabase
+      .from('payouts')
+      .insert({
+        participant_id: participantId,
+        project_id: projectId,
+        product_id: productId,
+        amount: product.product_value,
+        status: 'ELIGIBLE'
+      })
+      .select()
+      .maybeSingle();
+
+    if (insertError) {
+      console.error('[createPayoutIfBothApproved] Insert error:', insertError);
+      return null;
+    }
+
+    console.log(`[createPayoutIfBothApproved] ✅ Created ELIGIBLE payout for product ${productId}`);
+    return newPayout?.id;
+  } catch (err) {
+    console.error('[createPayoutIfBothApproved] Error:', err);
+    return null;
+  }
+};
+
+/**
  * Cleans up duplicate ELIGIBLE payout rows in the DB.
  */
 const deduplicatePayoutRows = async (participantId = null) => {
@@ -64,10 +153,10 @@ const deduplicatePayoutRows = async (participantId = null) => {
 
 /**
  * ✅ Get Eligible payouts (Admin)
+ * FIX: Now filters to ONLY show payouts with both invoice AND review APPROVED
  */
 const getEligiblePayouts = async (req, res, next) => {
   try {
-    await deduplicatePayoutRows();
     await backfillEligiblePayouts();
 
     const { data, error } = await supabase
@@ -99,8 +188,46 @@ const getEligiblePayouts = async (req, res, next) => {
     const projectMap = new Map((projectsRes.data || []).map(r => [r.id, r]));
     const productMap = new Map((productsRes.data || []).map(r => [r.id, r]));
 
+    // ── NEW VERIFICATION LOGIC ──────────────────────────────────────────────────
+    // Only include payouts where BOTH invoice + review are APPROVED
+    const verifiedPayouts = await Promise.all(
+      rows.map(async (row) => {
+        // Check if invoice (purchase_proof) is APPROVED for this product
+        const { data: proof } = await supabase
+          .from('purchase_proofs')
+          .select('id')
+          .eq('participant_id', row.participant_id)
+          .eq('product_id', row.product_id)
+          .eq('status', 'APPROVED')
+          .maybeSingle();
+
+        // Check if review is APPROVED for this product
+        const { data: review } = await supabase
+          .from('participant_reviews')
+          .select('id')
+          .eq('participant_id', row.participant_id)
+          .eq('product_id', row.product_id)
+          .eq('status', 'APPROVED')
+          .maybeSingle();
+
+        // Only return payout if BOTH are approved
+        const isVerified = Boolean(proof) && Boolean(review);
+        
+        if (!isVerified) {
+          console.log(`[getEligiblePayouts] Filtering out unverified payout - Product: ${row.product_id}, Proof: ${Boolean(proof)}, Review: ${Boolean(review)}`);
+          return null;
+        }
+
+        return row;
+      })
+    );
+
+    // Remove null entries (unverified payouts)
+    const validPayouts = verifiedPayouts.filter(Boolean);
+    // ── END OF NEW VERIFICATION LOGIC ────────────────────────────────────────
+
     // For payouts missing product_id, load all products for those projects
-    const rowsNeedingFallback    = rows.filter(r => !r.product_id);
+    const rowsNeedingFallback    = validPayouts.filter(r => !r.product_id);
     const allProjectProductMap   = new Map(); // projectId → [product, ...]
     const fallbackAppsByKey      = new Map(); // "pid::projId" → [app, ...]
     const fallbackAppIndexByKey  = new Map(); // tracks sequential assignment index
@@ -137,7 +264,7 @@ const getEligiblePayouts = async (req, res, next) => {
 
     // Deduplicate: keep one payout per (participant_id, project_id, product_id)
     const seenPayoutKeys  = new Set();
-    const deduplicatedRows = rows.filter(row => {
+    const deduplicatedRows = validPayouts.filter(row => {
       const key = `${row.participant_id}::${row.project_id}::${row.product_id || '__none__'}`;
       if (seenPayoutKeys.has(key)) return false;
       seenPayoutKeys.add(key);
@@ -147,7 +274,6 @@ const getEligiblePayouts = async (req, res, next) => {
     const enriched = deduplicatedRows.map(row => {
       const profile = profileMap.get(row.participant_id) || null;
       const project = projectMap.get(row.project_id)     || null;
-      // Direct product lookup by payout.product_id — always the most accurate source
       const product = productMap.get(row.product_id)     || null;
 
       // Resolve fallback product when product_id is missing from payout row
@@ -496,14 +622,6 @@ const backfillPayoutsForParticipant = async (participantId) => {
         payoutCountByProject.set(p.project_id, (payoutCountByProject.get(p.project_id) || 0) + 1);
       }
     }
-    const appCountByProject = new Map();
-    for (const app of apps) { if (app.project_id) appCountByProject.set(app.project_id, (appCountByProject.get(app.project_id) || 0) + 1); }
-    for (const [projId, payoutCount] of payoutCountByProject.entries()) {
-      const appCount = appCountByProject.get(projId) || 0;
-      if (payoutCount >= appCount && appCount > 0) {
-        for (const app of apps) { if (app.project_id === projId) coveredSet.add(`${projId}::${app.product_id || '__none__'}`); }
-      }
-    }
 
     for (const app of apps) {
       const { project_id: projId, product_id: productId } = app;
@@ -511,7 +629,12 @@ const backfillPayoutsForParticipant = async (participantId) => {
 
       const project    = projectMap.get(projId);
       const mode       = String(project?.mode || '').toUpperCase();
-      const isEligible = mode === 'MARKETPLACE' ? reviewProjectSet.has(projId) : (proofProjectSet.has(projId) || reviewProjectSet.has(projId));
+      // Only create ELIGIBLE payouts after admin-approved submission artifacts:
+      // MARKETPLACE: approved review/feedback
+      // D2C: approved invoice (proof) AND approved review
+      const isEligible = mode === 'MARKETPLACE'
+        ? reviewProjectSet.has(projId)
+        : (proofProjectSet.has(projId) && reviewProjectSet.has(projId));
       if (!isEligible) continue;
 
       const covKey = `${projId}::${productId || '__none__'}`;
@@ -524,17 +647,28 @@ const backfillPayoutsForParticipant = async (participantId) => {
       const productAmount = Number(productMap.get(productId)?.product_value || 0);
       const proofId       = firstProofIdByProject.get(projId) || null;
 
-      const candidates = [
-        { participant_id: participantId, user_id: participantId, project_id: projId, product_id: productId || null, purchase_proof_id: proofId, amount: productAmount, status: 'ELIGIBLE' },
-        { participant_id: participantId, user_id: participantId, project_id: projId, product_id: productId || null, amount: productAmount, status: 'ELIGIBLE' },
-        { participant_id: participantId, project_id: projId, product_id: productId || null, amount: productAmount, status: 'ELIGIBLE' },
-        { participant_id: participantId, project_id: projId, amount: productAmount, status: 'ELIGIBLE' },
+      // ── FIX: use the same tryInsert pattern as backfillEligiblePayouts ────────
+      const basePayload = {
+        participant_id:   participantId,
+        project_id:       projId,
+        product_id:       productId || null,
+        purchase_proof_id: proofId || null,
+        amount:           productAmount,
+        status:           'ELIGIBLE',
+      };
+      const variants = [
+        basePayload,
+        { ...basePayload, purchase_proof_id: undefined },
+        { ...basePayload, product_id: undefined, purchase_proof_id: undefined },
       ];
-      for (const c of candidates) {
-        const clean = Object.fromEntries(Object.entries(c).filter(([, v]) => v !== undefined && v !== null || typeof v === 'number'));
+      for (const variant of variants) {
+        const clean = Object.fromEntries(
+          Object.entries(variant).filter(([, v]) => v !== undefined && v !== null)
+        );
         const { error } = await supabase.from('payouts').insert(clean);
         if (!error) { coveredSet.add(covKey); break; }
         const msg = String(error.message || '').toLowerCase();
+        // Only continue trying variants for schema errors (missing column/table)
         if (!msg.includes('does not exist') && !msg.includes('column') && !msg.includes('schema cache')) break;
       }
     }
@@ -549,8 +683,6 @@ const backfillPayoutsForParticipant = async (participantId) => {
 const getMyPayouts = async (req, res, next) => {
   try {
     const participantId = req.user.id;
-    await deduplicatePayoutRows(participantId);
-    await backfillPayoutsForParticipant(participantId);
 
     let payoutRes = await supabase
       .from('payouts')
@@ -685,46 +817,74 @@ const getMyPayouts = async (req, res, next) => {
           row.status === 'PAID'     ? 'Payout paid successfully' :
           row.status === 'IN_BATCH' ? 'Included in payout batch' :
           row.status === 'EXPORTED' ? 'Batch exported and waiting for transfer' :
+          row.status === 'ELIGIBLE' ? 'Admin approved your invoice and review. Payout will be processed soon.' :
                                       'Payout eligible and waiting for batch processing'
       };
     }));
 
-    const existingActualKeys = new Set(
-      actualPayoutRows.map((row) => `${row.project_id}::${row.product_id || ''}`)
-    );
+    // For repeat application cycles, a participant can have older PAID rows for the
+    // same (project, product). We still want to show the latest cycle's state.
+    const latestPayoutTimeByKey = new Map();
+    for (const row of actualPayoutRows) {
+      const key = `${row.project_id}::${row.product_id || ''}`;
+      const t = new Date(row.created_at || 0).getTime();
+      const existing = latestPayoutTimeByKey.get(key) || 0;
+      if (t > existing) latestPayoutTimeByKey.set(key, t);
+    }
 
-    const syntheticPendingRows = Array.from(latestAppByProjectProduct.values())
+    const syntheticRows = Array.from(latestAppByProjectProduct.values())
       .map((app) => {
         const key = `${app.project_id}::${app.product_id || ''}`;
-        if (existingActualKeys.has(key)) return null;
 
-        const proof = app.product_id ? latestProofByProduct.get(String(app.product_id)) || null : null;
+        // If there's no payout for this key at all, keep old behavior too.
+        const latestPayoutTime = latestPayoutTimeByKey.get(key) || 0;
+
+        const appTime = new Date(app.reviewed_at || app.created_at || 0).getTime();
+        // Allow small clock/ordering skew between app approval and payout creation.
+        const SKEW_MS = 2 * 60 * 1000;
+        if (latestPayoutTime && appTime && latestPayoutTime >= (appTime - SKEW_MS)) return null;
+
+        const proof = app.product_id ? (latestProofByProduct.get(String(app.product_id)) || null) : null;
         const review = latestReviewByProjectProduct.get(key) || null;
-        if (!proof || !review) return null;
+
+        // Ignore artifacts from older cycles (before this app was approved/created).
+        const proofTime = new Date(proof?.uploaded_at || 0).getTime();
+        const reviewTime = new Date(review?.created_at || 0).getTime();
+        const proofInThisCycle = Boolean(proof) && (!appTime || proofTime >= appTime);
+        const reviewInThisCycle = Boolean(review) && (!appTime || reviewTime >= appTime);
 
         const product = app.product_id ? (productMap.get(app.product_id) || null) : null;
-        const createdAt = review?.created_at || proof?.uploaded_at || app.reviewed_at || app.created_at || null;
+        const amount = Number(product?.product_value || 0);
 
-        return {
-          id: `pending::${app.id}`,
-          amount: Number(product?.product_value || 0),
-          status: 'PENDING',
-          created_at: createdAt,
-          payout_batch_id: null,
-          participant_id: app.participant_id,
-          project_id: app.project_id,
-          product_id: app.product_id || null,
-          projects: app.projects || null,
-          project_products: product,
-          reward_amount: 0,
-          product_amount: Number(product?.product_value || 0),
-          total_amount: Number(product?.product_value || 0),
-          eligibility_reason: 'Invoice and review submitted. Waiting for admin approval.'
-        };
+        // If participant has submitted both invoice and review for this cycle but no payout row exists yet,
+        // show a synthetic "PENDING" row (admin verification in progress).
+        if (proofInThisCycle && reviewInThisCycle) {
+          const createdAt = review?.created_at || proof?.uploaded_at || app.reviewed_at || app.created_at || null;
+          return {
+            id: `pending::${app.id}`,
+            amount,
+            status: 'PENDING',
+            created_at: createdAt,
+            payout_batch_id: null,
+            participant_id: app.participant_id,
+            project_id: app.project_id,
+            product_id: app.product_id || null,
+            projects: app.projects || null,
+            project_products: product,
+            reward_amount: 0,
+            product_amount: amount,
+            total_amount: amount,
+            eligibility_reason: 'Invoice and review submitted. Waiting for admin approval.'
+          };
+        }
+
+        // If there is no submission yet for this cycle, do not show anything on the payout page.
+        // Payouts should reflect reimbursement tracking, not purchase approval.
+        return null;
       })
       .filter(Boolean);
 
-    const finalRows = [...syntheticPendingRows, ...enrichedPayouts]
+    const finalRows = [...syntheticRows, ...enrichedPayouts]
       .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
 
     res.json({ success: true, data: finalRows });
@@ -734,13 +894,24 @@ const getMyPayouts = async (req, res, next) => {
 };
 
 /**
- * Backfill: create ELIGIBLE payout rows for all participants with approved proof/review.
+ * ✅ Backfill: create ELIGIBLE payout rows for all participants with approved proof/review.
+ * KEY FIX: Only creates payouts when BOTH invoice (proof) AND review are approved.
  */
 const backfillEligiblePayouts = async () => {
-  const { data: applications, error: appErr } = await supabase
+  const SKEW_MS = 2 * 60 * 1000;
+  let appRes = await supabase
     .from('project_applications')
-    .select('id, participant_id, project_id, product_id, allocated_budget, status')
+    .select('id, participant_id, project_id, product_id, allocated_budget, status, reviewed_at, created_at')
     .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+
+  if (appRes.error && /reviewed_at/i.test(String(appRes.error.message || ''))) {
+    appRes = await supabase
+      .from('project_applications')
+      .select('id, participant_id, project_id, product_id, allocated_budget, status, created_at')
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+  }
+
+  const { data: applications, error: appErr } = appRes;
   if (appErr) { console.error('backfill app fetch error:', appErr.message); return; }
   if (!applications || !applications.length) return;
 
@@ -780,16 +951,25 @@ const backfillEligiblePayouts = async () => {
   for (const proof of allProofs) { const pid = allocMap.get(proof.allocation_id); if (pid) { const e = getOrCreate(proof.participant_id, pid); e.hasProof = true; if (!e.proofId) e.proofId = proof.id; } }
 
   const { data: existingPayouts } = await supabase
-    .from('payouts').select('participant_id, project_id, product_id, status')
+    .from('payouts').select('participant_id, project_id, product_id, status, created_at')
     .in('participant_id', participantIds).in('project_id', projectIds);
+
+  // Repeat application cycles can legitimately create multiple payouts for the same
+  // (participant, project, product) across time. We only skip inserting when there is
+  // already a payout row created for the current cycle (based on timestamps).
+  const latestPayoutTimeByKey = new Map();
   const coveredSet = new Set();
   for (const p of (existingPayouts || [])) {
-    if (['ELIGIBLE','IN_BATCH','EXPORTED','PAID'].includes(String(p.status || '').toUpperCase()))
-      coveredSet.add(`${p.participant_id}::${p.project_id}::${p.product_id || '__none__'}`);
+    if (!['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID'].includes(String(p.status || '').toUpperCase())) continue;
+    const key = `${p.participant_id}::${p.project_id}::${p.product_id || '__none__'}`;
+    coveredSet.add(key);
+    const t = new Date(p.created_at || 0).getTime();
+    const existing = latestPayoutTimeByKey.get(key) || 0;
+    if (t > existing) latestPayoutTimeByKey.set(key, t);
   }
 
   const tryInsert = async (payload) => {
-    for (const v of [payload, { ...payload, user_id: undefined }, { ...payload, purchase_proof_id: undefined }, { ...payload, user_id: undefined, purchase_proof_id: undefined }]) {
+    for (const v of [payload, { ...payload, purchase_proof_id: undefined }]) {
       const clean = Object.fromEntries(Object.entries(v).filter(([, val]) => val !== undefined));
       const { error } = await supabase.from('payouts').insert(clean);
       if (!error) return true;
@@ -803,16 +983,39 @@ const backfillEligiblePayouts = async () => {
     const { participant_id: pid, project_id: projId, product_id: productId } = app;
     if (!pid || !projId) continue;
     const eligi = eligibilityMap.get(`${pid}::${projId}`);
-    if (!eligi) continue;
     const mode       = String(projectMap.get(projId)?.mode || '').toUpperCase();
-    const isEligible = mode === 'MARKETPLACE' ? eligi.hasReview : (eligi.hasProof || eligi.hasReview);
+    // Only create ELIGIBLE payouts after admin-approved submission artifacts:
+    // MARKETPLACE: approved review
+    // D2C: approved invoice (proof) AND approved review ← THIS IS CORRECT
+    const isEligible = Boolean(eligi) && (
+      mode === 'MARKETPLACE'
+        ? eligi.hasReview
+        : (eligi.hasProof && eligi.hasReview)
+    );
     if (!isEligible) continue;
     const covKey = `${pid}::${projId}::${productId || '__none__'}`;
-    if (coveredSet.has(covKey)) continue;
+
+    // Allow a new ELIGIBLE payout when the application is from a newer cycle than
+    // the last recorded payout for this same (participant, project, product).
+    const appTime = new Date(app.reviewed_at || app.created_at || 0).getTime();
+    const lastPayoutTime = latestPayoutTimeByKey.get(covKey) || 0;
+    if (coveredSet.has(covKey) && appTime && lastPayoutTime >= (appTime - SKEW_MS)) continue;
     const productAmount = Number(productMap.get(productId)?.product_value || 0);
-    const inserted = await tryInsert({ participant_id: pid, user_id: pid, project_id: projId, product_id: productId || null, purchase_proof_id: eligi.proofId || null, amount: productAmount, status: 'ELIGIBLE' });
-    if (inserted) coveredSet.add(covKey);
+    const inserted = await tryInsert({ participant_id: pid, project_id: projId, product_id: productId || null, purchase_proof_id: eligi?.proofId || null, amount: productAmount, status: 'ELIGIBLE' });
+    if (inserted) {
+      coveredSet.add(covKey);
+      latestPayoutTimeByKey.set(covKey, Date.now());
+    }
   }
 };
 
-module.exports = { getEligiblePayouts, getPayoutBatches, createPayoutBatch, markBatchPaid, getMyPayouts, backfillEligiblePayouts };
+module.exports = { 
+  getEligiblePayouts, 
+  getPayoutBatches, 
+  createPayoutBatch, 
+  markBatchPaid, 
+  getMyPayouts, 
+  backfillEligiblePayouts,
+  createPayoutIfBothApproved,
+  deduplicatePayoutRows
+};

@@ -2604,8 +2604,8 @@ const bulkDecideApplications = async (req, res, next) => {
 
 /**
  * Approve purchase proof.
- * D2C: purchase proof approval can mark payout eligible.
- * Marketplace: payout stays pending until review/feedback workflow completes.
+ * Purchase proof approval unlocks the review step.
+ * Payout becomes ELIGIBLE only after admin approves BOTH invoice and review.
  */
 const approvePurchaseProof = async (req, res, next) => {
   try {
@@ -2680,102 +2680,9 @@ const approvePurchaseProof = async (req, res, next) => {
 
     if (allocationError) throw allocationError;
 
-    let payoutCreated = false;
-    if (allocation) {
-      const projectMode = String(allocation?.projects?.mode || '').toUpperCase();
-      // FIX: For both D2C and MARKETPLACE, create payout on proof approval
-      // (MARKETPLACE proof approval signals purchase happened — review approval creates final payout via ensureEligiblePayout)
-      if (projectMode === 'D2C' || projectMode === 'MARKETPLACE') {
-        const { data: existingPayout, error: payoutLookupError } = await supabase
-          .from('payouts')
-          .select('id')
-          .eq('participant_id', allocation.participant_id)
-          .eq('project_id', allocation.project_id)
-          .maybeSingle();
-
-        if (payoutLookupError) throw payoutLookupError;
-
-        if (!existingPayout) {
-          const breakdown = await calculatePayoutBreakdown({
-            supabase,
-            participantId: allocation.participant_id,
-            projectId: allocation.project_id,
-            fallbackReward: allocation?.projects?.reward
-          });
-
-          let payoutError = null;
-          ({ error: payoutError } = await supabase
-            .from('payouts')
-            .insert({
-              participant_id: allocation.participant_id,
-              user_id: allocation.participant_id,
-              project_id: allocation.project_id,
-              purchase_proof_id: proofRow.id,
-              amount: Number(breakdown.totalAmount || 0),
-              status: 'ELIGIBLE'
-            }));
-
-          if (payoutError && isMissingSchemaObjectError(payoutError)) {
-            ({ error: payoutError } = await supabase
-              .from('payouts')
-              .insert({
-                participant_id: allocation.participant_id,
-                user_id: allocation.participant_id,
-                project_id: allocation.project_id,
-                amount: Number(breakdown.totalAmount || 0),
-                status: 'ELIGIBLE'
-              }));
-          }
-
-          if (payoutError && isMissingSchemaObjectError(payoutError)) {
-            ({ error: payoutError } = await supabase
-              .from('payouts')
-              .insert({
-                participant_id: allocation.participant_id,
-                project_id: allocation.project_id,
-                purchase_proof_id: proofRow.id,
-                amount: Number(breakdown.totalAmount || 0),
-                status: 'ELIGIBLE'
-              }));
-          }
-
-          if (payoutError && isMissingSchemaObjectError(payoutError)) {
-            ({ error: payoutError } = await supabase
-              .from('payouts')
-              .insert({
-                participant_id: allocation.participant_id,
-                project_id: allocation.project_id,
-                amount: Number(breakdown.totalAmount || 0),
-                status: 'ELIGIBLE'
-              }));
-          }
-
-          if (payoutError) throw payoutError;
-          payoutCreated = true;
-        }
-
-        const completionRes = await supabase
-          .from('unit_allocations')
-          .update({ completed_at: new Date().toISOString() })
-          .eq('id', proofRow.allocation_id)
-          .eq('participant_id', allocation.participant_id)
-          .is('completed_at', null);
-
-        if (completionRes.error && isMissingSchemaObjectError(completionRes.error)) {
-          const statusOnlyRes = await supabase
-            .from('unit_allocations')
-            .update({ status: ALLOCATION_STATUS.COMPLETED })
-            .eq('id', proof.allocation_id)
-            .eq('participant_id', allocation.participant_id);
-
-          if (statusOnlyRes.error && !isMissingSchemaObjectError(statusOnlyRes.error)) {
-            throw statusOnlyRes.error;
-          }
-        } else if (completionRes.error) {
-          throw completionRes.error;
-        }
-      }
-    }
+    // Do not create payouts or complete allocations here.
+    // Invoice approval only unlocks the review step. Payout eligibility is created
+    // when the review is approved.
 
     const { data: participant } = await supabase
       .from('profiles')
@@ -2792,18 +2699,16 @@ const approvePurchaseProof = async (req, res, next) => {
     if (participant?.email) {
       sendEmail({
         to: participant.email,
-        subject: '✅ Invoice Approved — Submit Your Review',
+        subject: 'Invoice Approved - Submit Your Review',
         html: purchaseApprovedEmail(participant.full_name, proofProjectName, [])
       });
     }
 
     res.json({
       success: true,
-      message: payoutCreated
-        ? 'Purchase proof approved and payout eligibility created'
-        : alreadyProcessed
-          ? 'Purchase proof already approved'
-          : 'Purchase proof approved'
+      message: alreadyProcessed
+        ? 'Purchase proof already approved'
+        : 'Purchase proof approved'
     });
 
     await logActivity({
@@ -3486,18 +3391,20 @@ const markPayoutBatchPaid = async (req, res, next) => {
       });
     }
 
+    // IMPORTANT: Do NOT filter by status here.
+    // In real data we have seen rows stuck in unexpected statuses/casing
+    // after partial migrations (e.g. 'pending', 'in_batch', etc.). The only
+    // reliable link is payout_batch_id.
     let payoutsLookup = await supabase
       .from('payouts')
-      .select('id, participant_id, project_id, product_id')
-      .eq('payout_batch_id', id)
-      .in('status', ['IN_BATCH', 'EXPORTED']);
+      .select('id, participant_id, project_id, product_id, status, payout_batch_id')
+      .eq('payout_batch_id', id);
 
     if (payoutsLookup.error && /product_id/i.test(String(payoutsLookup.error.message || ''))) {
       payoutsLookup = await supabase
         .from('payouts')
-        .select('id, participant_id, project_id')
-        .eq('payout_batch_id', id)
-        .in('status', ['IN_BATCH', 'EXPORTED']);
+        .select('id, participant_id, project_id, status, payout_batch_id')
+        .eq('payout_batch_id', id);
     }
 
     const { data: payouts, error: payoutsError } = payoutsLookup;
@@ -3505,42 +3412,86 @@ const markPayoutBatchPaid = async (req, res, next) => {
     if (!payouts || payouts.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'No payouts in this batch are pending payment'
+        message: 'No payouts found for this batch'
       });
     }
 
     const payoutIds = payouts.map((row) => row.id);
 
-    const { error: payoutUpdateError } = await supabase
-      .from('payouts')
-      .update({ status: 'PAID' })
-      .in('id', payoutIds);
+    const nowIso = new Date().toISOString();
+
+    // Update payout rows to PAID and bump a timestamp so participant views (which are cycle-aware)
+    // stop showing a newer "Approved" row after payment is recorded.
+    //
+    // Prefer paid_at/updated_at if the column exists; otherwise fall back to bumping created_at.
+    // Bumping created_at is not semantically perfect, but it's the only stable timestamp that
+    // exists across older schemas and it's what participant views currently rely on.
+    const tryUpdatePayouts = async (payload) => {
+      const clean = Object.fromEntries(Object.entries(payload).filter(([, v]) => v !== undefined));
+      return supabase.from('payouts').update(clean).in('id', payoutIds);
+    };
+
+    // Always try to bump created_at too because participant endpoints rely on it for
+    // cycle ordering (older schemas may not have updated_at/paid_at).
+    let payoutUpdate = await tryUpdatePayouts({ status: 'PAID', paid_at: nowIso, updated_at: nowIso, created_at: nowIso });
+    if (payoutUpdate.error && /paid_at/i.test(String(payoutUpdate.error.message || ''))) {
+      payoutUpdate = await tryUpdatePayouts({ status: 'PAID', updated_at: nowIso, created_at: nowIso });
+    }
+    if (payoutUpdate.error && /updated_at/i.test(String(payoutUpdate.error.message || ''))) {
+      payoutUpdate = await tryUpdatePayouts({ status: 'PAID', created_at: nowIso });
+    }
+    if (payoutUpdate.error && /created_at/i.test(String(payoutUpdate.error.message || ''))) {
+      payoutUpdate = await tryUpdatePayouts({ status: 'PAID' });
+    }
+
+    const { error: payoutUpdateError } = payoutUpdate;
 
     if (payoutUpdateError) throw payoutUpdateError;
 
-    const { error: batchUpdateError } = await supabase
+    // Mark batch PAID too (best-effort paid_at if schema supports it)
+    let batchUpdate = await supabase
       .from('payout_batches')
-      .update({ status: 'PAID' })
+      .update({ status: 'PAID', paid_at: nowIso })
       .eq('id', id);
 
-    if (batchUpdateError) throw batchUpdateError;
+    if (batchUpdate.error && /paid_at/i.test(String(batchUpdate.error.message || ''))) {
+      batchUpdate = await supabase
+        .from('payout_batches')
+        .update({ status: 'PAID' })
+        .eq('id', id);
+    }
+
+    if (batchUpdate.error) throw batchUpdate.error;
 
     const participantIds = [...new Set(payouts.map((row) => row.participant_id).filter(Boolean))];
     if (participantIds.length) {
-      let appRes = await supabase
+      const projectIds = [...new Set(payouts.map((row) => row.project_id).filter(Boolean))];
+      const productIds = [...new Set(payouts.map((row) => row.product_id).filter(Boolean))];
+
+      let appQuery = supabase
         .from('project_applications')
         .select('id, participant_id, project_id, product_id, status, reviewed_at, created_at')
         .in('participant_id', participantIds)
-        .in('status', ['APPROVED', 'PURCHASED'])
+        .in('status', ['APPROVED', 'PURCHASED']);
+
+      if (projectIds.length) appQuery = appQuery.in('project_id', projectIds);
+      if (productIds.length) appQuery = appQuery.in('product_id', productIds);
+
+      let appRes = await appQuery
         .order('reviewed_at', { ascending: false })
         .order('created_at', { ascending: false });
 
       if (appRes.error && /reviewed_at|created_at/i.test(String(appRes.error.message || ''))) {
-        appRes = await supabase
+        let appFallbackQuery = supabase
           .from('project_applications')
           .select('id, participant_id, project_id, product_id, status')
           .in('participant_id', participantIds)
           .in('status', ['APPROVED', 'PURCHASED']);
+
+        if (projectIds.length) appFallbackQuery = appFallbackQuery.in('project_id', projectIds);
+        if (productIds.length) appFallbackQuery = appFallbackQuery.in('product_id', productIds);
+
+        appRes = await appFallbackQuery;
       }
 
       if (appRes.error && !isMissingSchemaObjectError(appRes.error)) {
@@ -3603,12 +3554,21 @@ const markPayoutBatchPaid = async (req, res, next) => {
 };
 
 const backfillEligiblePayouts = async () => {
+  const SKEW_MS = 2 * 60 * 1000;
   // ── 1. Fetch all applications eligible for payout ─────────────────────────
   let appRes = await supabase
     .from('project_applications')
-    .select('id, participant_id, project_id, product_id, allocated_budget, status')
-    .in('status', ['APPROVED', 'PURCHASED']);
+    .select('id, participant_id, project_id, product_id, allocated_budget, status, reviewed_at, created_at')
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
   if (appRes.error && !isMissingSchemaObjectError(appRes.error)) throw appRes.error;
+
+  if (appRes.error && /reviewed_at|created_at/i.test(String(appRes.error.message || ''))) {
+    appRes = await supabase
+      .from('project_applications')
+      .select('id, participant_id, project_id, product_id, allocated_budget, status')
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+    if (appRes.error && !isMissingSchemaObjectError(appRes.error)) throw appRes.error;
+  }
 
   const applications = (appRes.data || []);
   if (!applications.length) return;
@@ -3741,7 +3701,7 @@ const backfillEligiblePayouts = async () => {
   // ── 8. Fetch existing payouts to skip already-covered products ────────────
   let existingPayoutsRes = await supabase
     .from('payouts')
-    .select('id, participant_id, project_id, product_id, status')
+    .select('id, participant_id, project_id, product_id, status, created_at')
     .in('participant_id', participantIds)
     .in('project_id', projectIds);
 
@@ -3757,14 +3717,20 @@ const backfillEligiblePayouts = async () => {
 
   const existingPayouts = existingPayoutsRes.data || [];
 
-  // Build covered set: participantId::projectId::productId when possible.
-  // Older schemas may miss product_id; in that case fall back to participant::project.
+  // Repeat application cycles can create multiple payouts for the same
+  // (participant, project, product) over time. Only skip if the latest payout
+  // is already for the current cycle (based on timestamps).
   const coveredSet = new Set();
+  const latestPayoutTimeByKey = new Map();
   for (const p of existingPayouts) {
-    coveredSet.add(`${p.participant_id}::${p.project_id}::${p.product_id || ''}`);
-    if (!('product_id' in p)) {
-      coveredSet.add(`${p.participant_id}::${p.project_id}`);
-    }
+    const st = String(p?.status || '').toUpperCase();
+    if (!['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID'].includes(st)) continue;
+    const key = `${p.participant_id}::${p.project_id}::${p.product_id || ''}`;
+    coveredSet.add(key);
+    if (!('product_id' in p)) coveredSet.add(`${p.participant_id}::${p.project_id}`);
+    const t = new Date(p.created_at || 0).getTime();
+    const existing = latestPayoutTimeByKey.get(key) || 0;
+    if (t > existing) latestPayoutTimeByKey.set(key, t);
   }
 
   // ── 9. For each application, create ELIGIBLE payout if needed ─────────────
@@ -3775,23 +3741,23 @@ const backfillEligiblePayouts = async () => {
 
     const eligKey = `${participantId}::${projectId}`;
     const eligi = eligibilityMap.get(eligKey);
-    if (!eligi) continue;
-
     const project = projectMap.get(projectId);
     const mode = String(project?.mode || '').toUpperCase();
-
-    let isEligible = false;
-    if (mode === 'MARKETPLACE') {
-      isEligible = eligi.hasReview;
-    } else {
-      isEligible = eligi.hasProof || eligi.hasReview;
-    }
+    // Only create ELIGIBLE payouts after admin-approved submission artifacts:
+    // MARKETPLACE: approved review/feedback
+    // D2C: approved invoice (proof) AND approved review
+    const isEligible = Boolean(eligi) && (
+      mode === 'MARKETPLACE'
+        ? eligi.hasReview
+        : (eligi.hasProof && eligi.hasReview)
+    );
     if (!isEligible) continue;
 
     const covKey = `${participantId}::${projectId}::${productId || ''}`;
-    if (coveredSet.has(covKey)) continue;
+    const appTime = new Date(app.reviewed_at || app.created_at || 0).getTime();
+    const lastPayoutTime = latestPayoutTimeByKey.get(covKey) || 0;
+    if (coveredSet.has(covKey) && appTime && lastPayoutTime >= (appTime - SKEW_MS)) continue;
 
-    const rewardAmount = toAmount(project?.reward);
     // Always use product_value as the authoritative price. Only fall back to
     // allocated_budget when product_value is missing/zero (prevents accidental
     // override when admin set allocated_budget to a wrong value).
@@ -3805,8 +3771,9 @@ const backfillEligiblePayouts = async () => {
       user_id: participantId,
       project_id: projectId,
       product_id: productId || null,
-      purchase_proof_id: eligi.proofId || null,
-      amount: rewardAmount + productAmount,
+      purchase_proof_id: eligi?.proofId || null,
+      // Store product value only; frontend totals are based on product_value.
+      amount: productAmount,
       status: 'ELIGIBLE',
     });
   }
@@ -4356,13 +4323,22 @@ const markPayoutPaid = async (req, res, next) => {
   try {
     const { payoutId } = req.params;
 
-    const { data: payout, error: lookupErr } = await supabase
+    let payoutLookup = await supabase
       .from('payouts')
-      .select('id, status, participant_id, project_id')
+      .select('id, status, participant_id, project_id, product_id')
       .eq('id', payoutId)
       .maybeSingle();
 
-    if (lookupErr) throw lookupErr;
+    if (payoutLookup.error && /product_id/i.test(String(payoutLookup.error.message || ''))) {
+      payoutLookup = await supabase
+        .from('payouts')
+        .select('id, status, participant_id, project_id')
+        .eq('id', payoutId)
+        .maybeSingle();
+    }
+
+    if (payoutLookup.error) throw payoutLookup.error;
+    const payout = payoutLookup.data;
     if (!payout) {
       return res.status(404).json({ success: false, message: 'Payout not found' });
     }
@@ -4370,20 +4346,40 @@ const markPayoutPaid = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Payout is already marked as paid' });
     }
 
-    const { error: updateErr } = await supabase
-      .from('payouts')
-      .update({ status: 'PAID' })
-      .eq('id', payoutId);
-    if (updateErr) throw updateErr;
+    const nowIso = new Date().toISOString();
+
+    // Same compatibility strategy as batch mark-paid: bump created_at so participant views
+    // (which are cycle-aware based on created_at) reflect the payment immediately.
+    const tryUpdate = async (payload) => {
+      const clean = Object.fromEntries(Object.entries(payload).filter(([, v]) => v !== undefined));
+      return supabase.from('payouts').update(clean).eq('id', payoutId);
+    };
+
+    let updateRes = await tryUpdate({ status: 'PAID', paid_at: nowIso, updated_at: nowIso, created_at: nowIso });
+    if (updateRes.error && /paid_at/i.test(String(updateRes.error.message || ''))) {
+      updateRes = await tryUpdate({ status: 'PAID', updated_at: nowIso, created_at: nowIso });
+    }
+    if (updateRes.error && /updated_at/i.test(String(updateRes.error.message || ''))) {
+      updateRes = await tryUpdate({ status: 'PAID', created_at: nowIso });
+    }
+    if (updateRes.error && /created_at/i.test(String(updateRes.error.message || ''))) {
+      updateRes = await tryUpdate({ status: 'PAID' });
+    }
+    if (updateRes.error) throw updateRes.error;
 
     // If participant has a project_application, mark it COMPLETED
     if (payout.participant_id && payout.project_id) {
-      await supabase
+      let appUpdate = supabase
         .from('project_applications')
-        .update({ status: 'COMPLETED' })
+        .update({ status: 'COMPLETED', reviewed_at: nowIso })
         .eq('participant_id', payout.participant_id)
         .eq('project_id', payout.project_id)
         .in('status', ['APPROVED', 'PURCHASED']);
+
+      if (payout.product_id) appUpdate = appUpdate.eq('product_id', payout.product_id);
+
+      const { error: appUpdateErr } = await appUpdate;
+      if (appUpdateErr && !isMissingSchemaObjectError(appUpdateErr)) throw appUpdateErr;
     }
 
     res.json({ success: true, message: 'Payout marked as paid successfully' });

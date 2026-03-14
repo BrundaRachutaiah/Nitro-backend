@@ -6,7 +6,7 @@ const {
   purchaseRejectedEmail
 } = require('../services/email.templates');
 
-const { ensureEligiblePayout } = require('./submission.controller');
+const { createPayoutIfBothApproved } = require('./payout.controller');
 
 const buildAppMapKey = (participantId, projectId) => `${participantId}::${projectId}`;
 
@@ -80,6 +80,33 @@ const fetchPurchaseProofRows = async (queryBuilder) => {
       uploaded_at,
       allocation_id,
       participant_id
+    `);
+  }
+
+  return result;
+};
+
+const fetchParticipantReviewRows = async (queryBuilder) => {
+  let result = await queryBuilder(`
+    id,
+    feedback,
+    rating,
+    status,
+    created_at,
+    participant_id,
+    project_id,
+    product_id
+  `);
+
+  if (result.error && /product_id/i.test(String(result.error.message || ''))) {
+    result = await queryBuilder(`
+      id,
+      feedback,
+      rating,
+      status,
+      created_at,
+      participant_id,
+      project_id
     `);
   }
 
@@ -221,6 +248,53 @@ const enrichProofRows = async (rows) => {
   });
 };
 
+const enrichReviewRows = async (rows) => {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+
+  const participantIds = [...new Set(rows.map((row) => row.participant_id).filter(Boolean))];
+  const projectIds = [...new Set(rows.map((row) => row.project_id).filter(Boolean))];
+
+  const { data: projects, error: projectError } = projectIds.length
+    ? await supabase
+        .from('projects')
+        .select('id, title, name')
+        .in('id', projectIds)
+    : { data: [], error: null };
+  if (projectError) throw projectError;
+
+  const projectMap = new Map(
+    (projects || []).map((item) => [item.id, item.title || item.name || null])
+  );
+
+  const { data: profiles, error: profileError } = participantIds.length
+    ? await supabase
+        .from('profiles')
+        .select('id, full_name, email')
+        .in('id', participantIds)
+    : { data: [], error: null };
+  if (profileError) throw profileError;
+
+  const profileMap = new Map((profiles || []).map((item) => [item.id, item]));
+  const directProductMap = await getProductNameMap(rows.map((row) => row.product_id));
+
+  return rows.map((row) => {
+    const profile = profileMap.get(row.participant_id) || {};
+    const productId = row.product_id || null;
+
+    return {
+      ...row,
+      project_name: projectMap.get(row.project_id) || null,
+      product_name: directProductMap.get(productId)?.name || null,
+      participant_name: profile.full_name || null,
+      participant_email: profile.email || null
+    };
+  });
+};
+
+// ────────────────────────────────────────────────────────────────────────────────
+// PURCHASE PROOF (INVOICE) FUNCTIONS
+// ────────────────────────────────────────────────────────────────────────────────
+
 /**
  * Get all pending purchase proofs (Admin)
  */
@@ -244,7 +318,8 @@ const getPendingPurchaseProofs = async (req, res, next) => {
 };
 
 /**
- * Approve purchase proof
+ * ✅ Approve purchase proof (Invoice)
+ * FIX: Call createPayoutIfBothApproved to create payout if review is also approved
  */
 const approvePurchaseProof = async (req, res, next) => {
   try {
@@ -255,7 +330,7 @@ const approvePurchaseProof = async (req, res, next) => {
       .update({ status: PROOF_STATUS.APPROVED })
       .eq('id', id)
       .eq('status', PROOF_STATUS.PENDING)
-      .select('id, participant_id, allocation_id')
+      .select('id, participant_id, allocation_id, product_id')
       .maybeSingle();
     if (error) throw error;
 
@@ -265,7 +340,7 @@ const approvePurchaseProof = async (req, res, next) => {
     if (!proof) {
       const { data: existingById, error: existingByIdError } = await supabase
         .from('purchase_proofs')
-        .select('id, participant_id, allocation_id, status')
+        .select('id, participant_id, allocation_id, product_id, status')
         .eq('id', id)
         .maybeSingle();
       if (existingByIdError) throw existingByIdError;
@@ -276,7 +351,7 @@ const approvePurchaseProof = async (req, res, next) => {
       } else {
         const { data: existingByAllocation, error: existingByAllocationError } = await supabase
           .from('purchase_proofs')
-          .select('id, participant_id, allocation_id, status')
+          .select('id, participant_id, allocation_id, product_id, status')
           .eq('allocation_id', id)
           .order('uploaded_at', { ascending: false })
           .limit(1)
@@ -297,7 +372,7 @@ const approvePurchaseProof = async (req, res, next) => {
             .update({ status: PROOF_STATUS.APPROVED })
             .eq('id', existingByAllocation.id)
             .eq('status', PROOF_STATUS.PENDING)
-            .select('id, participant_id, allocation_id')
+            .select('id, participant_id, allocation_id, product_id')
             .maybeSingle();
           if (promotedError) throw promotedError;
           if (promoted) {
@@ -317,11 +392,17 @@ const approvePurchaseProof = async (req, res, next) => {
       .eq('id', proof.allocation_id)
       .maybeSingle();
 
-    if (allocation?.project_id) {
-      await ensureEligiblePayout({
+    // ── TRY TO CREATE PAYOUT (if review is also approved) ──
+    if (allocation?.project_id && proof.product_id) {
+      const payoutId = await createPayoutIfBothApproved({
         participantId: proof.participant_id,
-        projectId: allocation.project_id
+        projectId: allocation.project_id,
+        productId: proof.product_id
       });
+      
+      if (payoutId) {
+        console.log(`[approvePurchaseProof] Payout created: ${payoutId}`);
+      }
     }
 
     res.json({
@@ -433,9 +514,209 @@ const rejectPurchaseProof = async (req, res, next) => {
   }
 };
 
+// ────────────────────────────────────────────────────────────────────────────────
+// PARTICIPANT REVIEW FUNCTIONS
+// ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Get all pending participant reviews (Admin)
+ */
+const getPendingParticipantReviews = async (req, res, next) => {
+  try {
+    const { data, error } = await fetchParticipantReviewRows((fields) =>
+      supabase
+        .from('participant_reviews')
+        .select(fields)
+        .eq('status', 'PENDING')
+        .order('created_at', { ascending: true })
+    );
+
+    if (error) throw error;
+
+    const enriched = await enrichReviewRows(data || []);
+    res.json({ success: true, data: enriched });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * ✅ Approve participant review
+ * FIX: Call createPayoutIfBothApproved to create payout if invoice is also approved
+ */
+const approveParticipantReview = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Update review status
+    const { data, error } = await supabase
+      .from('participant_reviews')
+      .update({ status: 'APPROVED' })
+      .eq('id', id)
+      .eq('status', 'PENDING')
+      .select('id, participant_id, project_id, product_id')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    let review = data;
+    let alreadyProcessed = false;
+
+    if (!review) {
+      const { data: existingById, error: existingByIdError } = await supabase
+        .from('participant_reviews')
+        .select('id, participant_id, project_id, product_id, status')
+        .eq('id', id)
+        .maybeSingle();
+      if (existingByIdError) throw existingByIdError;
+
+      if (existingById) {
+        review = existingById;
+        alreadyProcessed = String(existingById.status || '').toUpperCase() === 'APPROVED';
+      } else {
+        return res.status(404).json({
+          success: false,
+          message: 'Review not found'
+        });
+      }
+    }
+
+    // ── TRY TO CREATE PAYOUT (if invoice is also approved) ──
+    if (review.product_id) {
+      const payoutId = await createPayoutIfBothApproved({
+        participantId: review.participant_id,
+        projectId: review.project_id,
+        productId: review.product_id
+      });
+      
+      if (payoutId) {
+        console.log(`[approveParticipantReview] Payout created: ${payoutId}`);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: alreadyProcessed
+        ? 'Review already approved'
+        : 'Review approved successfully'
+    });
+
+    // Send confirmation email
+    const { data: participant } = await supabase
+      .from('profiles')
+      .select('email, full_name')
+      .eq('id', review.participant_id)
+      .maybeSingle();
+
+    if (participant?.email) {
+      sendEmail({
+        to: participant.email,
+        subject: '✅ Your Review Has Been Approved',
+        html: `
+          <h2>Review Approved</h2>
+          <p>Hi ${participant.full_name},</p>
+          <p>Your review has been approved by our admin team. Your payout will be processed soon!</p>
+          <p>Track your reimbursement status on the <a href="${process.env.FRONTEND_URL}/payouts">Payouts page</a>.</p>
+        `
+      });
+    }
+
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Get participant reviews with optional status filter (Admin)
+ */
+const getParticipantReviews = async (req, res, next) => {
+  try {
+    const status = String(req.query.status || "").toUpperCase();
+    const limit = Number(req.query.limit) > 0 ? Number(req.query.limit) : 100;
+
+    const { data, error } = await fetchParticipantReviewRows((fields) => {
+      let query = supabase
+        .from('participant_reviews')
+        .select(fields)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+
+      if (status) {
+        query = query.eq('status', status);
+      }
+
+      return query;
+    });
+
+    if (error) throw error;
+
+    const enriched = await enrichReviewRows(data || []);
+    res.json({ success: true, data: enriched });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Reject participant review
+ */
+const rejectParticipantReview = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    const { data } = await supabase
+      .from('participant_reviews')
+      .update({ status: 'REJECTED' })
+      .eq('id', id)
+      .eq('status', 'PENDING')
+      .select('id, participant_id')
+      .maybeSingle();
+
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Review not found or already processed'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Review rejected'
+    });
+
+    const { data: participant } = await supabase
+      .from('profiles')
+      .select('email, full_name')
+      .eq('id', data.participant_id)
+      .maybeSingle();
+
+    if (participant?.email) {
+      sendEmail({
+        to: participant.email,
+        subject: '⚠️ Action Required: Re-submit Your Review',
+        html: `
+          <h2>Review Needs Revision</h2>
+          <p>Hi ${participant.full_name},</p>
+          <p>Your review was not approved and needs revision. Please re-submit your feedback for this product.</p>
+          <p>Go to your <a href="${process.env.FRONTEND_URL}/allocation/active">Tasks page</a> to re-submit.</p>
+        `
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
+  // Purchase Proof (Invoice)
   getPurchaseProofs,
   getPendingPurchaseProofs,
   approvePurchaseProof,
-  rejectPurchaseProof
+  rejectPurchaseProof,
+  
+  // Participant Review
+  getParticipantReviews,
+  getPendingParticipantReviews,
+  approveParticipantReview,
+  rejectParticipantReview
 };

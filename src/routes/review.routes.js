@@ -5,6 +5,10 @@ const reviewController = require('../controllers/review.controller');
 
 const router = express.Router();
 
+// ────────────────────────────────────────────────────────────────────────────────
+// PURCHASE PROOF (INVOICE) ROUTES
+// ────────────────────────────────────────────────────────────────────────────────
+
 /**
  * Get purchase proofs with optional status filter (Admin)
  */
@@ -43,6 +47,50 @@ router.patch(
   authMiddleware,
   roleMiddleware('ADMIN', 'SUPER_ADMIN'),
   reviewController.rejectPurchaseProof
+);
+
+// ────────────────────────────────────────────────────────────────────────────────
+// PARTICIPANT REVIEW ROUTES
+// ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Get participant reviews with optional status filter (Admin)
+ */
+router.get(
+  '/participant-reviews',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  reviewController.getParticipantReviews
+);
+
+/**
+ * Get pending participant reviews (Admin)
+ */
+router.get(
+  '/participant-reviews/pending',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  reviewController.getPendingParticipantReviews
+);
+
+/**
+ * Approve participant review (Admin)
+ */
+router.patch(
+  '/participant-reviews/:id/approve',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  reviewController.approveParticipantReview
+);
+
+/**
+ * Reject participant review (Admin)
+ */
+router.patch(
+  '/participant-reviews/:id/reject',
+  authMiddleware,
+  roleMiddleware('ADMIN', 'SUPER_ADMIN'),
+  reviewController.rejectParticipantReview
 );
 
 module.exports = router;
