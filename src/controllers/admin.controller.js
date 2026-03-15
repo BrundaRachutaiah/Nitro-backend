@@ -68,9 +68,12 @@ const getOrCreateActiveAllocationForProject = async ({ participantId, projectId 
 
   // Find an active allocation for THIS participant+project.
   // Older schemas may not have completed_at; some very old schemas may not have status.
+  // FIX: For new cycle re-applications, we need a fresh allocation.
+  // Only reuse an existing allocation if it was created recently (within 30 days)
+  // AND has no completed/paid payouts yet (meaning it's still an active cycle).
   let allocationLookup = await supabase
     .from('unit_allocations')
-    .select('id')
+    .select('id, reserved_until')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
     .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
@@ -107,7 +110,24 @@ const getOrCreateActiveAllocationForProject = async ({ participantId, projectId 
   }
 
   const existingId = allocationLookup?.data?.id || null;
-  if (existingId) return existingId;
+
+  // Check if the existing allocation already has PAID payouts (old cycle).
+  // If yes, create a fresh allocation for the new cycle.
+  if (existingId) {
+    const { data: paidPayouts } = await supabase
+      .from('payouts')
+      .select('id')
+      .eq('participant_id', participantId)
+      .eq('project_id', projectId)
+      .in('status', ['PAID', 'EXPORTED'])
+      .limit(1);
+
+    // If no paid payouts found, this is still the active cycle — reuse it
+    if (!paidPayouts || paidPayouts.length === 0) {
+      return existingId;
+    }
+    // Paid payouts exist = old cycle. Fall through to create a new allocation.
+  }
 
   const reservedUntil = new Date();
   reservedUntil.setDate(reservedUntil.getDate() + 20);

@@ -102,7 +102,7 @@ const allocateUnit = async (req, res, next) => {
       .from('project_applications')
       .update({
         status: 'APPROVED',
-        allocation_id: data.id, 
+        allocation_id: data.id,
         reviewed_at: new Date().toISOString()
       })
       .eq('id', applicationId)
@@ -130,7 +130,6 @@ const allocateUnit = async (req, res, next) => {
     if (participant?.email) {
       const projectName = projectInfo?.title || projectInfo?.name || 'your project';
 
-      // Fetch the allocated product(s) to show in the email
       const { data: allocProducts } = application.product_id
         ? await supabase
             .from('project_products')
@@ -293,7 +292,6 @@ const getMyAllocationTracking = async (req, res, next) => {
           }
         }
 
-        // Re-fetch allocations after self-heal insert.
         let refreshedAllocationsRes = await supabase
           .from('unit_allocations')
           .select(
@@ -349,8 +347,15 @@ const getMyAllocationTracking = async (req, res, next) => {
     const allocationIds = allocations.map((item) => item.id);
 
     const activeAllocationIds = allocations
-  .filter(a => ['RESERVED','PURCHASED'].includes(String(a.status || '').toUpperCase()))
-  .map(a => a.id);
+      .filter(a => ['RESERVED', 'PURCHASED'].includes(String(a.status || '').toUpperCase()))
+      .map(a => a.id);
+
+    // Collect all project_ids from active allocations for fallback matching
+    // when application rows have allocation_id = NULL
+    const activeProjectIds = allocations
+      .filter(a => ['RESERVED', 'PURCHASED'].includes(String(a.status || '').toUpperCase()))
+      .map(a => a.project_id)
+      .filter(Boolean);
 
     const [proofsRes, reviewsRes, feedbacksRes, payoutsRes, applicationsRes] = await Promise.all([
       supabase
@@ -376,7 +381,11 @@ const getMyAllocationTracking = async (req, res, next) => {
         .select('id, project_id, product_id, purchase_proof_id, amount, status, created_at')
         .eq('participant_id', participantId)
         .order('created_at', { ascending: false }),
-      // Fetch active task applications for this participant (across ALL projects).
+      // ── FIX: Fetch applications WITHOUT filtering by allocation_id ──────────
+      // Previously .in('allocation_id', activeAllocationIds) silently dropped every
+      // application whose allocation_id was NULL (legacy rows / backfill gap),
+      // making selected_products appear empty. Now we fetch all approved apps by
+      // participant_id + status and join to allocations in memory.
       supabase
         .from('project_applications')
         .select(
@@ -384,8 +393,11 @@ const getMyAllocationTracking = async (req, res, next) => {
           id,
           project_id,
           product_id,
+          allocation_id,
           allocated_budget,
           status,
+          reviewed_at,
+          created_at,
           projects (
             id,
             title,
@@ -401,11 +413,7 @@ const getMyAllocationTracking = async (req, res, next) => {
         `
         )
         .eq('participant_id', participantId)
-        // Only active task items should show up in "My Tasks".
-        // COMPLETED apps are already paid out and must not appear again when the
-        // participant re-applies in a later cycle.
         .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
-        .in('allocation_id', activeAllocationIds)
         .order('created_at', { ascending: false })
     ]);
 
@@ -416,7 +424,6 @@ const getMyAllocationTracking = async (req, res, next) => {
     if (proofsRes.error) {
       if (!isMissingSchemaObjectError(proofsRes.error)) throw proofsRes.error;
 
-      // Fallback: try with product_id explicitly, then without
       let fallbackProofs = await supabase
         .from('purchase_proofs')
         .select('id, allocation_id, participant_id, product_id, status, file_url, uploaded_at')
@@ -495,13 +502,14 @@ const getMyAllocationTracking = async (req, res, next) => {
       if (!isMissingSchemaObjectError(applicationsRes.error)) throw applicationsRes.error;
 
       // Fallback: fetch approved apps for this participant (across ALL projects).
+      // NOTE: Do NOT filter by allocation_id — rows with allocation_id = NULL
+      // would be silently dropped, making the task list appear empty.
       const fallbackApps = await supabase
-  .from('project_applications')
-  .select('id, project_id, product_id, allocation_id, allocated_budget, status')
-  .eq('participant_id', participantId)
-  .in('allocation_id', activeAllocationIds)
-  .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
-  .order('created_at', { ascending: false });
+        .from('project_applications')
+        .select('id, project_id, product_id, allocation_id, allocated_budget, status, reviewed_at, created_at')
+        .eq('participant_id', participantId)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('created_at', { ascending: false });
 
       if (fallbackApps.error && !isMissingSchemaObjectError(fallbackApps.error)) {
         throw fallbackApps.error;
@@ -608,22 +616,41 @@ const getMyAllocationTracking = async (req, res, next) => {
     }
 
     const rows = allocations.map((allocation) => {
-      // One allocation covers products from ALL projects for this participant.
-      // Filtering by allocation.project_id hides tasks when the participant has approvals
-      // across multiple different projects.
-      const approvedForProject = approvedApplications.filter(
-  (app) => app.allocation_id === allocation.id
-);
+      // ── FIX: Two-step match ──────────────────────────────────────────────────
+      // 1. If allocation_id is set on the app → exact match (preferred)
+      // 2. If allocation_id is NULL → fall back to project_id match
+      // This ensures legacy rows without allocation_id are never silently dropped.
+      const approvedForProject = approvedApplications.filter((app) => {
+        if (app.allocation_id) return app.allocation_id === allocation.id;
+        return app.project_id === allocation.project_id;
+      });
 
-      // Deduplicate by product_id within this project, keep the latest row.
-      const latestByProduct = new Map(); // productId -> application row
+      // ── FIX: Deduplicate by product_id — prefer APPROVED > PURCHASED > COMPLETED
+      // This ensures a new cycle APPROVED app shows instead of the old COMPLETED one
+      // when a participant re-applies for the same product in a new cycle.
+      const STATUS_PRIORITY = { 'APPROVED': 3, 'PURCHASED': 2, 'COMPLETED': 1 };
+      const latestByProduct = new Map();
       for (const item of approvedForProject) {
         const productKey = String(item?.product_id || '');
         if (!productKey) continue;
-        const nextTime = new Date(item?.reviewed_at || item?.created_at || 0).getTime();
         const existing = latestByProduct.get(productKey);
-        const existingTime = new Date(existing?.reviewed_at || existing?.created_at || 0).getTime();
-        if (!existing || nextTime >= existingTime) latestByProduct.set(productKey, item);
+        if (!existing) {
+          latestByProduct.set(productKey, item);
+          continue;
+        }
+        const newPriority = STATUS_PRIORITY[String(item?.status || '').toUpperCase()] || 0;
+        const oldPriority = STATUS_PRIORITY[String(existing?.status || '').toUpperCase()] || 0;
+        // Prefer higher priority status (APPROVED wins over COMPLETED)
+        if (newPriority > oldPriority) {
+          latestByProduct.set(productKey, item);
+          continue;
+        }
+        // Same priority — prefer newer created_at
+        if (newPriority === oldPriority) {
+          const nextTime = new Date(item?.created_at || 0).getTime();
+          const existingTime = new Date(existing?.created_at || 0).getTime();
+          if (nextTime > existingTime) latestByProduct.set(productKey, item);
+        }
       }
       const approvedProducts = latestByProduct.size
         ? Array.from(latestByProduct.values())
@@ -718,7 +745,6 @@ const getActiveAllocations = async (req, res, next) => {
       .in('status', ['RESERVED', 'PURCHASED'])
       .order('reserved_until', { ascending: true });
 
-    // Fallback: if completed_at column doesn't exist, query without it
     if (error && /completed_at/i.test(String(error.message || ''))) {
       const fallback = await supabase
         .from('unit_allocations')
@@ -733,7 +759,7 @@ const getActiveAllocations = async (req, res, next) => {
           )
         `)
         .eq('participant_id', participantId)
-        .in('status', ['RESERVED','PURCHASED'])
+        .in('status', ['RESERVED', 'PURCHASED'])
         .order('reserved_until', { ascending: true });
 
       if (fallback.error) throw fallback.error;
@@ -837,7 +863,6 @@ const updateAllocationStatus = async (req, res, next) => {
     let error;
 
     if (status === ALLOCATION_STATUS.PURCHASED) {
-      // Try with completed_at filter; fall back without it if column doesn't exist
       let res = await supabase
         .from('unit_allocations')
         .update({ status: ALLOCATION_STATUS.PURCHASED })
@@ -871,7 +896,6 @@ const updateAllocationStatus = async (req, res, next) => {
       data = res.data;
       error = res.error;
     } else {
-      // COMPLETED: try with completed_at, fall back to just status update
       const completedPayload = { status: ALLOCATION_STATUS.COMPLETED };
       let res = await supabase
         .from('unit_allocations')
@@ -917,21 +941,14 @@ const updateAllocationStatus = async (req, res, next) => {
   }
 };
 
-
 // ─────────────────────────────────────────────────────────────────────────────
-// cancelAllocation — participant voluntarily cancels a RESERVED or PURCHASED slot
-//   1. Validates the allocation belongs to this participant and is cancellable
-//   2. Sets allocation status → CANCELLED
-//   3. Rejects the matching project_applications (restores allocated_budget to pool)
-//   4. Sends confirmation email to participant
-//   5. Fetches all admins and notifies them with budget-restored summary
+// cancelAllocation
 // ─────────────────────────────────────────────────────────────────────────────
 const cancelAllocation = async (req, res, next) => {
   try {
     const participantId = req.user.id;
     const { id: allocationId } = req.params;
 
-    // ── 1. Fetch allocation — verify ownership and cancellable status ─────────
     const { data: allocation, error: allocError } = await supabase
       .from('unit_allocations')
       .select('id, project_id, status, participant_id')
@@ -951,7 +968,6 @@ const cancelAllocation = async (req, res, next) => {
       });
     }
 
-    // ── 2. Mark allocation as CANCELLED ───────────────────────────────────────
     const { error: cancelError } = await supabase
       .from('unit_allocations')
       .update({ status: 'CANCELLED' })
@@ -960,16 +976,12 @@ const cancelAllocation = async (req, res, next) => {
 
     if (cancelError) throw cancelError;
 
-    // ── RESPOND IMMEDIATELY so the frontend never hangs ──────────────────────
-    // All remaining work (budget restore, notifications, emails) runs after
-    // the response is sent and cannot block or error out the cancel action.
     res.json({
       success: true,
       message: 'Allocation cancelled successfully. Your reserved slot has been released.',
       data: { allocationId }
     });
 
-    // ── 3. Reject project_applications → restore budget (fire-and-forget) ─────
     let restoredAmt = 0;
     let products    = [];
     let projectName = 'your project';
@@ -978,9 +990,6 @@ const cancelAllocation = async (req, res, next) => {
     try {
       const nowIso = new Date().toISOString();
 
-      // FIX: ONE allocation covers products from ALL brands/projects.
-      // Reject ALL approved applications for this participant across ALL project_ids,
-      // not just allocation.project_id (which was only one brand).
       let rejectedApps = null;
       let appRes = await supabase
         .from('project_applications')
@@ -1023,7 +1032,6 @@ const cancelAllocation = async (req, res, next) => {
       console.error('[cancelAllocation] Budget restore failed (non-fatal):', err);
     }
 
-    // ── 4. Fetch supporting data for notifications ────────────────────────────
     try {
       const [projectRes, profileRes] = await Promise.all([
         supabase.from('projects').select('id, title, name').eq('id', allocation.project_id).maybeSingle(),
@@ -1035,11 +1043,10 @@ const cancelAllocation = async (req, res, next) => {
       console.error('[cancelAllocation] Profile/project fetch failed (non-fatal):', err);
     }
 
-    // ── 5. In-app notification for participant ────────────────────────────────
     try {
       await supabase.from('notifications').insert({
         user_id: participantId,
-        type:    'PRODUCT_APPLICATION',   // use a known-safe type value
+        type:    'PRODUCT_APPLICATION',
         title:   'Reservation cancelled',
         message: `Your reservation for ${projectName} has been cancelled and your slot released.`
       });
@@ -1047,7 +1054,6 @@ const cancelAllocation = async (req, res, next) => {
       console.error('[cancelAllocation] Participant notification failed (non-fatal):', err);
     }
 
-    // ── 6. Participant confirmation email ─────────────────────────────────────
     try {
       if (participantProfile?.email) {
         sendEmail({
@@ -1065,7 +1071,6 @@ const cancelAllocation = async (req, res, next) => {
       console.error('[cancelAllocation] Participant email failed (non-fatal):', err);
     }
 
-    // ── 7. Admin notifications ────────────────────────────────────────────────
     try {
       const { data: adminProfiles } = await supabase
         .from('profiles')

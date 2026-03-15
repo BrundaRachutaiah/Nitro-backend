@@ -149,39 +149,61 @@ const markAllocationCompleted = async ({ allocationId, participantId }) => {
 const markApplicationCompleted = async ({ participantId, projectId, productId }) => {
   if (!participantId || !projectId) return;
 
-  let query = supabase
+  // ── FIX: Only mark the OLDEST active application as completed ────────────
+  // Previously this updated ALL APPROVED/PURCHASED rows for the product,
+  // which incorrectly completed the NEW cycle application immediately.
+  // Now we find the single oldest APPROVED/PURCHASED row and complete only that.
+
+  // Step 1: Find the oldest active application for this product
+  let findQuery = supabase
     .from('project_applications')
-    .update({
-      status: 'COMPLETED',
-      reviewed_at: new Date().toISOString()
-    })
+    .select('id')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
-    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+    .in('status', ['APPROVED', 'PURCHASED'])
+    .order('created_at', { ascending: true })  // oldest first
+    .limit(1);
 
   if (productId) {
-    query = query.eq('product_id', productId);
+    findQuery = findQuery.eq('product_id', productId);
   }
 
-  let result = await query;
+  const { data: oldestApp, error: findError } = await findQuery.maybeSingle();
 
-  if (result.error && isMissingSchemaObjectError(result.error)) {
+  if (findError && isMissingSchemaObjectError(findError)) {
+    // Schema fallback — just update all matching rows
     let fallbackQuery = supabase
       .from('project_applications')
-      .update({ status: 'COMPLETED' })
+      .update({ status: 'COMPLETED', reviewed_at: new Date().toISOString() })
       .eq('participant_id', participantId)
       .eq('project_id', projectId)
-      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
+      .in('status', ['APPROVED', 'PURCHASED']);
 
     if (productId) {
       fallbackQuery = fallbackQuery.eq('product_id', productId);
     }
 
-    result = await fallbackQuery;
+    const result = await fallbackQuery;
+    if (result.error && !isMissingSchemaObjectError(result.error)) {
+      throw result.error;
+    }
+    return;
   }
 
-  if (result.error && !isMissingSchemaObjectError(result.error)) {
-    throw result.error;
+  if (findError) throw findError;
+  if (!oldestApp?.id) return; // no active application found
+
+  // Step 2: Complete only that specific row by ID
+  const { error: updateError } = await supabase
+    .from('project_applications')
+    .update({
+      status: 'COMPLETED',
+      reviewed_at: new Date().toISOString()
+    })
+    .eq('id', oldestApp.id);
+
+  if (updateError && !isMissingSchemaObjectError(updateError)) {
+    throw updateError;
   }
 };
 
@@ -566,12 +588,35 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
   const apps = applications || [];
 
   // ── Step 6: Get already-covered products to avoid duplicates ─────────────
+  // FIX: Only check payouts from the CURRENT cycle, not old PAID ones.
+  // Old PAID payouts from previous cycles must NOT block new cycle payouts.
+  const { data: currentCycleApps } = await supabase
+    .from('project_applications')
+    .select('id, product_id, created_at')
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+    .order('created_at', { ascending: false })
+    .limit(20);
+
+  // Find the most recent application date = start of current cycle
+  const currentCycleStart = (currentCycleApps || []).reduce((latest, app) => {
+    const t = new Date(app.created_at || 0).getTime();
+    return t > latest ? t : latest;
+  }, 0);
+
+  // Only count payouts created after current cycle started (1 min buffer)
+  const currentCycleDate = currentCycleStart > 0
+    ? new Date(currentCycleStart - 60000).toISOString()
+    : new Date(0).toISOString();
+
   const { data: existingPayouts } = await supabase
     .from('payouts')
     .select('id, product_id')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
-    .in('status', ['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID']);
+    .in('status', ['ELIGIBLE', 'IN_BATCH', 'EXPORTED', 'PAID'])
+    .gte('created_at', currentCycleDate);
 
   const coveredProductIds = new Set(
     (existingPayouts || []).map(p => p.product_id || '__none__')
