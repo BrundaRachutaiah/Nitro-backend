@@ -102,6 +102,7 @@ const allocateUnit = async (req, res, next) => {
       .from('project_applications')
       .update({
         status: 'APPROVED',
+        allocation_id: data.id, 
         reviewed_at: new Date().toISOString()
       })
       .eq('id', applicationId)
@@ -347,6 +348,10 @@ const getMyAllocationTracking = async (req, res, next) => {
 
     const allocationIds = allocations.map((item) => item.id);
 
+    const activeAllocationIds = allocations
+  .filter(a => ['RESERVED','PURCHASED'].includes(String(a.status || '').toUpperCase()))
+  .map(a => a.id);
+
     const [proofsRes, reviewsRes, feedbacksRes, payoutsRes, applicationsRes] = await Promise.all([
       supabase
         .from('purchase_proofs')
@@ -400,6 +405,7 @@ const getMyAllocationTracking = async (req, res, next) => {
         // COMPLETED apps are already paid out and must not appear again when the
         // participant re-applies in a later cycle.
         .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .in('allocation_id', activeAllocationIds)
         .order('created_at', { ascending: false })
     ]);
 
@@ -490,11 +496,12 @@ const getMyAllocationTracking = async (req, res, next) => {
 
       // Fallback: fetch approved apps for this participant (across ALL projects).
       const fallbackApps = await supabase
-        .from('project_applications')
-        .select('id, project_id, product_id, allocated_budget, status')
-        .eq('participant_id', participantId)
-        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
-        .order('created_at', { ascending: false });
+  .from('project_applications')
+  .select('id, project_id, product_id, allocation_id, allocated_budget, status')
+  .eq('participant_id', participantId)
+  .in('allocation_id', activeAllocationIds)
+  .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+  .order('created_at', { ascending: false });
 
       if (fallbackApps.error && !isMissingSchemaObjectError(fallbackApps.error)) {
         throw fallbackApps.error;
@@ -604,7 +611,9 @@ const getMyAllocationTracking = async (req, res, next) => {
       // One allocation covers products from ALL projects for this participant.
       // Filtering by allocation.project_id hides tasks when the participant has approvals
       // across multiple different projects.
-      const approvedForProject = approvedApplications;
+      const approvedForProject = approvedApplications.filter(
+  (app) => app.allocation_id === allocation.id
+);
 
       // Deduplicate by product_id within this project, keep the latest row.
       const latestByProduct = new Map(); // productId -> application row
@@ -706,7 +715,7 @@ const getActiveAllocations = async (req, res, next) => {
       `
       )
       .eq('participant_id', participantId)
-      .is('completed_at', null)
+      .in('status', ['RESERVED', 'PURCHASED'])
       .order('reserved_until', { ascending: true });
 
     // Fallback: if completed_at column doesn't exist, query without it
@@ -724,7 +733,7 @@ const getActiveAllocations = async (req, res, next) => {
           )
         `)
         .eq('participant_id', participantId)
-        .neq('status', 'COMPLETED')
+        .in('status', ['RESERVED','PURCHASED'])
         .order('reserved_until', { ascending: true });
 
       if (fallback.error) throw fallback.error;
