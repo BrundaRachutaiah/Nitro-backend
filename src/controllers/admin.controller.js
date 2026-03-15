@@ -2199,10 +2199,18 @@ const approveProductApplication = async (req, res, next) => {
       throw productError;
     }
 
-    const defaultAllocatedBudget = toAmount(productRow?.product_value);
-    const normalizedAllocatedBudget = hasProvidedNumber(allocated_budget)
-      ? Number(allocated_budget)
-      : defaultAllocatedBudget;
+    // Multiply product_value by quantity if set
+const { data: appWithQty } = await supabase
+  .from('project_applications')
+  .select('quantity')
+  .eq('id', id)
+  .maybeSingle();
+
+const appQuantity = Math.max(1, Number(appWithQty?.quantity || 1));
+const defaultAllocatedBudget = toAmount(productRow?.product_value) * appQuantity;
+const normalizedAllocatedBudget = hasProvidedNumber(allocated_budget)
+  ? Number(allocated_budget)
+  : defaultAllocatedBudget;
 
     if (!Number.isFinite(normalizedAllocatedBudget) || normalizedAllocatedBudget <= 0) {
       return res.status(400).json({

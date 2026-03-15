@@ -42,14 +42,17 @@ const applyToProject = async (req, res, next) => {
   try {
     const participantId = req.user.id;
     const { projectId } = req.params;
-    const { productId, address = {}, bankDetails = {} } = req.body;
+    const { productId, quantity: rawQuantity, address = {}, bankDetails = {} } = req.body;
 
-    if (!productId) {
-      return res.status(400).json({
-        success: false,
-        message: 'productId is required'
-      });
-    }
+// Quantity must be a positive integer, default 1, max 10
+const quantity = Math.min(10, Math.max(1, Math.floor(Number(rawQuantity) || 1)));
+
+if (!productId) {
+  return res.status(400).json({
+    success: false,
+    message: 'productId is required'
+  });
+}
 
     // Check project exists and is active
     const { data: project, error: projectError } = await supabase
@@ -159,15 +162,16 @@ const applyToProject = async (req, res, next) => {
     }
 
     const insertRes = await supabase
-      .from('project_applications')
-      .insert({
-        project_id: projectId,
-        participant_id: participantId,
-        product_id: productId,
-        status: 'PENDING'
-      })
-      .select()
-      .single();
+  .from('project_applications')
+  .insert({
+    project_id: projectId,
+    participant_id: participantId,
+    product_id: productId,
+    quantity: quantity,
+    status: 'PENDING'
+  })
+  .select()
+  .single();
 
     if (insertRes.error) {
       if (insertRes.error.code === '23505') {

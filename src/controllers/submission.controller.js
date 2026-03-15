@@ -149,19 +149,13 @@ const markAllocationCompleted = async ({ allocationId, participantId }) => {
 const markApplicationCompleted = async ({ participantId, projectId, productId }) => {
   if (!participantId || !projectId) return;
 
-  // ── FIX: Only mark the OLDEST active application as completed ────────────
-  // Previously this updated ALL APPROVED/PURCHASED rows for the product,
-  // which incorrectly completed the NEW cycle application immediately.
-  // Now we find the single oldest APPROVED/PURCHASED row and complete only that.
-
-  // Step 1: Find the oldest active application for this product
   let findQuery = supabase
     .from('project_applications')
     .select('id')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
     .in('status', ['APPROVED', 'PURCHASED'])
-    .order('created_at', { ascending: true })  // oldest first
+    .order('created_at', { ascending: true })
     .limit(1);
 
   if (productId) {
@@ -171,7 +165,6 @@ const markApplicationCompleted = async ({ participantId, projectId, productId })
   const { data: oldestApp, error: findError } = await findQuery.maybeSingle();
 
   if (findError && isMissingSchemaObjectError(findError)) {
-    // Schema fallback — just update all matching rows
     let fallbackQuery = supabase
       .from('project_applications')
       .update({ status: 'COMPLETED', reviewed_at: new Date().toISOString() })
@@ -191,9 +184,8 @@ const markApplicationCompleted = async ({ participantId, projectId, productId })
   }
 
   if (findError) throw findError;
-  if (!oldestApp?.id) return; // no active application found
+  if (!oldestApp?.id) return;
 
-  // Step 2: Complete only that specific row by ID
   const { error: updateError } = await supabase
     .from('project_applications')
     .update({
