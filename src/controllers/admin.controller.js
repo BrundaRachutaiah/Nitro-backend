@@ -63,6 +63,85 @@ const getApplicationBudgetAmount = (row, productValueMap = new Map()) => {
   return toAmount(productValueMap.get(row?.product_id));
 };
 
+const getOrCreateActiveAllocationForProject = async ({ participantId, projectId }) => {
+  if (!participantId || !projectId) return null;
+
+  // Find an active allocation for THIS participant+project.
+  // Older schemas may not have completed_at; some very old schemas may not have status.
+  let allocationLookup = await supabase
+    .from('unit_allocations')
+    .select('id')
+    .eq('participant_id', participantId)
+    .eq('project_id', projectId)
+    .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
+    .is('completed_at', null)
+    .order('reserved_until', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (allocationLookup.error && /completed_at/i.test(String(allocationLookup.error.message || ''))) {
+    allocationLookup = await supabase
+      .from('unit_allocations')
+      .select('id')
+      .eq('participant_id', participantId)
+      .eq('project_id', projectId)
+      .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
+      .order('reserved_until', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+  }
+
+  if (allocationLookup.error && /status/i.test(String(allocationLookup.error.message || ''))) {
+    allocationLookup = await supabase
+      .from('unit_allocations')
+      .select('id')
+      .eq('participant_id', participantId)
+      .eq('project_id', projectId)
+      .order('reserved_until', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+  }
+
+  if (allocationLookup.error && !isMissingSchemaObjectError(allocationLookup.error)) {
+    throw allocationLookup.error;
+  }
+
+  const existingId = allocationLookup?.data?.id || null;
+  if (existingId) return existingId;
+
+  const reservedUntil = new Date();
+  reservedUntil.setDate(reservedUntil.getDate() + 20);
+
+  const insertPayload = {
+    project_id: projectId,
+    participant_id: participantId,
+    reserved_until: reservedUntil.toISOString(),
+    status: ALLOCATION_STATUS.RESERVED
+  };
+
+  let created = await supabase
+    .from('unit_allocations')
+    .insert(insertPayload)
+    .select('id')
+    .maybeSingle();
+
+  if (created.error && /status/i.test(String(created.error.message || ''))) {
+    // ultra-legacy fallback: status column missing
+    created = await supabase
+      .from('unit_allocations')
+      .insert({
+        project_id: projectId,
+        participant_id: participantId,
+        reserved_until: reservedUntil.toISOString()
+      })
+      .select('id')
+      .maybeSingle();
+  }
+
+  if (created.error) throw created.error;
+  return created?.data?.id || null;
+};
+
 const getApprovedApplicationBreakdownMap = async ({ participantIds = [], projectIds = [] } = {}) => {
   if (!participantIds.length || !projectIds.length) return new Map();
 
@@ -2169,54 +2248,23 @@ const approveProductApplication = async (req, res, next) => {
       });
     }
 
-    let allocationLookup = await supabase
-      .from('unit_allocations')
-      .select('id')
-      .eq('participant_id', application.participant_id)
-      .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
-      .is('completed_at', null)
-      .limit(1)
-      .maybeSingle();
+    // Create (or reuse) an active allocation PER project. Previously this lookup
+    // was only by participant_id, which incorrectly blocked multi-campaign tasks.
+    const allocationId = await getOrCreateActiveAllocationForProject({
+      participantId: application.participant_id,
+      projectId: application.project_id
+    });
 
-    if (allocationLookup.error && /completed_at/i.test(String(allocationLookup.error.message || ''))) {
-      allocationLookup = await supabase
-        .from('unit_allocations')
-        .select('id')
-        .eq('participant_id', application.participant_id)
-        .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
-        .limit(1)
-        .maybeSingle();
-
-      if (allocationLookup.error && /status/i.test(String(allocationLookup.error.message || ''))) {
-        allocationLookup = await supabase
-          .from('unit_allocations')
-          .select('id')
-          .eq('participant_id', application.participant_id)
-          .limit(1)
-          .maybeSingle();
+    // Link the approved application to its allocation so participant task tracking
+    // can correctly show per-campaign product lists.
+    if (allocationId) {
+      const linkRes = await supabase
+        .from('project_applications')
+        .update({ allocation_id: allocationId })
+        .eq('id', application.id);
+      if (linkRes.error && !isMissingSchemaObjectError(linkRes.error)) {
+        throw linkRes.error;
       }
-    }
-
-    if (allocationLookup.error && !isMissingSchemaObjectError(allocationLookup.error)) {
-      throw allocationLookup.error;
-    }
-
-    const existingAllocation = allocationLookup.data;
-
-    if (!existingAllocation) {
-      const reservedUntil = new Date();
-      reservedUntil.setDate(reservedUntil.getDate() + 20);
-
-      const { error: allocationError } = await supabase
-        .from('unit_allocations')
-        .insert({
-          project_id: application.project_id,
-          participant_id: application.participant_id,
-          reserved_until: reservedUntil.toISOString(),
-          status: ALLOCATION_STATUS.RESERVED
-        });
-
-      if (allocationError) throw allocationError;
     }
 
     await sendParticipantDecisionSummaryNotification({
@@ -2514,55 +2562,34 @@ const bulkDecideApplications = async (req, res, next) => {
       try {
         let allocationId = null;
         if (approved.length > 0) {
-          let allocationLookup = await supabase
-            .from('unit_allocations')
-            .select('id')
-            .eq('participant_id', participantId)
-            .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
-            .is('completed_at', null)
-            .limit(1)
-            .maybeSingle();
-
-          if (allocationLookup.error && /completed_at/i.test(String(allocationLookup.error.message || ''))) {
-            allocationLookup = await supabase
-              .from('unit_allocations')
-              .select('id')
-              .eq('participant_id', participantId)
-              .in('status', [ALLOCATION_STATUS.RESERVED, ALLOCATION_STATUS.PURCHASED])
-              .limit(1)
-              .maybeSingle();
+          // Ensure allocations exist PER project, and link approved applications to
+          // their respective allocation_id so multi-campaign tasks show correctly.
+          const approvedByProject = new Map(); // projectId -> application meta rows
+          for (const app of approved) {
+            const projectId = app?.project_id || null;
+            if (!projectId) continue;
+            if (!approvedByProject.has(projectId)) approvedByProject.set(projectId, []);
+            approvedByProject.get(projectId).push(app);
           }
 
-          if (allocationLookup.error && /status/i.test(String(allocationLookup.error.message || ''))) {
-            allocationLookup = await supabase
-              .from('unit_allocations')
-              .select('id')
-              .eq('participant_id', participantId)
-              .limit(1)
-              .maybeSingle();
-          }
+          for (const [projectId, apps] of approvedByProject.entries()) {
+            const allocIdForProject = await getOrCreateActiveAllocationForProject({
+              participantId,
+              projectId
+            });
 
-          if (allocationLookup.error && !isMissingSchemaObjectError(allocationLookup.error)) {
-            throw allocationLookup.error;
-          }
+            if (!allocationId) allocationId = allocIdForProject || null; // keep first for response compatibility
 
-          allocationId = allocationLookup?.data?.id || null;
-          if (!allocationId) {
-            const firstApproved = approved.find(Boolean);
-            const reservedUntil = new Date();
-            reservedUntil.setDate(reservedUntil.getDate() + 20);
-            const { data: createdAllocation, error: createAllocationError } = await supabase
-              .from('unit_allocations')
-              .insert({
-                participant_id: participantId,
-                project_id: firstApproved?.project_id || null,
-                status: ALLOCATION_STATUS.RESERVED,
-                reserved_until: reservedUntil.toISOString()
-              })
-              .select('id')
-              .maybeSingle();
-            if (createAllocationError) throw createAllocationError;
-            allocationId = createdAllocation?.id || null;
+            const appIds = (apps || []).map((row) => row?.id).filter(Boolean);
+            if (allocIdForProject && appIds.length) {
+              const linkRes = await supabase
+                .from('project_applications')
+                .update({ allocation_id: allocIdForProject })
+                .in('id', appIds);
+              if (linkRes.error && !isMissingSchemaObjectError(linkRes.error)) {
+                throw linkRes.error;
+              }
+            }
           }
         }
 
