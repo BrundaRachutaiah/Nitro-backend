@@ -13,7 +13,8 @@ const { ensureParticipantDetailsFromRegistration } = require('../services/partic
 const {
   approvalEmail,
   rejectionEmail,
-  productDecisionEmail
+  productDecisionEmail,
+  payoutPaidEmail
 } = require('../services/email.templates');
 
 const isMissingSchemaObjectError = (error) => {
@@ -3072,7 +3073,6 @@ const getEligiblePayouts = async (req, res, next) => {
         .eq('status', 'ELIGIBLE');
     }
     if (payoutsRes.error) throw payoutsRes.error;
-    console.log('payoutsRes.data', payoutsRes.data);
 
     const data = (payoutsRes.data || []).filter(
       (row) => normalizeStatus(row?.status) === 'ELIGIBLE'
@@ -3357,6 +3357,7 @@ const getPayoutBatches = async (req, res, next) => {
           project_id,
           product_id,
           allocated_budget,
+          quantity,
           status,
           project_products (
             id,
@@ -3492,7 +3493,10 @@ const getPayoutBatches = async (req, res, next) => {
           (a) => !usedApps.has(a) && a.product_id === payout.product_id
         );
         if (exactApp) {
-          if (exactApp.allocated_budget != null) productAmount = toAmount(exactApp.allocated_budget);
+          const appQty = Math.max(1, Number(exactApp.quantity || 1));
+          // Use product_value × quantity as the correct amount
+          const baseValue = toAmount(prod?.product_value ?? exactApp.project_products?.product_value);
+          productAmount = baseValue > 0 ? baseValue * appQty : toAmount(exactApp.allocated_budget);
           resolvedApp = exactApp;
         }
       }
@@ -3552,6 +3556,11 @@ const getPayoutBatches = async (req, res, next) => {
       // Mark this app as consumed
       if (resolvedApp) usedApps.add(resolvedApp);
 
+      // Compute unit_price and quantity for display
+      const resolvedProd = resolvedApp?.product_id ? productMap.get(resolvedApp.product_id) : null;
+      const unitPrice    = toAmount(resolvedProd?.product_value ?? resolvedApp?.project_products?.product_value ?? 0);
+      const appQtyFinal  = Math.max(1, Number(resolvedApp?.quantity || 1));
+
       participantsByBatchId.get(batchId).push({
         id: participantId,
         payout_id: payout.id,
@@ -3559,6 +3568,8 @@ const getPayoutBatches = async (req, res, next) => {
         full_name: profile.full_name || null,
         email: profile.email || null,
         product_name: productName,
+        unit_price: unitPrice,
+        quantity: appQtyFinal,
         product_amount: productAmount || expectedProductAmount,
         reward_amount: rewardAmount,
         total_amount: toAmount(payout.amount),
@@ -3822,6 +3833,91 @@ const markPayoutBatchPaid = async (req, res, next) => {
       entityId: id,
       message: `Payout batch ${id} marked as paid (${payoutIds.length} payouts)`
     });
+
+    // ── Send payout paid email to each participant ────────────────────────
+    try {
+      const paidParticipantIds = [...new Set(payouts.map(r => r.participant_id).filter(Boolean))];
+      const paidProductIds     = [...new Set(payouts.map(r => r.product_id).filter(Boolean))];
+
+      const [profilesRes, productsRes, projectsRes, appQtyRes] = await Promise.all([
+        supabase.from('profiles').select('id, full_name, email').in('id', paidParticipantIds),
+        paidProductIds.length
+          ? supabase.from('project_products').select('id, name, product_value').in('id', paidProductIds)
+          : Promise.resolve({ data: [] }),
+        supabase.from('projects').select('id, title, name')
+              .in('id', [...new Set(payouts.map(r => r.project_id).filter(Boolean))]),
+        // Fetch quantity per (participant, product)
+        paidParticipantIds.length && paidProductIds.length
+          ? supabase.from('project_applications')
+              .select('participant_id, product_id, quantity')
+              .in('participant_id', paidParticipantIds)
+              .in('product_id', paidProductIds)
+              .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED', 'PAID'])
+              .order('created_at', { ascending: false })
+          : Promise.resolve({ data: [] })
+      ]);
+
+      const profileMap  = new Map((profilesRes.data  || []).map(p => [p.id, p]));
+      const productMap  = new Map((productsRes.data  || []).map(p => [p.id, p]));
+      const projMap     = new Map((projectsRes.data  || []).map(p => [p.id, p]));
+
+      // Build quantity map: `${participant_id}::${product_id}` → quantity
+      const emailQtyMap = new Map();
+      for (const a of (appQtyRes.data || [])) {
+        const k = `${a.participant_id}::${a.product_id}`;
+        if (!emailQtyMap.has(k)) emailQtyMap.set(k, Math.max(1, Number(a.quantity || 1)));
+      }
+
+      // Group payouts by participant
+      const payoutsByParticipant = new Map();
+      for (const row of payouts) {
+        if (!payoutsByParticipant.has(row.participant_id)) payoutsByParticipant.set(row.participant_id, []);
+        payoutsByParticipant.get(row.participant_id).push(row);
+      }
+
+      const frontendUrl = String(env.frontendUrl || 'http://localhost:5173').replace(/\/$/, '');
+
+      for (const [participantId, participantPayouts] of payoutsByParticipant) {
+        const profile = profileMap.get(participantId);
+        if (!profile?.email) continue;
+
+        const items = participantPayouts.map(row => {
+          const project   = projMap.get(row.project_id);
+          const product   = productMap.get(row.product_id);
+          const unitPrice = Number(product?.product_value || 0);
+          const qKey      = `${participantId}::${row.product_id}`;
+          const qty       = emailQtyMap.get(qKey) || 1;
+          // Infer qty from stored payout amount if DB quantity is still 1
+          const storedAmt = Number(row.amount || 0);
+          const finalQty  = qty > 1 ? qty : (unitPrice > 0 && storedAmt > unitPrice ? Math.round(storedAmt / unitPrice) : qty);
+          const amount    = unitPrice * finalQty;
+          return {
+            projectName: project?.title || project?.name || 'Campaign',
+            productName: product?.name || null,
+            quantity:    finalQty,
+            unitPrice,
+            amount
+          };
+        });
+
+        const totalAmount  = items.reduce((s, i) => s + i.amount, 0);
+        const dashboardUrl = `${frontendUrl}/participant/${participantId}/payouts`;
+
+        const emailResult = await sendEmail({
+          to:      profile.email,
+          subject: '💸 Your Nitro Reimbursement Has Been Processed!',
+          html:    payoutPaidEmail(profile.full_name || 'Participant', items, totalAmount, dashboardUrl)
+        });
+
+        if (emailResult.success) {
+          console.log(`[markPayoutBatchPaid] ✅ Payout email sent to ${profile.email} — total: ₹${totalAmount}`);
+        } else {
+          console.error(`[markPayoutBatchPaid] ❌ Failed to send email to ${profile.email}:`, emailResult.error?.message || emailResult.error);
+        }
+      }
+    } catch (emailErr) {
+      console.error('[markPayoutBatchPaid] Email send error:', emailErr?.message || emailErr);
+    }
 
     res.json({
       success: true,
@@ -4303,7 +4399,7 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
   if (participantIds.length) {
     detailsRes = await supabase
       .from('participant_details')
-      .select('participant_id, bank_account_name, bank_account_number, bank_ifsc, bank_name')
+      .select('participant_id, bank_account_name, bank_account_number, bank_ifsc, bank_name, pan_number')
       .in('participant_id', participantIds);
     if (detailsRes.error && !isMissingSchemaObjectError(detailsRes.error)) throw detailsRes.error;
   }
@@ -4337,7 +4433,7 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
     const fbProjs = [...new Set(needsFallback.map(p => p.project_id))];
     const appRes  = await supabase
       .from('project_applications')
-      .select('participant_id, project_id, product_id, allocated_budget')
+      .select('participant_id, project_id, product_id, allocated_budget, quantity')
       .in('participant_id', fbPids)
       .in('project_id', fbProjs)
       .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
@@ -4475,6 +4571,22 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
     }
   }
 
+  // ── 10. Quantity per (participant, product) from project_applications ────────
+  const quantityMap = new Map(); // "participantId::productId" → quantity
+  if (participantIds.length && productIds.length) {
+    const qtyRes = await supabase
+      .from('project_applications')
+      .select('participant_id, product_id, quantity')
+      .in('participant_id', participantIds)
+      .in('product_id', productIds)
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED', 'PAID'])
+      .order('created_at', { ascending: false });
+    for (const a of (qtyRes.data || [])) {
+      const k = `${a.participant_id}::${a.product_id}`;
+      if (!quantityMap.has(k)) quantityMap.set(k, Math.max(1, Number(a.quantity || 1)));
+    }
+  }
+
   // ── Build lookup maps ─────────────────────────────────────────────────────
   const profileMap = new Map((profilesRes.data || []).map(r => [r.id, r]));
   const detailMap  = new Map((detailsRes.data  || []).map(r => [r.participant_id, r]));
@@ -4491,11 +4603,18 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
     const directProduct  = productMap.get(row.product_id) || null;
     const fallback       = fallbackMap.get(ppKey) || null;
     const resolvedProduct = directProduct || fallback?.product || null;
-    const productValue   = Number(
-      resolvedProduct?.product_value ||
-      fallback?.allocated_budget     ||
-      row.amount || 0
-    );
+    const unitPrice      = Number(resolvedProduct?.product_value || fallback?.allocated_budget || 0);
+
+    // Quantity: from quantityMap, or infer from payout.amount / unit_price
+    const qtyKey   = `${row.participant_id}::${row.product_id}`;
+    const mappedQty = quantityMap.get(qtyKey) || 1;
+    const quantity  = mappedQty > 1
+      ? mappedQty
+      : (unitPrice > 0 && Number(row.amount) > unitPrice
+          ? Math.round(Number(row.amount) / unitPrice)
+          : mappedQty);
+
+    const totalAmount = unitPrice > 0 ? unitPrice * quantity : Number(row.amount || 0);
 
     // Invoice: look up proof by allocation_id
     const participantAllocIds = allocIdsByParticipant.get(row.participant_id) || [];
@@ -4535,7 +4654,9 @@ const fetchPayoutExportRows = async ({ batchIds = [], payoutIds = [] } = {}) => 
 
     return {
       ...row,
-      product_amount: productValue,
+      unit_price:     unitPrice,
+      quantity:       quantity,
+      product_amount: totalAmount,
       product_name:   resolvedProduct?.name || null,
       profiles: {
         ...(profileMap.get(row.participant_id) || {}),
@@ -4558,7 +4679,9 @@ const buildPayoutExportCsvRows = (payouts = []) => {
       participant_email:   profile.email || null,
       project_title:       row?.projects?.title || row?.projects?.name || null,
       product_name:        row.product_name || null,
-      product_value:       row.product_amount || row.amount || null,
+      unit_price:          row.unit_price || null,
+      quantity:            row.quantity || 1,
+      total_amount:        row.product_amount || row.amount || null,
       review_text:         row.review_text  || null,
       review_screenshot:   row.review_url   || null,
       invoice_url:         row.invoice_url  || null,
@@ -4566,6 +4689,7 @@ const buildPayoutExportCsvRows = (payouts = []) => {
       bank_account_number: profile.bank_account_number || null,
       bank_ifsc:           profile.bank_ifsc || null,
       bank_name:           profile.bank_name || null,
+      pan_number:          profile.pan_number || null,
     };
   });
 };
@@ -4582,7 +4706,7 @@ const exportPayoutCSV = async (req, res, next) => {
 
     const csvData = buildPayoutExportCsvRows(payouts);
     const fields = [
-      'brand_name', 'participant_name', 'participant_email', 'project_title', 'product_name', 'product_value', 'review_text', 'review_screenshot', 'invoice_url', 'account_holder_name', 'bank_account_number', 'bank_ifsc', 'bank_name'
+      'brand_name', 'participant_name', 'participant_email', 'project_title', 'product_name', 'unit_price', 'quantity', 'total_amount', 'review_text', 'review_screenshot', 'invoice_url', 'account_holder_name', 'bank_account_number', 'bank_ifsc', 'bank_name', 'pan_number'
     ];
     const parser = new Parser({ fields });
     const csv = parser.parse(csvData);
@@ -4685,14 +4809,17 @@ const exportPayoutBatchCSV = async (req, res, next) => {
       'participant_email',
       'project_title',
       'product_name',
-      'product_value',
+      'unit_price',
+      'quantity',
+      'total_amount',
       'review_text',
       'review_screenshot',
       'invoice_url',
       'account_holder_name',
       'bank_account_number',
       'bank_ifsc',
-      'bank_name'
+      'bank_name',
+      'pan_number'
     ];
     const parser = new Parser({ fields });
     const csv = parser.parse(csvData);
@@ -4760,14 +4887,17 @@ const exportPayoutBatchesCSV = async (req, res, next) => {
       'participant_email',
       'project_title',
       'product_name',
-      'product_value',
+      'unit_price',
+      'quantity',
+      'total_amount',
       'review_text',
       'review_screenshot',
       'invoice_url',
       'account_holder_name',
       'bank_account_number',
       'bank_ifsc',
-      'bank_name'
+      'bank_name',
+      'pan_number'
     ];
     const parser = new Parser({ fields });
     const csv = parser.parse(csvData);

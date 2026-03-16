@@ -794,17 +794,27 @@ const payoutPaidEmail = (
 
   const itemRows = items
     .map(
-      ({ projectName, productName, amount }) => `
+      ({ projectName, productName, amount, quantity, unitPrice }) => {
+        const qty      = Math.max(1, Number(quantity || 1));
+        const unit     = Number(unitPrice || 0);
+        const total    = Number(amount || 0);
+        // Show "₹664 × 2 units" breakdown when quantity > 1
+        const qtyLine  = qty > 1
+          ? `<br/><span style="font-size:12px;color:#9aa3b2;">${fmt(unit)} &times; ${qty} units</span>`
+          : '';
+        return `
         <tr>
           <td style="padding:10px 16px;font-size:14px;color:#4a5568;border-bottom:1px solid #edf0f7;">
             <strong style="color:#1a1a2e;">${projectName || 'Campaign'}</strong>
             ${productName ? `<br/><span style="font-size:12px;color:#9aa3b2;">${productName}</span>` : ''}
+            ${qtyLine}
           </td>
           <td style="padding:10px 16px;font-size:14px;font-weight:700;color:#1a7a4a;
                      text-align:right;border-bottom:1px solid #edf0f7;white-space:nowrap;">
-            ${fmt(amount)}
+            ${fmt(total)}
           </td>
-        </tr>`
+        </tr>`;
+      }
     )
     .join('');
 
