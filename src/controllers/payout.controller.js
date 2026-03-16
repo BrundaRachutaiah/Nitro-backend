@@ -659,6 +659,8 @@ const getPayoutBatches = async (req, res, next) => {
         pincode:             profile.pincode              || null,
         country:             profile.country              || null,
         product_name:        product?.name                || null,
+        quantity:            batchQty,
+        unit_price:          Number(product?.product_value || 0),
         product_amount:      Number(product?.product_value || 0) * batchQty,
         payout_status:       payout.status,
       });

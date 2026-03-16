@@ -3113,6 +3113,7 @@ const getEligiblePayouts = async (req, res, next) => {
               project_id,
               product_id,
               allocated_budget,
+              quantity,
               status,
               created_at,
               project_products (
@@ -3202,10 +3203,10 @@ const getEligiblePayouts = async (req, res, next) => {
       const app = appMap.get(key) || appMap.get(buildParticipantProjectProductKey(row.participant_id, row.project_id, null)) || null;
       const product = hasProductColumn ? (productMap.get(row.product_id) || null) : null;
       const rewardAmount = toAmount(breakdown.rewardAmount ?? project.reward);
-      // Use product_value as primary source of truth. allocated_budget is only
-      // a fallback when product_value is missing/zero to avoid accidental overrides.
-      const mappedProductAmount = product ? toAmount(product.product_value) : 0;
-      const appCatalogueAmount = toAmount(app?.project_products?.product_value);
+      // Use product_value as primary source of truth, multiplied by quantity
+      const appQuantity = Math.max(1, Number(app?.quantity || 1));
+      const mappedProductAmount = product ? toAmount(product.product_value) * appQuantity : 0;
+      const appCatalogueAmount = toAmount(app?.project_products?.product_value) * appQuantity;
       const appAllocatedBudget = toAmount(app?.allocated_budget);
       const productAmount = mappedProductAmount > 0
         ? mappedProductAmount
@@ -3222,6 +3223,8 @@ const getEligiblePayouts = async (req, res, next) => {
         projects: project || null,
         product_name: product?.name || app?.project_products?.name || null,
         reward_amount: rewardAmount,
+        quantity: appQuantity,
+        unit_price: product ? toAmount(product.product_value) : toAmount(app?.project_products?.product_value),
         product_amount: productAmount,
         allocated_budget: toAmount(app?.allocated_budget),
         total_amount: computedTotal > 0
