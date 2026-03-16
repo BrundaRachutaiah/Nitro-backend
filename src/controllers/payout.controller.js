@@ -342,6 +342,25 @@ const getEligiblePayouts = async (req, res, next) => {
         : Promise.resolve({ data: [] }),
     ]);
 
+    // Load quantity AND compute correct amount directly from project_applications
+    // This is the single source of truth — never trust payouts.amount which may be stale
+    const quantityMap = new Map(); // key: `${participant_id}::${product_id}` → quantity
+    if (participantIds.length && productIds.length) {
+      const { data: appQtyRows } = await supabase
+        .from('project_applications')
+        .select('participant_id, product_id, quantity')
+        .in('participant_id', participantIds)
+        .in('product_id', productIds)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED', 'REVIEW_SUBMITTED'])
+        .order('created_at', { ascending: false });
+      for (const a of (appQtyRows || [])) {
+        const qKey = `${a.participant_id}::${a.product_id}`;
+        if (!quantityMap.has(qKey)) {
+          quantityMap.set(qKey, Math.max(1, Number(a.quantity || 1)));
+        }
+      }
+    }
+
     const profileMap = new Map((profilesRes.data || []).map(r => [r.id, r]));
     const projectMap = new Map((projectsRes.data || []).map(r => [r.id, r]));
     const productMap = new Map((productsRes.data || []).map(r => [r.id, r]));
@@ -482,17 +501,30 @@ const getEligiblePayouts = async (req, res, next) => {
         }
       }
 
-      // ── BUG 1 FIX ─────────────────────────────────────────────────────────────
-      // product?.product_value MUST be primary — row.amount is LAST RESORT only.
-      // row.amount may have been written incorrectly (e.g. ₹664 stored for a ₹308
-      // product due to a previous bug). product_value from project_products is always
-      // the ground truth for what the participant actually paid.
-      const productAmount = Number(
-        product?.product_value            // PRIMARY: direct lookup by payout.product_id
-        || fallbackProduct?.product_value // SECONDARY: resolved when product_id is null
-        || row.amount                     // LAST RESORT: stale DB value
+      // ── QUANTITY & AMOUNT RESOLUTION ──────────────────────────────────────────
+      // unitValue = single-unit price from project_products catalogue (always accurate)
+      const unitValue = Number(
+        product?.product_value
+        || fallbackProduct?.product_value
         || 0
       );
+
+      const qKey = `${row.participant_id}::${row.product_id || ''}`;
+      const mappedQty = quantityMap.get(qKey) || 1;
+
+      // quantity: use project_applications.quantity as the source of truth.
+      // If it is 1 but the stored payout amount is a multiple of unit_price,
+      // infer from the amount (handles rows inserted before quantity was tracked).
+      let quantity = mappedQty;
+      if (quantity <= 1 && unitValue > 0) {
+        const inferredQty = Math.round(Number(row.amount || 0) / unitValue);
+        if (inferredQty > 1 && Number.isFinite(inferredQty)) quantity = inferredQty;
+      }
+
+      // productAmount: always recompute from unit_price × quantity (never trust row.amount)
+      const productAmount = unitValue > 0
+        ? unitValue * quantity
+        : Number(row.amount || 0);
 
       return {
         ...row,
@@ -500,10 +532,9 @@ const getEligiblePayouts = async (req, res, next) => {
         projects:      project,
         product_name:  product?.name || fallbackProduct?.name || null,
         reward_amount: 0,
+        quantity,
+        unit_price:    unitValue,
         product_amount: productAmount,
-        // ── BUG 2 FIX ───────────────────────────────────────────────────────────
-        // fallbackApp was referenced here but defined inside a nested if-block above,
-        // causing ReferenceError. The field is unused by the frontend — set to 0.
         allocated_budget: 0,
         total_amount:  productAmount,
       };
@@ -586,6 +617,23 @@ const getPayoutBatches = async (req, res, next) => {
       }
     }
 
+    // Load quantity for each (participant, product) so payout amount reflects actual units
+    const batchParticipantIds = [...new Set(payoutRows.map(p => p.participant_id).filter(Boolean))];
+    const batchProductIds     = [...new Set(payoutRows.map(p => p.product_id).filter(Boolean))];
+    const batchQuantityMap    = new Map(); // key: `${participant_id}::${product_id}` → quantity
+    if (batchParticipantIds.length && batchProductIds.length) {
+      const { data: qtyRows } = await supabase
+        .from('project_applications')
+        .select('participant_id, product_id, quantity')
+        .in('participant_id', batchParticipantIds)
+        .in('product_id', batchProductIds)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED', 'IN_BATCH', 'PAID']);
+      for (const a of (qtyRows || [])) {
+        const qKey = `${a.participant_id}::${a.product_id}`;
+        if (!batchQuantityMap.has(qKey)) batchQuantityMap.set(qKey, Math.max(1, Number(a.quantity || 1)));
+      }
+    }
+
     const participantsByBatch = new Map();
     for (const payout of payoutRows) {
       const bid = payout.payout_batch_id;
@@ -593,6 +641,8 @@ const getPayoutBatches = async (req, res, next) => {
       const profile            = profileMap.get(payout.participant_id) || {};
       const effectiveProductId = payout.product_id || fallbackProductByKey.get(payout.participant_id) || null;
       const product            = effectiveProductId ? (productMap.get(effectiveProductId) || null) : null;
+      const batchQKey          = `${payout.participant_id}::${effectiveProductId || ''}`;
+      const batchQty           = batchQuantityMap.get(batchQKey) || 1;
       participantsByBatch.get(bid).push({
         id:                  payout.participant_id,
         payout_id:           payout.id,
@@ -609,7 +659,7 @@ const getPayoutBatches = async (req, res, next) => {
         pincode:             profile.pincode              || null,
         country:             profile.country              || null,
         product_name:        product?.name                || null,
-        product_amount:      Number(product?.product_value || 0),
+        product_amount:      Number(product?.product_value || 0) * batchQty,
         payout_status:       payout.status,
       });
     }
@@ -762,7 +812,7 @@ const backfillPayoutsForParticipant = async (participantId) => {
   try {
     const { data: apps } = await supabase
       .from('project_applications')
-      .select('id, project_id, product_id, allocated_budget, status')
+      .select('id, project_id, product_id, allocated_budget, quantity, status')
       .eq('participant_id', participantId)
       .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
     if (!apps || !apps.length) return;
@@ -829,11 +879,9 @@ const backfillPayoutsForParticipant = async (participantId) => {
       const covKey = `${projId}::${productId || '__none__'}`;
       if (coveredSet.has(covKey)) continue;
 
-      // ── BUG 3 FIX: amount = product_value only — NO reward component ─────────
-      // The participant payouts page shows product_value only (no reward).
-      // Previously rewardAmount + productAmount was used here, causing inflated
-      // amounts. This is now consistent with backfillEligiblePayouts.
-      const productAmount = Number(productMap.get(productId)?.product_value || 0);
+      // amount = product_value × quantity (quantity defaults to 1 if not set)
+      const appQuantity   = Math.max(1, Number(app.quantity || 1));
+      const productAmount = Number(productMap.get(productId)?.product_value || 0) * appQuantity;
       const proofId       = firstProofIdByProject.get(projId) || null;
 
       // ── FIX: use the same tryInsert pattern as backfillEligiblePayouts ────────
@@ -940,7 +988,7 @@ const getMyPayouts = async (req, res, next) => {
         .order('created_at', { ascending: false }),
       supabase
         .from('project_applications')
-        .select('id, participant_id, project_id, product_id, status, reviewed_at, created_at, projects ( id, title, name )')
+        .select('id, participant_id, project_id, product_id, quantity, status, reviewed_at, created_at, projects ( id, title, name )')
         .eq('participant_id', participantId)
         .not('product_id', 'is', null)
         .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
@@ -971,6 +1019,13 @@ const getMyPayouts = async (req, res, next) => {
       if (!latestAppByProjectProduct.has(key)) latestAppByProjectProduct.set(key, app);
     }
 
+    // Build quantity map: `${project_id}::${product_id}` → quantity
+    const myPayoutQtyMap = new Map();
+    for (const app of (appsRes.data || [])) {
+      const key = `${app.project_id}::${app.product_id || ''}`;
+      if (!myPayoutQtyMap.has(key)) myPayoutQtyMap.set(key, Math.max(1, Number(app.quantity || 1)));
+    }
+
     const appProductIds = [...new Set((appsRes.data || []).map((row) => row.product_id).filter(Boolean))];
     const missingAppProductIds = appProductIds.filter((id) => !productMap.has(id));
     if (missingAppProductIds.length) {
@@ -989,14 +1044,19 @@ const getMyPayouts = async (req, res, next) => {
       const effectiveProductId = row.product_id || fallbackProductByKey.get(cacheKey) || null;
       const effectiveProduct = effectiveProductId ? (productMap.get(effectiveProductId) || null) : null;
 
-      const mappedValue = effectiveProductId ? Number(effectiveProduct?.product_value || 0) : 0;
-      const productAmount = mappedValue > 0 ? mappedValue : Number(row.amount || 0);
+      const unitValue = effectiveProductId ? Number(effectiveProduct?.product_value || 0) : 0;
+      // Multiply by quantity — fall back to row.amount if product_value is unknown
+      const qtyKey = `${row.project_id}::${effectiveProductId || ''}`;
+      const qty = myPayoutQtyMap.get(qtyKey) || 1;
+      const productAmount = (unitValue > 0 ? unitValue * qty : Number(row.amount || 0));
 
       return {
         ...row,
         product_id: effectiveProductId,
         project_products: effectiveProduct,
         reward_amount: 0,
+        quantity: qty,
+        unit_price: unitValue,
         product_amount: Number.isFinite(productAmount) ? productAmount : 0,
         total_amount: Number.isFinite(productAmount) ? productAmount : 0,
         eligibility_reason:
@@ -1040,7 +1100,8 @@ const getMyPayouts = async (req, res, next) => {
         const reviewInThisCycle = Boolean(review) && (!appTime || reviewTime >= appTime);
 
         const product = app.product_id ? (productMap.get(app.product_id) || null) : null;
-        const amount = Number(product?.product_value || 0);
+        const appQty  = Math.max(1, Number(app.quantity || 1));
+        const amount  = Number(product?.product_value || 0) * appQty;
 
         // If participant has submitted both invoice and review for this cycle but no payout row exists yet,
         // show a synthetic "PENDING" row (admin verification in progress).
@@ -1058,6 +1119,8 @@ const getMyPayouts = async (req, res, next) => {
             projects: app.projects || null,
             project_products: product,
             reward_amount: 0,
+            quantity: appQty,
+            unit_price: Number(product?.product_value || 0),
             product_amount: amount,
             total_amount: amount,
             eligibility_reason: 'Invoice and review submitted. Waiting for admin approval.'
@@ -1087,13 +1150,13 @@ const backfillEligiblePayouts = async () => {
   const SKEW_MS = 10 * 60 * 1000;
   let appRes = await supabase
     .from('project_applications')
-    .select('id, participant_id, project_id, product_id, allocated_budget, status, reviewed_at, created_at')
+    .select('id, participant_id, project_id, product_id, allocated_budget, quantity, status, reviewed_at, created_at')
     .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
 
   if (appRes.error && /reviewed_at/i.test(String(appRes.error.message || ''))) {
     appRes = await supabase
       .from('project_applications')
-      .select('id, participant_id, project_id, product_id, allocated_budget, status, created_at')
+      .select('id, participant_id, project_id, product_id, allocated_budget, quantity, status, created_at')
       .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
   }
 
@@ -1255,7 +1318,9 @@ const backfillEligiblePayouts = async () => {
     const appTime = new Date(app.reviewed_at || app.created_at || 0).getTime();
     const lastPayoutTime = latestPayoutTimeByKey.get(covKey) || 0;
     if (coveredSet.has(covKey) && appTime && lastPayoutTime >= (appTime - SKEW_MS)) continue;
-    const productAmount = Number(productMap.get(productId)?.product_value || 0);
+    // amount = product_value × quantity (quantity defaults to 1 if not set)
+    const appQuantity   = Math.max(1, Number(app.quantity || 1));
+    const productAmount = Number(productMap.get(productId)?.product_value || 0) * appQuantity;
     const inserted = await tryInsert({ participant_id: pid, user_id: pid, project_id: projId, product_id: productId || null, purchase_proof_id: eligi?.proofId || null, amount: productAmount, status: 'ELIGIBLE' });
     if (inserted) {
       coveredSet.add(covKey);

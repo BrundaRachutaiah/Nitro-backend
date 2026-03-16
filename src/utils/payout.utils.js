@@ -18,7 +18,7 @@ const isMissingSchemaObjectError = (error) => {
 const getApprovedApplication = async ({ supabase, participantId, projectId }) => {
   let applicationRes = await supabase
     .from('project_applications')
-    .select('id, product_id, allocated_budget')
+    .select('id, product_id, allocated_budget, quantity')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
     .in('status', ['APPROVED', 'PURCHASED', 'REVIEW_SUBMITTED', 'COMPLETED'])
@@ -29,7 +29,7 @@ const getApprovedApplication = async ({ supabase, participantId, projectId }) =>
   if (applicationRes.error && /created_at/i.test(String(applicationRes.error.message || ''))) {
     applicationRes = await supabase
       .from('project_applications')
-      .select('id, product_id, allocated_budget')
+      .select('id, product_id, allocated_budget, quantity')
       .eq('participant_id', participantId)
       .eq('project_id', projectId)
       .in('status', ['APPROVED', 'PURCHASED', 'REVIEW_SUBMITTED', 'COMPLETED'])
@@ -74,7 +74,9 @@ const getProductAmount = async ({ supabase, application }) => {
     if (isMissingSchemaObjectError(error)) return 0;
     throw error;
   }
-  return toAmount(data?.product_value);
+  // Multiply by quantity (defaults to 1 if not set)
+  const quantity = Math.max(1, Number(application.quantity || 1));
+  return toAmount(data?.product_value) * quantity;
 };
 
 const calculatePayoutBreakdown = async ({
