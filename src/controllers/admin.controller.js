@@ -60,7 +60,9 @@ const hasProvidedNumber = (value) =>
 const getApplicationBudgetAmount = (row, productValueMap = new Map()) => {
   const allocated = toAmount(row?.allocated_budget);
   if (allocated > 0) return allocated;
-  return toAmount(productValueMap.get(row?.product_id));
+  const baseValue = toAmount(productValueMap.get(row?.product_id));
+  const quantity = Math.max(1, Number(row?.quantity || 1));
+  return baseValue * quantity;
 };
 
 const getOrCreateActiveAllocationForProject = async ({ participantId, projectId }) => {
@@ -1985,6 +1987,7 @@ const getPendingProductApplications = async (req, res, next) => {
           participant_id,
           product_id,
           allocated_budget,
+          quantity,
           status,
           created_at,
           updated_at,
@@ -2010,6 +2013,7 @@ const getPendingProductApplications = async (req, res, next) => {
             participant_id,
             product_id,
             allocated_budget,
+            quantity,
             status,
             created_at,
             reviewed_at
@@ -2198,19 +2202,19 @@ const approveProductApplication = async (req, res, next) => {
     if (productError && !/column|schema|does not exist|relation/i.test(String(productError.message || ''))) {
       throw productError;
     }
-
+    
     // Multiply product_value by quantity if set
-const { data: appWithQty } = await supabase
-  .from('project_applications')
-  .select('quantity')
-  .eq('id', id)
-  .maybeSingle();
+    const { data: appWithQty } = await supabase
+      .from('project_applications')
+      .select('quantity')
+      .eq('id', id)
+      .maybeSingle();
 
-const appQuantity = Math.max(1, Number(appWithQty?.quantity || 1));
-const defaultAllocatedBudget = toAmount(productRow?.product_value) * appQuantity;
-const normalizedAllocatedBudget = hasProvidedNumber(allocated_budget)
-  ? Number(allocated_budget)
-  : defaultAllocatedBudget;
+    const appQuantity = Math.max(1, Number(appWithQty?.quantity || 1));
+    const defaultAllocatedBudget = toAmount(productRow?.product_value) * appQuantity;
+    const normalizedAllocatedBudget = hasProvidedNumber(allocated_budget)
+      ? Number(allocated_budget)
+      : defaultAllocatedBudget;
 
     if (!Number.isFinite(normalizedAllocatedBudget) || normalizedAllocatedBudget <= 0) {
       return res.status(400).json({

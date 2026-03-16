@@ -571,7 +571,7 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
   // ── Step 5: Get applications (one per product) ───────────────────────────
   const { data: applications, error: appError } = await supabase
     .from('project_applications')
-    .select('id, product_id, allocated_budget')
+    .select('id, product_id, allocated_budget, quantity')
     .eq('participant_id', participantId)
     .eq('project_id', projectId)
     .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED']);
@@ -660,15 +660,17 @@ const ensureEligiblePayout = async ({ participantId, projectId }) => {
         ? (approvedProofIdByProduct.get(productIdStr) || approvedProofs[0]?.id || null)
         : (approvedProofs[0]?.id || null);
 
-      let productAmount = Number(application.allocated_budget || 0);
-      if (!productAmount && application.product_id) {
-        const { data: prod } = await supabase
-          .from('project_products')
-          .select('product_value')
-          .eq('id', application.product_id)
-          .maybeSingle();
-        productAmount = Number(prod?.product_value || 0);
-      }
+      const appQuantity = Math.max(1, Number(application.quantity || 1));
+let productAmount = Number(application.allocated_budget || 0);
+if (!productAmount && application.product_id) {
+  const { data: prod } = await supabase
+    .from('project_products')
+    .select('product_value')
+    .eq('id', application.product_id)
+    .maybeSingle();
+  productAmount = Number(prod?.product_value || 0);
+}
+productAmount = productAmount * appQuantity;
 
       // ── BUG 6 FIX: amount = productAmount only — no reward component ─────────
       // The participant payouts page shows product_value only (not reward + product).

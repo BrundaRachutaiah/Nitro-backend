@@ -162,7 +162,7 @@ const createPayoutIfBothApproved = async ({
       return null;  // Don't create payout yet
     }
 
-    // Get product value
+    // Get product value + quantity from application
     const { data: product } = await supabase
       .from('project_products')
       .select('product_value')
@@ -173,6 +173,21 @@ const createPayoutIfBothApproved = async ({
       console.log(`[createPayoutIfBothApproved] Product value not found for ${productId}`);
       return null;
     }
+
+    // Get quantity from the approved application
+    const { data: appForQty } = await supabase
+      .from('project_applications')
+      .select('quantity')
+      .eq('participant_id', participantId)
+      .eq('project_id', projectId)
+      .eq('product_id', productId)
+      .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const payoutQuantity = Math.max(1, Number(appForQty?.quantity || 1));
+    const payoutAmount = Number(product.product_value) * payoutQuantity;
 
     // ── CHECK 3: Does payout already exist? ──
     const { data: existingPayout } = await supabase
@@ -198,7 +213,7 @@ const createPayoutIfBothApproved = async ({
       project_id: projectId,
       product_id: productId,
       purchase_proof_id: proof?.id || null,
-      amount: product.product_value,
+      amount: payoutAmount,
       status: 'ELIGIBLE'
     };
 

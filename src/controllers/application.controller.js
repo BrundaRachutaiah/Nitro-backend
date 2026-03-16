@@ -236,29 +236,35 @@ const getMyApplications = async (req, res, next) => {
     const participantId = req.user.id;
 
     const { data, error } = await supabase
-      .from('project_applications')
-      .select(`
-        id,
-        status,
-        project_id,
-        product_id,
-        allocated_budget,
-        created_at,
-        projects (
+        .from('project_applications')
+        .select(
+          `
           id,
-          name,
-          title,
-          mode
-        ),
-        project_products (
-          id,
-          name,
-          product_url,
-          product_value
+          project_id,
+          product_id,
+          allocation_id,
+          allocated_budget,
+          quantity,
+          status,
+          reviewed_at,
+          created_at,
+          projects (
+            id,
+            title,
+            name,
+            mode
+          ),
+          project_products (
+            id,
+            name,
+            product_value,
+            product_url
+          )
+        `
         )
-      `)
-      .eq('participant_id', participantId)
-      .order('created_at', { ascending: false });
+        .eq('participant_id', participantId)
+        .in('status', ['APPROVED', 'PURCHASED', 'COMPLETED'])
+        .order('created_at', { ascending: false })
 
     if (error) throw error;
 
