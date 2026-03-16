@@ -1,6 +1,7 @@
 const supabase = require('../config/supabaseClient');
 const { PROOF_STATUS } = require('../utils/constants');
 const { sendEmail } = require('../services/email.service');
+const { scheduleInvoiceReview } = require('../services/email.digest');
 const {
   purchaseApprovedEmail,
   purchaseRejectedEmail
@@ -530,10 +531,16 @@ const approvePurchaseProof = async (req, res, next) => {
       : [];
 
     if (participant?.email) {
-      sendEmail({
-        to: participant.email,
-        subject: '✅ Invoice Approved — Submit Your Review',
-        html: purchaseApprovedEmail(participant.full_name, reviewProjName, approvedProducts)
+      // Digest: batch all invoice/review events into ONE email per participant
+      const productName = approvedProducts.length > 0 ? approvedProducts[0]?.name : null;
+      scheduleInvoiceReview({
+        participantId:    proof.participant_id,
+        participantEmail: participant.email,
+        participantName:  participant.full_name,
+        kind:        'invoice',
+        status:      'APPROVED',
+        productName: productName,
+        projectTitle: reviewProjName,
       });
     }
 
@@ -606,10 +613,12 @@ const rejectPurchaseProof = async (req, res, next) => {
       .maybeSingle();
 
     if (participant?.email) {
-      sendEmail({
-        to: participant.email,
-        subject: '⚠️ Action Required: Re-upload Your Invoice',
-        html: purchaseRejectedEmail(participant.full_name, null)
+      scheduleInvoiceReview({
+        participantId:    data.participant_id,
+        participantEmail: participant.email,
+        participantName:  participant.full_name,
+        kind:   'invoice',
+        status: 'REJECTED',
       });
     }
   } catch (err) {
@@ -733,15 +742,13 @@ const approveParticipantReview = async (req, res, next) => {
       .maybeSingle();
 
     if (participant?.email) {
-      sendEmail({
-        to: participant.email,
-        subject: '✅ Your Review Has Been Approved',
-        html: `
-          <h2>Review Approved</h2>
-          <p>Hi ${participant.full_name},</p>
-          <p>Your review has been approved by our admin team. Your payout will be processed soon!</p>
-          <p>Track your reimbursement status on the <a href="${process.env.FRONTEND_URL}/payouts">Payouts page</a>.</p>
-        `
+      scheduleInvoiceReview({
+        participantId:    review.participant_id,
+        participantEmail: participant.email,
+        participantName:  participant.full_name,
+        kind:        'review',
+        status:      'APPROVED',
+        projectTitle: null,
       });
     }
 
@@ -815,15 +822,12 @@ const rejectParticipantReview = async (req, res, next) => {
       .maybeSingle();
 
     if (participant?.email) {
-      sendEmail({
-        to: participant.email,
-        subject: '⚠️ Action Required: Re-submit Your Review',
-        html: `
-          <h2>Review Needs Revision</h2>
-          <p>Hi ${participant.full_name},</p>
-          <p>Your review was not approved and needs revision. Please re-submit your feedback for this product.</p>
-          <p>Go to your <a href="${process.env.FRONTEND_URL}/allocation/active">Tasks page</a> to re-submit.</p>
-        `
+      scheduleInvoiceReview({
+        participantId:    data.participant_id,
+        participantEmail: participant.email,
+        participantName:  participant.full_name,
+        kind:        'review',
+        status:      'REJECTED',
       });
     }
   } catch (err) {

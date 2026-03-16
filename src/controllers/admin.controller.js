@@ -16,6 +16,7 @@ const {
   productDecisionEmail,
   payoutPaidEmail
 } = require('../services/email.templates');
+const { scheduleProductDecision, scheduleInvoiceReview } = require('../services/email.digest');
 
 const isMissingSchemaObjectError = (error) => {
   const text = String(error?.message || '').toLowerCase();
@@ -407,33 +408,32 @@ const sendParticipantDecisionSummaryNotification = async ({
       message: notificationMessage
     });
 
-  // ── 7. Send beautifully designed grouped HTML email ──────────────────────
+  // ── 7. Schedule digest email (batches all decisions into ONE email per participant) ──
   if (participantProfile?.email) {
-    const { productDecisionEmail } = require('../services/email.templates');
-
-    const subjectLine = approvedProducts.length > 0 && rejectedProducts.length === 0
-      ? `🎉 Product Request Approved — ${projectTitle || 'Nitro'}`
-      : approvedProducts.length > 0
-      ? `📋 Your Product Request Update — ${projectTitle || 'Nitro'}`
-      : `📋 Product Request Update — ${projectTitle || 'Nitro'}`;
-
-    const participantBaseUrl = `${env.frontendUrl.replace(/\/$/, '')}/participant/${participantId}`;
-    const invoiceUrl = `${participantBaseUrl}/allocation/active`;
-    const reviewUrl  = `${participantBaseUrl}/allocation/active`;
-
-    await sendEmail({
-      to: participantProfile.email,
-      subject: subjectLine,
-      html: productDecisionEmail(
-        participantProfile.full_name,
-        projectTitle || 'Project',
-        approvedProducts,
-        rejectedProducts,
-        invoiceUrl,
-        invoiceUrl,
-        reviewUrl
-      )
-    });
+    for (const p of approvedProducts) {
+      scheduleProductDecision({
+        participantId,
+        participantEmail: participantProfile.email,
+        participantName:  participantProfile.full_name,
+        status:       'APPROVED',
+        productName:  p.name,
+        productValue: p.product_value,
+        productUrl:   p.product_url,
+        brand:        p.brand || projectTitle,
+        projectTitle: projectTitle || 'Project',
+      });
+    }
+    for (const p of rejectedProducts) {
+      scheduleProductDecision({
+        participantId,
+        participantEmail: participantProfile.email,
+        participantName:  participantProfile.full_name,
+        status:       'REJECTED',
+        productName:  p.name,
+        brand:        p.brand || projectTitle,
+        projectTitle: projectTitle || 'Project',
+      });
+    }
   }
 };
 
@@ -2672,26 +2672,31 @@ const bulkDecideApplications = async (req, res, next) => {
             ? 'Your Product Requests'
             : (approvedProducts[0]?.brand || rejectedProducts[0]?.brand || 'Nitro');
 
-        const dashboardUrl = `${env.frontendUrl.replace(/\/$/, '')}/participant/${participantId}/allocation/active`;
-        const invoiceUrl   = dashboardUrl;
-        const reviewUrl    = dashboardUrl;
-        setImmediate(() => {
-          sendEmail({
-            to: participant.email,
-            subject: approvedProducts.length > 0
-              ? '🎉 Products Approved — Upload Your Invoice Now'
-              : 'Update on Your Product Requests',
-            html: productDecisionEmail(
-              participant.full_name,
-              emailProjectTitle,
-              approvedProducts,
-              rejectedProducts,
-              dashboardUrl,
-              invoiceUrl,
-              reviewUrl
-            )
-          }).catch(() => {});
-        });
+        // Schedule digest — batches all bulk decisions into ONE email per participant
+        for (const p of approvedProducts) {
+          scheduleProductDecision({
+            participantId,
+            participantEmail: participant.email,
+            participantName:  participant.full_name,
+            status:       'APPROVED',
+            productName:  p.name,
+            productValue: p.product_value,
+            productUrl:   p.product_url,
+            brand:        p.brand || emailProjectTitle,
+            projectTitle: emailProjectTitle,
+          });
+        }
+        for (const p of rejectedProducts) {
+          scheduleProductDecision({
+            participantId,
+            participantEmail: participant.email,
+            participantName:  participant.full_name,
+            status:       'REJECTED',
+            productName:  p.name,
+            brand:        p.brand || emailProjectTitle,
+            projectTitle: emailProjectTitle,
+          });
+        }
       } catch (participantError) {
         participantErrors.push({
           participantId,
@@ -2917,17 +2922,19 @@ const approvePurchaseProof = async (req, res, next) => {
       .eq('id', proofRow.participant_id)
       .maybeSingle();
 
-    const { purchaseApprovedEmail } = require('../services/email.templates');
     const { data: proofProject } = allocation?.project_id
       ? await supabase.from('projects').select('title, name').eq('id', allocation.project_id).maybeSingle()
       : { data: null };
     const proofProjectName = proofProject?.title || proofProject?.name || null;
 
     if (participant?.email) {
-      sendEmail({
-        to: participant.email,
-        subject: 'Invoice Approved - Submit Your Review',
-        html: purchaseApprovedEmail(participant.full_name, proofProjectName, [])
+      scheduleInvoiceReview({
+        participantId:    proofRow.participant_id,
+        participantEmail: participant.email,
+        participantName:  participant.full_name,
+        kind:        'invoice',
+        status:      'APPROVED',
+        projectTitle: proofProjectName,
       });
     }
 

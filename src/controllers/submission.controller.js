@@ -1,5 +1,6 @@
 const supabase = require('../config/supabaseClient');
 const { sendEmail } = require('../services/email.service');
+const { scheduleInvoiceReview } = require('../services/email.digest');
 const {
   reviewApprovedEmail,
   reviewRejectedEmail
@@ -1323,10 +1324,15 @@ const approveReview = async (req, res, next) => {
       : [];
 
     if (participant?.email) {
-      sendEmail({
-        to: participant.email,
-        subject: '🎊 Review Approved — Your Payout Is Unlocked!',
-        html: reviewApprovedEmail(participant.full_name, reviewProjectName, null, approvedProducts)
+      const productName = approvedProducts.length > 0 ? approvedProducts[0]?.name : null;
+      scheduleInvoiceReview({
+        participantId:    reviewRow.participant_id,
+        participantEmail: participant.email,
+        participantName:  participant.full_name,
+        kind:        'review',
+        status:      'APPROVED',
+        productName: productName,
+        projectTitle: reviewProjectName,
       });
     }
   } catch (err) {
@@ -1371,10 +1377,13 @@ const rejectReview = async (req, res, next) => {
     const rejProjectName = rejProject?.title || rejProject?.name || null;
 
     if (participant?.email) {
-      sendEmail({
-        to: participant.email,
-        subject: '📝 Your Review Needs Revision',
-        html: reviewRejectedEmail(participant.full_name, rejProjectName)
+      scheduleInvoiceReview({
+        participantId:    data.participant_id,
+        participantEmail: participant.email,
+        participantName:  participant.full_name,
+        kind:        'review',
+        status:      'REJECTED',
+        projectTitle: rejProjectName,
       });
     }
   } catch (err) {
