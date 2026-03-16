@@ -10,7 +10,7 @@ const router = express.Router();
 router.post(
   '/projects/:projectId/apply',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   applicationController.applyToProject
 );
 
@@ -18,7 +18,7 @@ router.post(
 router.get(
   '/applications/my',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   applicationController.getMyApplications
 );
 

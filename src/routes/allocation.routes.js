@@ -17,14 +17,14 @@ router.post(
 router.get(
   '/allocations/my',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   allocationController.getMyAllocations
 );
 
 router.get(
   '/allocations/my/tracking',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   allocationController.getMyAllocationTracking
 );
 

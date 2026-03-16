@@ -15,7 +15,7 @@ const upload = multer({
 router.post(
   '/uploads/purchase-proof',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   upload.single('file'),
   uploadController.uploadPurchaseProof
 );
@@ -23,7 +23,7 @@ router.post(
 router.post(
   '/uploads/review-proof',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   upload.single('file'),
   uploadController.uploadReviewProof
 );
@@ -31,7 +31,7 @@ router.post(
 router.post(
   '/uploads/review-proofs',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   upload.array('files', 6),
   uploadController.uploadReviewProofs
 );

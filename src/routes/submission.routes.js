@@ -8,14 +8,14 @@ const router = express.Router();
 router.post(
   '/feedback',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   submissionController.submitFeedback
 );
 
 router.post(
   '/review',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'ADMIN', 'SUPER_ADMIN'),
   submissionController.submitReview
 );
 
