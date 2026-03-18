@@ -413,33 +413,93 @@ const updateProject = async (req, res, next) => {
     }
 
     if (Array.isArray(products)) {
+      // Build cleaned product list — preserve existing id if provided, support is_active flag
       const cleanedProducts = products
         .map((item) => ({
+          ...(item?.id ? { id: item.id } : {}),
           project_id: id,
           name: String(item?.name || '').trim(),
-          product_url: String(item?.product_url || '').trim(),
+          product_url: String(item?.product_url || '').trim() || null,
           image_url: String(item?.image_url || '').trim() || null,
-          product_value: Number(item?.product_value || item?.price || 0)
+          product_value: Number(item?.product_value || item?.price || 0),
+          is_active: item?.is_active !== false  // default true unless explicitly false
         }))
         .filter((item) => item.name && item.product_url);
 
-      const { error: deleteProductsError } = await supabase
-        .from('project_products')
-        .delete()
-        .eq('project_id', id);
+      // Validate: budget cannot be reduced below the original project reward
+      if (updates.reward !== undefined) {
+        const { data: currentProject } = await supabase
+          .from('projects')
+          .select('reward')
+          .eq('id', id)
+          .maybeSingle();
 
-      if (deleteProductsError && !isMissingTableOrColumn(deleteProductsError)) {
-        throw deleteProductsError;
+        const originalBudget = Number(currentProject?.reward || 0);
+        if (originalBudget > 0 && updates.reward < originalBudget) {
+          return res.status(400).json({
+            success: false,
+            message: `Budget cannot be reduced below ₹${originalBudget.toLocaleString('en-IN')} — the originally set project budget.`,
+            minimum_budget: originalBudget
+          });
+        }
       }
 
-      if (cleanedProducts.length) {
+      // Delete products that are no longer in the list (by id)
+      const incomingIds = cleanedProducts.map((p) => p.id).filter(Boolean);
+      const { data: existingProds } = await supabase
+        .from('project_products')
+        .select('id')
+        .eq('project_id', id);
+
+      const existingIds = (existingProds || []).map((p) => p.id);
+      const toDelete = existingIds.filter((eid) => !incomingIds.includes(eid));
+
+      if (toDelete.length) {
+        await supabase.from('project_products').delete().in('id', toDelete);
+      }
+
+      // Upsert products (update existing by id, insert new ones)
+      const toUpdate = cleanedProducts.filter((p) => p.id);
+      const toInsert = cleanedProducts.filter((p) => !p.id);
+
+      if (toUpdate.length) {
+        for (const prod of toUpdate) {
+          await supabase
+            .from('project_products')
+            .update({
+              name: prod.name,
+              product_url: prod.product_url,
+              image_url: prod.image_url,
+              product_value: prod.product_value,
+              is_active: prod.is_active
+            })
+            .eq('id', prod.id);
+        }
+      }
+
+      if (toInsert.length) {
         const { error: insertProductsError } = await supabase
           .from('project_products')
-          .insert(cleanedProducts);
-
+          .insert(toInsert.map(({ id: _id, ...rest }) => rest));
         if (insertProductsError && !isMissingTableOrColumn(insertProductsError)) {
           throw insertProductsError;
         }
+      }
+    } else if (updates.reward !== undefined) {
+      // Budget-only update — validate against original reward
+      const { data: currentProject } = await supabase
+        .from('projects')
+        .select('reward')
+        .eq('id', id)
+        .maybeSingle();
+
+      const originalBudget = Number(currentProject?.reward || 0);
+      if (originalBudget > 0 && updates.reward < originalBudget) {
+        return res.status(400).json({
+          success: false,
+          message: `Budget cannot be reduced below ₹${originalBudget.toLocaleString('en-IN')} — the originally set project budget.`,
+          minimum_budget: originalBudget
+        });
       }
     }
 
@@ -1240,7 +1300,7 @@ const getActiveCatalog = async (req, res, next) => {
     for (const row of productRows) {
       const projectId = row.project_id;
       if (!projectId) continue;
-      if (Object.prototype.hasOwnProperty.call(row, 'is_active') && row.is_active !== true) continue;
+      if (Object.prototype.hasOwnProperty.call(row, 'is_active') && row.is_active === false) continue;
       if (!String(row.name || '').trim()) continue;
       if (!String(row.product_url || '').trim()) continue;
       productCountByProject.set(projectId, (productCountByProject.get(projectId) || 0) + 1);

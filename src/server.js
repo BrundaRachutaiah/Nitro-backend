@@ -7,6 +7,7 @@ const env = require('./config/env');
 const startAllocationExpiryJob = require('./jobs/allocationExpiry.job');
 const startProjectStatusJob = require('./jobs/projectStatus.job');
 const startPayoutBackfillJob = require('./jobs/payoutBackfill.job');
+const startAdminDigestJob = require('./jobs/adminDigest.job');
 
 // Routes
 const healthRoutes = require('./routes/health.routes');
@@ -57,6 +58,7 @@ app.use(express.json());
 startAllocationExpiryJob();
 startProjectStatusJob();
 startPayoutBackfillJob();
+startAdminDigestJob();
 
 // Routes
 app.use('/health', healthRoutes);
