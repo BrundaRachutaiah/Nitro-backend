@@ -53,7 +53,7 @@ router.patch(
 router.patch(
   '/allocations/:id/cancel',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'SUPER_ADMIN'),
   allocationController.cancelAllocation
 );
 

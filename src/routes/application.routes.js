@@ -25,21 +25,21 @@ router.get(
 router.patch(
   '/applications/:id/purchased',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'SUPER_ADMIN'),
   applicationController.markApplicationPurchased
 );
 
 router.get(
   '/applications/payment-details',
   authAnyStatusMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'SUPER_ADMIN'),
   applicationController.getPaymentDetails
 );
 
 router.put(
   '/applications/payment-details',
   authAnyStatusMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'SUPER_ADMIN'),
   applicationController.savePaymentDetails
 );
 

@@ -49,21 +49,21 @@ router.get(
 router.get(
   '/catalog',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'SUPER_ADMIN'),
   projectController.getActiveCatalog
 );
 
 router.get(
   '/access-requests/my',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'SUPER_ADMIN'),
   projectController.getMyProjectAccessRequests
 );
 
 router.post(
   '/:id/request-access',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'SUPER_ADMIN'),
   projectController.requestProjectAccess
 );
 
@@ -116,7 +116,7 @@ router.get(
 router.get(
   '/:id/products',
   authMiddleware,
-  roleMiddleware('PARTICIPANT'),
+  roleMiddleware('PARTICIPANT', 'SUPER_ADMIN'),
   projectController.getProjectProductsForParticipant
 );
 
