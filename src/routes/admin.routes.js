@@ -42,10 +42,24 @@ router.patch(
 );
 
 router.patch(
+  '/participants/:id/promote-super-admin',
+  authMiddleware,
+  roleMiddleware('SUPER_ADMIN'),
+  adminController.promoteToSuperAdmin
+);
+
+router.patch(
   '/admins/:id/remove-access',
   authMiddleware,
   roleMiddleware('SUPER_ADMIN'),
   adminController.removeAdminAccess
+);
+
+router.patch(
+  '/super-admins/:id/demote',
+  authMiddleware,
+  roleMiddleware('SUPER_ADMIN'),
+  adminController.demoteSuperAdmin
 );
 
 router.get(
@@ -60,6 +74,13 @@ router.get(
   authMiddleware,
   roleMiddleware('SUPER_ADMIN'),
   adminController.getAllAdmins
+);
+
+router.get(
+  '/super-admins',
+  authMiddleware,
+  roleMiddleware('SUPER_ADMIN'),
+  adminController.getAllSuperAdmins
 );
 
 router.get(

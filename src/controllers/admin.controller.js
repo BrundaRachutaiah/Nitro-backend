@@ -698,7 +698,65 @@ const promoteParticipantToAdmin = async (req, res, next) => {
 };
 
 /**
- * Remove admin access (Super Admin)
+ * Promote participant/admin to Super Admin (Super Admin only)
+ */
+const promoteToSuperAdmin = async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only Super Admin can promote users to Super Admin'
+      });
+    }
+
+    const { id } = req.params;
+
+    // Prevent self-promotion (already super admin)
+    if (id === req.user.id) {
+      return res.status(400).json({
+        success: false,
+        message: 'You are already a Super Admin'
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ role: 'SUPER_ADMIN', status: 'APPROVED' })
+      .eq('id', id)
+      .in('role', ['PARTICIPANT', 'ADMIN'])
+      .select('id, full_name, email, role, status')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found or already a Super Admin'
+      });
+    }
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'USER_PROMOTED_TO_SUPER_ADMIN',
+      entityType: 'PROFILE',
+      entityId: id,
+      message: `${data.full_name || data.email || id} promoted to Super Admin`
+    });
+
+    return res.json({
+      success: true,
+      message: 'User promoted to Super Admin successfully',
+      data
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Remove admin access — demotes ADMIN → PARTICIPANT (Super Admin only)
  */
 const removeAdminAccess = async (req, res, next) => {
   try {
@@ -755,6 +813,63 @@ const removeAdminAccess = async (req, res, next) => {
 };
 
 /**
+ * Demote Super Admin → Admin (Super Admin only)
+ */
+const demoteSuperAdmin = async (req, res, next) => {
+  try {
+    if (req.user?.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({
+        success: false,
+        message: 'Only Super Admin can demote other Super Admins'
+      });
+    }
+
+    const { id } = req.params;
+
+    if (id === req.user.id) {
+      return res.status(400).json({
+        success: false,
+        message: 'You cannot demote yourself'
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('profiles')
+      .update({ role: 'ADMIN', status: 'APPROVED' })
+      .eq('id', id)
+      .eq('role', 'SUPER_ADMIN')
+      .select('id, full_name, email, role, status')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: 'Super Admin not found'
+      });
+    }
+
+    await logActivity({
+      actorId: req.user?.id,
+      actorRole: req.user?.role,
+      action: 'SUPER_ADMIN_DEMOTED',
+      entityType: 'PROFILE',
+      entityId: id,
+      message: `${data.full_name || data.email || id} demoted from Super Admin to Admin`
+    });
+
+    return res.json({
+      success: true,
+      message: 'Super Admin demoted to Admin successfully',
+      data
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
  * Get all participants (Admin)
  */
 const getAllParticipants = async (req, res, next) => {
@@ -784,6 +899,26 @@ const getAllAdmins = async (req, res, next) => {
       .from('profiles')
       .select('id, full_name, email, role, status, created_at')
       .eq('role', 'ADMIN')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    const enriched = await fillParticipantIdentity(data || []);
+    res.json({ success: true, data: enriched });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Get all super admins (Super Admin)
+ */
+const getAllSuperAdmins = async (req, res, next) => {
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, full_name, email, role, status, created_at')
+      .eq('role', 'SUPER_ADMIN')
       .order('created_at', { ascending: false });
 
     if (error) throw error;
@@ -5313,9 +5448,12 @@ module.exports = {
   rejectParticipant,
   deleteParticipant,
   promoteParticipantToAdmin,
+  promoteToSuperAdmin,
   removeAdminAccess,
+  demoteSuperAdmin,
   getAllParticipants,
   getAllAdmins,
+  getAllSuperAdmins,
   getParticipantById,
   getAdminDashboardSummary,
   getDashboardSummary,
