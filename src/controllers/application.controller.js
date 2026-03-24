@@ -1,5 +1,6 @@
 const supabase = require('../config/supabaseClient');
 const { logActivity } = require('../services/activityLog.service');
+const { queueSuperAdminBatchDigestItem } = require('../services/superAdminBatchDigest.service');
 const {
   ensureParticipantDetailsFromRegistration,
   persistParticipantDetails
@@ -184,6 +185,9 @@ if (!productId) {
     }
 
     const data = insertRes.data;
+
+    // Queue a batched SUPER_ADMIN email (debounced for 30s)
+    queueSuperAdminBatchDigestItem({ kind: 'REQUEST', id: data?.id });
 
     const { data: participantProfile } = await supabase
       .from('profiles')

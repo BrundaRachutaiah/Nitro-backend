@@ -14,6 +14,9 @@ const cron = require('node-cron');
 const supabase = require('../config/supabaseClient');
 const { sendEmail } = require('../services/email.service');
 
+// Default to India time unless explicitly overridden via env.
+const DIGEST_TIMEZONE = process.env.ADMIN_DIGEST_TIMEZONE || process.env.CRON_TIMEZONE || 'Asia/Kolkata';
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const fmt = (n) =>
@@ -260,7 +263,7 @@ const sendAdminDailyDigest = async () => {
     });
 
     // ── 1. New product requests (PENDING applications in last 24h) ──
-    const { data: rawRequests } = await supabase
+    const { data: rawRequests, error: rawRequestsError } = await supabase
       .from('project_applications')
       .select(`
         id, created_at, status,
@@ -272,8 +275,13 @@ const sendAdminDailyDigest = async () => {
       .gte('created_at', since)
       .order('created_at', { ascending: false });
 
+    if (rawRequestsError) {
+      console.error('[AdminDigest] Failed to fetch product requests:', rawRequestsError);
+      return;
+    }
+
     // ── 2. Invoices uploaded (PENDING purchase_proofs in last 24h) ──
-    const { data: rawInvoices } = await supabase
+    const { data: rawInvoices, error: rawInvoicesError } = await supabase
       .from('purchase_proofs')
       .select(`
         id, status,
@@ -286,8 +294,13 @@ const sendAdminDailyDigest = async () => {
       .gte('uploaded_at', since)
       .order('uploaded_at', { ascending: false });
 
+    if (rawInvoicesError) {
+      console.error('[AdminDigest] Failed to fetch invoices:', rawInvoicesError);
+      return;
+    }
+
     // ── 3. Reviews submitted (PENDING participant_reviews in last 24h) ──
-    const { data: rawReviews } = await supabase
+    const { data: rawReviews, error: rawReviewsError } = await supabase
       .from('participant_reviews')
       .select(`
         id, created_at, status,
@@ -297,6 +310,11 @@ const sendAdminDailyDigest = async () => {
       .eq('status', 'PENDING')
       .gte('created_at', since)
       .order('created_at', { ascending: false });
+
+    if (rawReviewsError) {
+      console.error('[AdminDigest] Failed to fetch reviews:', rawReviewsError);
+      return;
+    }
 
     // ── Enrich with participant profiles ──
     const allParticipantIds = [
@@ -308,36 +326,47 @@ const sendAdminDailyDigest = async () => {
     const uniqueParticipantIds = [...new Set(allParticipantIds)];
     let profileMap = new Map();
     if (uniqueParticipantIds.length) {
-      const { data: profiles } = await supabase
+      const { data: profiles, error: profilesError } = await supabase
         .from('profiles')
         .select('id, full_name, email')
         .in('id', uniqueParticipantIds);
+
+      if (profilesError) {
+        console.error('[AdminDigest] Failed to fetch participant profiles:', profilesError);
+        return;
+      }
       profileMap = new Map((profiles || []).map((p) => [p.id, p]));
     }
 
     // ── Enrich invoices with product names ──
-    const invoiceProductIds = (rawInvoices || []).map((r) => r.product_id).filter(Boolean);
+    const invoiceProductIds = [...new Set((rawInvoices || []).map((r) => r.product_id).filter(Boolean))];
     let invoiceProductMap = new Map();
     if (invoiceProductIds.length) {
-      const { data: prods } = await supabase
-        .from('project_products')
-        .select('id, name, project_id, project_products(id)');
-      // Also get project titles via allocation
-      const { data: prodsWithProject } = await supabase
+      const { data: prodsWithProject, error: prodsError } = await supabase
         .from('project_products')
         .select('id, name')
         .in('id', invoiceProductIds);
+
+      if (prodsError) {
+        console.error('[AdminDigest] Failed to fetch invoice products:', prodsError);
+        return;
+      }
       invoiceProductMap = new Map((prodsWithProject || []).map((p) => [p.id, p]));
     }
 
     // Get project titles for invoices via allocation
-    const allocationIds = (rawInvoices || []).map((r) => r.allocation_id).filter(Boolean);
+    const allocationIds = [...new Set((rawInvoices || []).map((r) => r.allocation_id).filter(Boolean))];
     let allocationProjectMap = new Map();
     if (allocationIds.length) {
-      const { data: allocs } = await supabase
+      const { data: allocs, error: allocsError } = await supabase
         .from('unit_allocations')
         .select('id, project_id, projects(title)')
         .in('id', allocationIds);
+
+      if (allocsError) {
+        console.error('[AdminDigest] Failed to fetch invoice allocations:', allocsError);
+        return;
+      }
       allocationProjectMap = new Map(
         (allocs || []).map((a) => [a.id, a.projects?.title || null])
       );
@@ -380,11 +409,16 @@ const sendAdminDailyDigest = async () => {
     });
 
     // ── Get all admins ──
-    const { data: admins } = await supabase
+    const { data: admins, error: adminsError } = await supabase
       .from('profiles')
       .select('id, full_name, email')
       .in('role', ['ADMIN', 'SUPER_ADMIN'])
       .eq('status', 'APPROVED');
+
+    if (adminsError) {
+      console.error('[AdminDigest] Failed to fetch admin recipients:', adminsError);
+      return;
+    }
 
     if (!admins?.length) {
       console.log('[AdminDigest] No admins found, skipping.');
@@ -427,11 +461,17 @@ const sendAdminDailyDigest = async () => {
 // ── Schedule ─────────────────────────────────────────────────────────────────
 
 const startAdminDigestJob = () => {
-  // Runs every day at 8:00 AM server time
+  // Runs every day at 8:00 AM in DIGEST_TIMEZONE
+  const scheduleOptions = { timezone: DIGEST_TIMEZONE };
+
   cron.schedule('0 8 * * *', () => {
-    console.log('[AdminDigest] Triggered at 8:00 AM');
+    console.log(`[AdminDigest] Triggered at 8:00 AM (${new Date().toISOString()})`);
     sendAdminDailyDigest();
-  });
+  }, scheduleOptions);
+
+  if (DIGEST_TIMEZONE) {
+    console.log(`[AdminDigest] Using timezone: ${DIGEST_TIMEZONE}`);
+  }
 
   console.log('[AdminDigest] Scheduled — runs daily at 8:00 AM');
 };

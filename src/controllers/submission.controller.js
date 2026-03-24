@@ -1,6 +1,7 @@
 const supabase = require('../config/supabaseClient');
 const { sendEmail } = require('../services/email.service');
 const { scheduleInvoiceReview } = require('../services/email.digest');
+const { queueSuperAdminBatchDigestItem } = require('../services/superAdminBatchDigest.service');
 const {
   reviewApprovedEmail,
   reviewRejectedEmail
@@ -1070,6 +1071,9 @@ const submitReview = async (req, res, next) => {
       message: 'Review submitted and awaiting admin approval',
       data
     });
+
+    // Queue a batched SUPER_ADMIN email (debounced for 30s)
+    queueSuperAdminBatchDigestItem({ kind: 'REVIEW', id: data?.id });
   } catch (err) {
     next(err);
   }

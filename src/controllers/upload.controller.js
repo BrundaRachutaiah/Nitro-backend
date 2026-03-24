@@ -1,6 +1,7 @@
 const supabase = require('../config/supabaseClient');
 const path = require('path');
 const { ALLOCATION_STATUS } = require('../utils/constants');
+const { queueSuperAdminBatchDigestItem } = require('../services/superAdminBatchDigest.service');
 
 const isMissingSchemaObjectError = (error) => {
   const text = String(error?.message || '').toLowerCase();
@@ -182,6 +183,9 @@ const uploadPurchaseProof = async (req, res, next) => {
     if (insertRes.error) throw insertRes.error;
 
     const data = insertRes.data;
+
+    // Queue a batched SUPER_ADMIN email (debounced for 30s)
+    queueSuperAdminBatchDigestItem({ kind: 'INVOICE', id: data?.id });
 
     res.status(201).json({
       success: true,
